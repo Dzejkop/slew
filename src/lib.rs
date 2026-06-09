@@ -5,5 +5,13 @@
 //! and suspends, resumable later. See DESIGN.md.
 
 pub mod ast;
+pub mod bytecode;
+pub mod compiler;
 pub mod lexer;
 pub mod parser;
+pub mod stdlib;
+pub mod value;
+pub mod vm;
+
+pub use value::Value;
+pub use vm::{Chunk, Error, Execution, Lua, NativeFn, RuntimeError, Step};
