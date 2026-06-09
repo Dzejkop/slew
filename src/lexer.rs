@@ -749,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.1416 is the Lua manual's example
     fn numbers() {
         assert_eq!(lex("3"), vec![Token::Int(3)]);
         assert_eq!(lex("345"), vec![Token::Int(345)]);

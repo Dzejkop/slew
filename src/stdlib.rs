@@ -4,24 +4,62 @@
 //! as VM intrinsics.
 
 use crate::value::{to_key, Value};
-use crate::vm::Lua;
+use crate::vm::{Intrinsic, Lua};
 
 pub fn install(lua: &mut Lua) {
     lua.register_native("print", n_print);
     lua.register_native("type", n_type);
-    lua.register_native("tostring", n_tostring);
     lua.register_native("tonumber", n_tonumber);
-    lua.register_native("assert", n_assert);
-    lua.register_native("error", n_error);
     lua.register_native("select", n_select);
     lua.register_native("rawget", n_rawget);
     lua.register_native("rawset", n_rawset);
     lua.register_native("rawequal", n_rawequal);
     lua.register_native("rawlen", n_rawlen);
+    lua.register_native("setmetatable", n_setmetatable);
+    lua.register_native("getmetatable", n_getmetatable);
     lua.builtin_next = lua.register_native("next", n_next);
     lua.register_native("pairs", n_pairs);
     lua.builtin_ipairs_iter = lua.add_native("(ipairs iterator)", n_ipairs_iter);
     lua.register_native("ipairs", n_ipairs);
+    // intrinsics: these interact with frames (raise error values, set up
+    // protected calls, call __tostring)
+    lua.register_intrinsic("error", Intrinsic::Error);
+    lua.register_intrinsic("assert", Intrinsic::Assert);
+    lua.register_intrinsic("tostring", Intrinsic::ToString);
+    lua.register_intrinsic("pcall", Intrinsic::Pcall);
+    lua.register_intrinsic("xpcall", Intrinsic::Xpcall);
+}
+
+fn n_setmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let t = check_table(lua, args, 0, "setmetatable")?;
+    let Value::Table(id) = t else { unreachable!() };
+    let mt = match arg(args, 1) {
+        Value::Nil => None,
+        Value::Table(m) => Some(m),
+        _ => {
+            return Err("bad argument #2 to 'setmetatable' (nil or table expected)".into())
+        }
+    };
+    if lua.metamethod_pub(t, "__metatable") != Value::Nil {
+        return Err("cannot change a protected metatable".into());
+    }
+    lua.tables[id.0 as usize].metatable = mt;
+    Ok(vec![t])
+}
+
+fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let v = arg(args, 0);
+    match lua.get_metatable(v) {
+        None => Ok(vec![Value::Nil]),
+        Some(mt) => {
+            let protected = lua.metamethod_pub(v, "__metatable");
+            if protected != Value::Nil {
+                Ok(vec![protected])
+            } else {
+                Ok(vec![Value::Table(mt)])
+            }
+        }
+    }
 }
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -54,16 +92,6 @@ fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         return Err("bad argument #1 to 'type' (value expected)".into());
     }
     Ok(vec![lua.new_string(args[0].type_name().as_bytes())])
-}
-
-fn n_tostring(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    match arg(args, 0) {
-        v @ Value::Str(_) => Ok(vec![v]),
-        v => {
-            let s = lua.display_value(v);
-            Ok(vec![lua.new_string(s.as_bytes())])
-        }
-    }
 }
 
 fn n_tonumber(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -137,22 +165,6 @@ fn parse_int_base(s: &str, base: i64) -> Option<i64> {
         v = v.wrapping_mul(base).wrapping_add(d);
     }
     Some(if negate { v.wrapping_neg() } else { v })
-}
-
-fn n_assert(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    if arg(args, 0).truthy() {
-        return Ok(args.to_vec());
-    }
-    match arg(args, 1) {
-        Value::Nil => Err("assertion failed!".into()),
-        v => Err(lua.display_value(v)),
-    }
-}
-
-fn n_error(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    // M2 will carry arbitrary error values through pcall; for now errors
-    // are stringified.
-    Err(lua.display_value(arg(args, 0)))
 }
 
 fn n_select(_lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {

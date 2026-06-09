@@ -135,6 +135,7 @@ pub struct Table {
     /// Dense array part for keys `1..=array.len()` (may contain trailing nils).
     array: Vec<Value>,
     hash: HashMap<HKey, Value>,
+    pub metatable: Option<TableId>,
 }
 
 impl Table {
@@ -304,6 +305,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn float_formatting() {
         assert_eq!(fmt_float(1.0), "1.0");
         assert_eq!(fmt_float(-1.0), "-1.0");

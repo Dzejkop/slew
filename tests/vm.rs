@@ -449,7 +449,7 @@ fn two_executions_share_globals_but_not_control() {
 #[test]
 fn runtime_error_reports_line() {
     let err = run_err("local x = 1\nlocal y = 2\nreturn x + {}");
-    assert!(err.contains("line 3"), "got: {err}");
+    assert!(err.contains("chunk:3:"), "got: {err}");
 }
 
 #[test]

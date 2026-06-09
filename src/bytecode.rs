@@ -95,6 +95,8 @@ pub enum UpvalDesc {
 
 pub struct Proto {
     pub code: Vec<Instr>,
+    /// Chunk name, used in error message position prefixes.
+    pub source: std::rc::Rc<str>,
     /// Source line per instruction (parallel to `code`).
     pub lines: Vec<u32>,
     pub consts: Vec<Value>,

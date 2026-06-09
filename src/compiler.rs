@@ -29,7 +29,8 @@ pub fn compile(
     strings: &mut Strings,
     chunk_name: &str,
 ) -> Result<Rc<Proto>, CompileError> {
-    let mut c = Compiler { strings, funcs: Vec::new() };
+    let source: Rc<str> = chunk_name.into();
+    let mut c = Compiler { strings, funcs: Vec::new(), source };
     let mut main = FuncState::new(format!("main chunk ({chunk_name})"), 0, true);
     // The main chunk has _ENV as its sole upvalue (Lua 5.4); the host fills
     // it with the globals table when instantiating the chunk.
@@ -37,9 +38,11 @@ pub fn compile(
     main.upval_names.push("_ENV".into());
     c.funcs.push(main);
     c.block_scope(block)?;
+    c.check_pending_gotos()?;
     c.emit(Instr::Return { base: 0, n: 1 });
     let fs = c.funcs.pop().unwrap();
-    Ok(Rc::new(fs.into_proto()))
+    let source = c.source.clone();
+    Ok(Rc::new(fs.into_proto(source)))
 }
 
 /// Hashable identity of a constant for deduplication.
@@ -63,6 +66,25 @@ struct LoopCtx {
     reg_floor: u8,
 }
 
+/// A `goto` whose label hasn't been seen yet. `close_pc` points at a
+/// placeholder `Close` (from=255, a no-op) patched when the target's
+/// register floor is known.
+struct PendingGoto {
+    name: Box<str>,
+    close_pc: usize,
+    jump_pc: usize,
+    /// Active-local count at the goto, capped at each enclosing block exit.
+    nact: usize,
+    line: u32,
+}
+
+/// A label visible at the current point.
+struct LabelDef {
+    name: Box<str>,
+    pc: usize,
+    reg: u8,
+}
+
 struct FuncState {
     code: Vec<Instr>,
     lines: Vec<u32>,
@@ -73,6 +95,8 @@ struct FuncState {
     upval_names: Vec<Box<str>>,
     locals: Vec<LocalVar>,
     loops: Vec<LoopCtx>,
+    gotos: Vec<PendingGoto>,
+    labels: Vec<LabelDef>,
     nparams: u8,
     is_vararg: bool,
     free_reg: u8,
@@ -93,6 +117,8 @@ impl FuncState {
             upval_names: Vec::new(),
             locals: Vec::new(),
             loops: Vec::new(),
+            gotos: Vec::new(),
+            labels: Vec::new(),
             nparams,
             is_vararg,
             free_reg: 0,
@@ -102,9 +128,10 @@ impl FuncState {
         }
     }
 
-    fn into_proto(self) -> Proto {
+    fn into_proto(self, source: Rc<str>) -> Proto {
         Proto {
             code: self.code,
+            source,
             lines: self.lines,
             consts: self.consts,
             protos: self.protos,
@@ -136,6 +163,7 @@ enum Target {
 struct Compiler<'h> {
     strings: &'h mut Strings,
     funcs: Vec<FuncState>,
+    source: Rc<str>,
 }
 
 fn enc(n: Option<usize>) -> u8 {
@@ -269,10 +297,88 @@ impl<'h> Compiler<'h> {
 
     fn block_scope(&mut self, b: &Block) -> Result<(), CompileError> {
         let floor = self.enter_scope();
-        for s in &b.stmts {
-            self.stmt(s)?;
-        }
+        self.stmt_seq(&b.stmts)?;
         self.exit_scope(floor);
+        Ok(())
+    }
+
+    /// Compiles a statement sequence, handling label visibility: a label is
+    /// "at the end of the block" (and may be jumped to over the block's
+    /// locals) when only other labels follow it.
+    fn stmt_seq(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
+        let nact_entry = self.funcs.last().unwrap().locals.len();
+        let labels_floor = self.funcs.last().unwrap().labels.len();
+        let gotos_floor = self.funcs.last().unwrap().gotos.len();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(name) = s {
+                let last = stmts[i + 1..].iter().all(|s| matches!(s, Stmt::Label(_)));
+                self.define_label(name, last, nact_entry)?;
+            } else {
+                self.stmt(s)?;
+            }
+        }
+        // leaving the block: labels go out of scope; unmatched gotos float
+        // up with their local count capped at this block's entry level
+        let fs = self.funcs.last_mut().unwrap();
+        fs.labels.truncate(labels_floor);
+        for g in &mut fs.gotos[gotos_floor..] {
+            g.nact = g.nact.min(nact_entry);
+        }
+        Ok(())
+    }
+
+    fn define_label(
+        &mut self,
+        name: &str,
+        last_in_block: bool,
+        block_nact: usize,
+    ) -> Result<(), CompileError> {
+        if self.funcs.last().unwrap().labels.iter().any(|l| &*l.name == name) {
+            return self.err(format!("label '{name}' already defined"));
+        }
+        let fs = self.funcs.last().unwrap();
+        let nact = if last_in_block { block_nact } else { fs.locals.len() };
+        let reg = fs.locals[..nact].iter().map(|l| l.reg + 1).max().unwrap_or(0);
+        let pc = self.here();
+        // resolve pending gotos targeting this label
+        let mut i = 0;
+        while i < self.funcs.last().unwrap().gotos.len() {
+            let g = &self.funcs.last().unwrap().gotos[i];
+            if &*g.name != name {
+                i += 1;
+                continue;
+            }
+            if g.nact < nact {
+                let line = g.line;
+                self.fs().cur_line = line;
+                return self.err(format!(
+                    "<goto {name}> jumps into the scope of a local"
+                ));
+            }
+            let g = self.funcs.last_mut().unwrap().gotos.remove(i);
+            if nact < g.nact {
+                // jumping out of local scopes: close their upvalues
+                if let Instr::Close { from } =
+                    &mut self.funcs.last_mut().unwrap().code[g.close_pc]
+                {
+                    *from = reg;
+                }
+            }
+            let off = pc as i32 - (g.jump_pc as i32 + 1);
+            if let Instr::Jump { off: o } = &mut self.funcs.last_mut().unwrap().code[g.jump_pc] {
+                *o = off;
+            }
+        }
+        self.funcs.last_mut().unwrap().labels.push(LabelDef { name: name.into(), pc, reg });
+        Ok(())
+    }
+
+    fn check_pending_gotos(&mut self) -> Result<(), CompileError> {
+        if let Some(g) = self.funcs.last().unwrap().gotos.first() {
+            let (name, line) = (g.name.clone(), g.line);
+            self.fs().cur_line = line;
+            return self.err(format!("no visible label '{name}' for goto"));
+        }
         Ok(())
     }
 
@@ -326,10 +432,35 @@ impl<'h> Compiler<'h> {
     fn stmt(&mut self, s: &Stmt) -> Result<(), CompileError> {
         let watermark = self.local_top();
         match s {
-            Stmt::Empty | Stmt::Label(_) => {}
-            Stmt::Goto { line, .. } => {
+            Stmt::Empty => {}
+            Stmt::Label(name) => {
+                // labels are normally handled by stmt_seq (which knows
+                // block-end position); a stray one is not last-in-block
+                let nact = self.funcs.last().unwrap().locals.len();
+                self.define_label(name, false, nact)?;
+            }
+            Stmt::Goto { label, line } => {
                 self.at_line(*line);
-                return self.err("goto is not supported yet (milestone M2)");
+                let fs = self.funcs.last().unwrap();
+                // backward goto: label already visible (innermost match)
+                if let Some(l) = fs.labels.iter().rev().find(|l| l.name == *label) {
+                    let (pc, reg) = (l.pc, l.reg);
+                    self.emit(Instr::Close { from: reg });
+                    let off = self.back_off(pc);
+                    self.emit(Instr::Jump { off });
+                } else {
+                    // forward goto: placeholder Close (no-op until patched)
+                    let close_pc = self.emit(Instr::Close { from: 255 });
+                    let jump_pc = self.emit(Instr::Jump { off: 0 });
+                    let nact = self.funcs.last().unwrap().locals.len();
+                    self.funcs.last_mut().unwrap().gotos.push(PendingGoto {
+                        name: label.clone(),
+                        close_pc,
+                        jump_pc,
+                        nact,
+                        line: *line,
+                    });
+                }
             }
             Stmt::Local { names, values, line } => {
                 self.at_line(*line);
@@ -405,9 +536,7 @@ impl<'h> Compiler<'h> {
                     .unwrap()
                     .loops
                     .push(LoopCtx { breaks: Vec::new(), reg_floor });
-                for st in &body.stmts {
-                    self.stmt(st)?;
-                }
+                self.stmt_seq(&body.stmts)?;
                 // condition sees the body's locals (Lua scoping rule)
                 let r = self.expr_to_any(cond)?;
                 let exit = self.emit_jump(Instr::Test { src: r, if_true: true, off: 0 });
@@ -1058,9 +1187,10 @@ impl<'h> Compiler<'h> {
             self.declare_local(p.clone(), r, Attrib::None);
         }
         self.block_scope(&fb.body)?;
+        self.check_pending_gotos()?;
         self.emit(Instr::Return { base: 0, n: 1 });
         let done = self.funcs.pop().unwrap();
-        let proto = Rc::new(done.into_proto());
+        let proto = Rc::new(done.into_proto(self.source.clone()));
         let fs = self.fs();
         if fs.protos.len() >= u16::MAX as usize {
             return self.err("too many nested functions");
