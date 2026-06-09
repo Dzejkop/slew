@@ -4,4 +4,6 @@
 //! fuel budgets: `Execution::step(fuel)` runs at most `fuel` units of work
 //! and suspends, resumable later. See DESIGN.md.
 
+pub mod ast;
 pub mod lexer;
+pub mod parser;

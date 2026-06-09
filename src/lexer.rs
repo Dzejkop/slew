@@ -155,6 +155,7 @@ impl fmt::Display for LexError {
     }
 }
 
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
