@@ -70,7 +70,7 @@ Everything implemented follows 5.4 rules from the start, in particular:
 
 ## Milestones
 
-- **M1 (this slice)**: lexer, parser (full grammar), compiler + VM for the core
+- **M1 (done)**: lexer, parser (full grammar), compiler + VM for the core
   language — locals, control flow, numeric/generic `for`, functions, closures,
   multiple returns, varargs, tables, full operator set on primitives — plus the
   public fuel API with suspension tests.

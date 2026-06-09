@@ -71,6 +71,11 @@ impl Strings {
         id
     }
 
+    /// Looks up an already-interned string without interning.
+    pub fn lookup(&self, s: &[u8]) -> Option<StrId> {
+        self.map.get(s).copied()
+    }
+
     pub fn get(&self, id: StrId) -> &[u8] {
         &self.vec[id.0 as usize]
     }
@@ -118,7 +123,7 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
 
 /// `Some(i)` iff `f` represents exactly the integer `i` (in i64 range).
 pub fn float_to_exact_int(f: f64) -> Option<i64> {
-    if f.fract() == 0.0 && f >= -9.223372036854776e18 && f < 9.223372036854776e18 {
+    if f.fract() == 0.0 && (-9.223372036854776e18..9.223372036854776e18).contains(&f) {
         Some(f as i64)
     } else {
         None
@@ -139,11 +144,10 @@ impl Table {
     }
 
     fn get_key(&self, k: HKey) -> Value {
-        if let HKey::Int(i) = k {
-            if i >= 1 && (i as usize) <= self.array.len() {
+        if let HKey::Int(i) = k
+            && i >= 1 && (i as usize) <= self.array.len() {
                 return self.array[i as usize - 1];
             }
-        }
         self.hash.get(&k).copied().unwrap_or(Value::Nil)
     }
 
@@ -256,7 +260,7 @@ pub fn fmt_float(x: f64) -> String {
     let sci = format!("{:.13e}", x);
     let epos = sci.find('e').unwrap();
     let exp: i32 = sci[epos + 1..].parse().unwrap();
-    let mut s = if exp >= -4 && exp < 14 {
+    let mut s = if (-4..14).contains(&exp) {
         let prec = (13 - exp).max(0) as usize;
         let mut s = format!("{x:.prec$}");
         if s.contains('.') {

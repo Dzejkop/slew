@@ -216,11 +216,10 @@ impl<'a> Lexer<'a> {
     /// Consumes a newline (\n, \r, \r\n or \n\r), incrementing the line count once.
     fn newline(&mut self) {
         let first = self.bump().unwrap();
-        if let Some(b) = self.peek() {
-            if (b == b'\n' || b == b'\r') && b != first {
+        if let Some(b) = self.peek()
+            && (b == b'\n' || b == b'\r') && b != first {
                 self.pos += 1;
             }
-        }
         self.line += 1;
     }
 
@@ -234,12 +233,11 @@ impl<'a> Lexer<'a> {
                 Some(b'-') if self.peek2() == Some(b'-') => {
                     self.pos += 2;
                     // long comment?
-                    if self.peek() == Some(b'[') {
-                        if let Some(level) = self.long_bracket_level() {
+                    if self.peek() == Some(b'[')
+                        && let Some(level) = self.long_bracket_level() {
                             self.read_long_string(level)?;
                             continue;
                         }
-                    }
                     // line comment
                     while let Some(b) = self.peek() {
                         if b == b'\n' || b == b'\r' {
@@ -275,10 +273,7 @@ impl<'a> Lexer<'a> {
     /// The opening bracket must already be consumed.
     fn read_long_string(&mut self, level: usize) -> Result<Box<[u8]>, LexError> {
         // first newline is skipped
-        match self.peek() {
-            Some(b'\n' | b'\r') => self.newline(),
-            _ => {}
-        }
+        if let Some(b'\n' | b'\r') = self.peek() { self.newline() }
         let mut out = Vec::new();
         loop {
             match self.peek() {

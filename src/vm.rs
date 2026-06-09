@@ -221,9 +221,11 @@ impl Lua {
         id
     }
 
-    pub fn get_global(&mut self, name: &str) -> Value {
-        let k = self.new_string(name.as_bytes());
-        self.tables[self.globals.0 as usize].get(k)
+    pub fn get_global(&self, name: &str) -> Value {
+        match self.strings.lookup(name.as_bytes()) {
+            Some(id) => self.tables[self.globals.0 as usize].get(Value::Str(id)),
+            None => Value::Nil, // a name never interned can't be a set global
+        }
     }
 
     pub fn set_global(&mut self, name: &str, v: Value) {
@@ -501,13 +503,12 @@ impl Lua {
                     let a = base + b as usize;
                     match (th.stack[a], th.stack[a + 1], th.stack[a + 2]) {
                         (Value::Int(i), Value::Int(l), Value::Int(s)) => {
-                            if let Some(ni) = i.checked_add(s) {
-                                if (s > 0 && ni <= l) || (s < 0 && ni >= l) {
+                            if let Some(ni) = i.checked_add(s)
+                                && ((s > 0 && ni <= l) || (s < 0 && ni >= l)) {
                                     th.stack[a] = Value::Int(ni);
                                     th.stack[a + 3] = Value::Int(ni);
                                     jump(th, off);
                                 }
-                            }
                         }
                         (Value::Float(i), Value::Float(l), Value::Float(s)) => {
                             let ni = i + s;
