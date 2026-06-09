@@ -1,0 +1,8 @@
+[package]
+name = "suslua"
+version = "0.1.0"
+edition = "2024"
+description = "A suspendable Lua interpreter with strict, embedder-controlled execution budgets"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
