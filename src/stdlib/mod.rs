@@ -1,10 +1,19 @@
-//! Base library (M1 subset): pure, allocation-light natives that never call
-//! back into Lua. Natives that need to run Lua code (table.sort, pcall as a
-//! library function, metamethod-aware tostring) arrive with later milestones
-//! as VM intrinsics.
+//! The standard library: base functions, `coroutine`, `string` (with the
+//! pattern engine), `table`, and `math`.
+//!
+//! Functions that call back into Lua code (table.sort's comparator,
+//! gsub's function replacements, gmatch iterators) are defined in
+//! `prelude.lua`, compiled and run at `Lua::new()` — that way they execute
+//! through the regular suspendable VM machinery instead of needing native
+//! reentrancy. `os` and `io` are deliberately absent: they are
+//! nondeterministic ambient authority; embedders can register their own.
+
+mod math;
+mod string;
+mod table;
 
 use crate::value::{to_key, Value};
-use crate::vm::{CoStatus, Intrinsic, Lua, NativeKind};
+use crate::vm::{CoStatus, Intrinsic, Lua, NativeKind, Step};
 
 pub fn install(lua: &mut Lua) {
     lua.register_native("print", n_print);
@@ -29,9 +38,27 @@ pub fn install(lua: &mut Lua) {
     lua.register_intrinsic("pcall", Intrinsic::Pcall);
     lua.register_intrinsic("xpcall", Intrinsic::Xpcall);
     install_coroutine(lua);
+    string::install(lua);
+    table::install(lua);
+    math::install(lua);
+    run_prelude(lua);
 }
 
-fn set_field(lua: &mut Lua, t: Value, name: &str, v: Value) {
+fn run_prelude(lua: &mut Lua) {
+    let chunk = lua
+        .load_named("prelude", include_str!("prelude.lua"))
+        .expect("prelude must compile");
+    let mut exec = lua.execute(&chunk);
+    loop {
+        match exec.step(lua, 1_000_000) {
+            Ok(Step::Done(_)) => break,
+            Ok(Step::Pending) => continue,
+            Err(e) => panic!("prelude failed: {e}"),
+        }
+    }
+}
+
+pub(super) fn set_field(lua: &mut Lua, t: Value, name: &str, v: Value) {
     let Value::Table(id) = t else { unreachable!() };
     let k = lua.new_string(name.as_bytes());
     lua.tables[id.0 as usize].set(k, v).unwrap();
@@ -133,11 +160,11 @@ fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn arg(args: &[Value], i: usize) -> Value {
+pub(super) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::Nil)
 }
 
-fn check_table(_lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Value, String> {
+pub(super) fn check_table(_lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Value, String> {
     match arg(args, i) {
         v @ Value::Table(_) => Ok(v),
         v => Err(format!(

@@ -251,9 +251,8 @@ pub fn key_to_value(k: HKey) -> Value {
     }
 }
 
-/// Formats a float like Lua 5.4's `%.14g`, with the trailing `.0` added when
-/// the result would otherwise look like an integer.
-pub fn fmt_float(x: f64) -> String {
+/// Formats a finite, non-zero float like C's `%.<prec>g`.
+pub fn fmt_g(x: f64, prec: usize) -> String {
     if x.is_nan() {
         return "nan".into();
     }
@@ -261,14 +260,15 @@ pub fn fmt_float(x: f64) -> String {
         return if x < 0.0 { "-inf".into() } else { "inf".into() };
     }
     if x == 0.0 {
-        return "0.0".into();
+        return "0".into();
     }
-    let sci = format!("{:.13e}", x);
+    let prec = prec.max(1) as i32;
+    let sci = format!("{:.*e}", prec as usize - 1, x);
     let epos = sci.find('e').unwrap();
     let exp: i32 = sci[epos + 1..].parse().unwrap();
-    let mut s = if (-4..14).contains(&exp) {
-        let prec = (13 - exp).max(0) as usize;
-        let mut s = format!("{x:.prec$}");
+    if exp >= -4 && exp < prec {
+        let p = (prec - 1 - exp).max(0) as usize;
+        let mut s = format!("{x:.p$}");
         if s.contains('.') {
             while s.ends_with('0') {
                 s.pop();
@@ -289,8 +289,17 @@ pub fn fmt_float(x: f64) -> String {
             }
         }
         format!("{m}e{}{:02}", if exp >= 0 { "+" } else { "-" }, exp.abs())
-    };
-    if !s.contains(['.', 'e']) {
+    }
+}
+
+/// Formats a float like Lua 5.4's `%.14g`, with the trailing `.0` added when
+/// the result would otherwise look like an integer.
+pub fn fmt_float(x: f64) -> String {
+    if x == 0.0 {
+        return "0.0".into();
+    }
+    let mut s = fmt_g(x, 14);
+    if !s.contains(['.', 'e', 'n', 'i']) {
         s.push_str(".0");
     }
     s

@@ -348,6 +348,9 @@ pub struct Lua {
     /// Set by resume/yield intrinsics; the dispatch loop performs the
     /// actual thread switch.
     switch_to: Option<ThreadId>,
+    /// math.random state (xoshiro256**); deterministically seeded so
+    /// scripts behave identically run-to-run unless reseeded.
+    rng: [u64; 4],
 }
 
 impl Default for Lua {
@@ -374,9 +377,37 @@ impl Lua {
             mm_names,
             current_thread: ThreadId(u32::MAX),
             switch_to: None,
+            rng: [0; 4],
         };
+        lua.seed_random(0x5375734c75615f31); // "SusLua_1"
         crate::stdlib::install(&mut lua);
         lua
+    }
+
+    pub fn seed_random(&mut self, seed: u64) {
+        // splitmix64 to expand the seed into the xoshiro state
+        let mut x = seed;
+        for s in &mut self.rng {
+            x = x.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            *s = z ^ (z >> 31);
+        }
+    }
+
+    pub fn next_random(&mut self) -> u64 {
+        // xoshiro256**
+        let s = &mut self.rng;
+        let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        result
     }
 
     /// Parses and compiles a script. No code runs.

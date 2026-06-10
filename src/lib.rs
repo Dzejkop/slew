@@ -9,6 +9,7 @@ pub mod bytecode;
 pub mod compiler;
 pub mod lexer;
 pub mod parser;
+pub mod pattern;
 pub mod stdlib;
 pub mod value;
 pub mod vm;
