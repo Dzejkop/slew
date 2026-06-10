@@ -252,7 +252,8 @@ impl<'h> Compiler<'h> {
     }
 
     fn str_const(&mut self, s: &[u8]) -> Result<u16, CompileError> {
-        let id = self.strings.intern(s);
+        // proto constants live outside the GC heap: intern as fixed
+        let id = self.strings.intern_fixed(s);
         self.const_idx(CKey::Str(id), Value::Str(id))
     }
 

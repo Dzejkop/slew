@@ -68,17 +68,54 @@ Everything implemented follows 5.4 rules from the start, in particular:
 - Metatables on all types, full metamethod set (milestone M4).
 - `error` with arbitrary values, `pcall`/`xpcall` as intrinsics.
 
-## Milestones
+## Milestones (all complete)
 
-- **M1 (done)**: lexer, parser (full grammar), compiler + VM for the core
+- **M1**: lexer, parser (full grammar), compiler + VM for the core
   language — locals, control flow, numeric/generic `for`, functions, closures,
   multiple returns, varargs, tables, full operator set on primitives — plus the
   public fuel API with suspension tests.
-- **M2**: metatables + metamethods, `pcall`/`error`, `goto` compilation.
-- **M3**: coroutines (full `coroutine.*`), to-be-closed variables.
-- **M4**: stdlib (`string`, `table`, `math`, sandboxed `os`/`io` opt-ins);
-  natives that call back into Lua (e.g. `table.sort`) via continuation frames.
-- **M5**: mark-sweep GC + memory budget as part of the execution profile.
+- **M2**: metatables + the full metamethod set (as shaped frames, never
+  reentrant Rust), error values, `pcall`/`xpcall` as protected frames,
+  `goto` with scope rules.
+- **M3**: coroutines (threads in the arena; resume/yield switch the dispatch
+  loop), to-be-closed variables with `__close` on all exit paths including
+  error unwinding.
+- **M4**: stdlib — `string` with a full Lua-pattern engine, `table`, `math`
+  (deterministically seeded PRNG). Callback-using functions (`table.sort`,
+  `gsub`, `gmatch`) are written in a Lua prelude compiled at startup, so
+  they are suspendable like all Lua code. `os`/`io` deliberately absent.
+- **M5**: mark-sweep GC over the handle arenas (free-list slot reuse) with
+  roots from globals, live executions, and host anchors; `lua.gc()`,
+  `memory_used()`, auto-collection by allocation threshold, and
+  `memory_limit` as part of the execution profile.
+
+## Execution profile knobs
+
+- `Execution::step(fuel)` — the core budget; debt from surcharges carries.
+- `Lua::memory_limit` — approximate byte ceiling, enforced at collection
+  points ("not enough memory" error).
+- `Lua::gc_alloc_threshold` — auto-GC cadence (0 disables; `lua.gc()` is
+  always available).
+- Call-depth cap (frames are heap data, the host stack is never consumed).
+- `math.random` is deterministic by default (fixed seed).
+
+## Known deviations / caveats
+
+- `Value` handles held by the host are not GC roots: use `lua.anchor(v)` or
+  keep them reachable from Lua. Suspended `Execution`s are roots until they
+  finish or are `abort`ed.
+- `pcall(coroutine.wrap(f))` does not catch errors raised after the wrapped
+  coroutine suspends and later fails (the protection has no frame to attach
+  to across the switch); `coroutine.resume`'s `false, err` convention works.
+- An error raised by a `__close` handler during unwinding supersedes the
+  original error and skips remaining closes up to the next handler.
+- `ipairs` uses raw indexing (no `__index` metamethods).
+- `print` uses raw tostring (no `__tostring`); `tostring()` itself honors it.
+- No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
+  rarely needs them; resources should be host-managed.
+- `string.format` lacks `%a`.
+- `next` iteration order is stable per table state but not PUC's; per-call
+  cost is O(n) (acceptable until tables move to an insertion-ordered map).
 
 ## Non-goals
 

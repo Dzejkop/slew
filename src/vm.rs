@@ -351,6 +351,30 @@ pub struct Lua {
     /// math.random state (xoshiro256**); deterministically seeded so
     /// scripts behave identically run-to-run unless reseeded.
     rng: [u64; 4],
+    // ---- GC state ----
+    tables_live: Vec<bool>,
+    tables_free: Vec<u32>,
+    closures_live: Vec<bool>,
+    closures_free: Vec<u32>,
+    upvals_live: Vec<bool>,
+    upvals_free: Vec<u32>,
+    threads_live: Vec<bool>,
+    threads_free: Vec<u32>,
+    natives_live: Vec<bool>,
+    natives_free: Vec<u32>,
+    /// Root + current thread per live (unfinished) execution.
+    exec_roots: std::collections::HashMap<u32, u32>,
+    /// Host-pinned values (see [`Lua::anchor`]).
+    anchors: Vec<Value>,
+    /// Placeholder proto for swept closure slots.
+    empty_proto: Rc<Proto>,
+    allocs_since_gc: usize,
+    str_bytes_at_gc: usize,
+    /// Auto-GC after this many allocations (0 disables auto collection).
+    pub gc_alloc_threshold: usize,
+    /// Memory ceiling in (approximate) bytes; allocation past it raises a
+    /// Lua error once detected at a collection point.
+    pub memory_limit: Option<usize>,
 }
 
 impl Default for Lua {
@@ -362,7 +386,7 @@ impl Default for Lua {
 impl Lua {
     pub fn new() -> Self {
         let mut strings = Strings::default();
-        let mm_names = MM_NAMES.iter().map(|n| strings.intern(n.as_bytes())).collect();
+        let mm_names = MM_NAMES.iter().map(|n| strings.intern_fixed(n.as_bytes())).collect();
         let mut lua = Lua {
             strings,
             tables: vec![Table::default()],
@@ -378,6 +402,34 @@ impl Lua {
             current_thread: ThreadId(u32::MAX),
             switch_to: None,
             rng: [0; 4],
+            tables_live: vec![true],
+            tables_free: Vec::new(),
+            closures_live: Vec::new(),
+            closures_free: Vec::new(),
+            upvals_live: Vec::new(),
+            upvals_free: Vec::new(),
+            threads_live: Vec::new(),
+            threads_free: Vec::new(),
+            natives_live: Vec::new(),
+            natives_free: Vec::new(),
+            exec_roots: std::collections::HashMap::new(),
+            anchors: Vec::new(),
+            empty_proto: Rc::new(Proto {
+                code: Vec::new(),
+                source: "<empty>".into(),
+                lines: Vec::new(),
+                consts: Vec::new(),
+                protos: Vec::new(),
+                upvals: Vec::new(),
+                nparams: 0,
+                is_vararg: false,
+                max_regs: 0,
+                name: String::new(),
+            }),
+            allocs_since_gc: 0,
+            str_bytes_at_gc: 0,
+            gc_alloc_threshold: 50_000,
+            memory_limit: None,
         };
         lua.seed_random(0x5375734c75615f31); // "SusLua_1"
         crate::stdlib::install(&mut lua);
@@ -426,8 +478,7 @@ impl Lua {
     /// [`Execution::step`] is called.
     pub fn execute(&mut self, chunk: &Chunk) -> Execution {
         let env = self.new_upval(Upval::Closed(Value::Table(self.globals)));
-        let cid = ClosId(self.closures.len() as u32);
-        self.closures.push(LuaClosure { proto: chunk.proto.clone(), upvals: vec![env] });
+        let cid = self.alloc_closure(LuaClosure { proto: chunk.proto.clone(), upvals: vec![env] });
         let mut th = Thread::default();
         th.stack.resize(chunk.proto.max_regs as usize, Value::Nil);
         th.frames.push(Frame {
@@ -444,8 +495,9 @@ impl Lua {
             tbc: Vec::new(),
             varargs: Vec::new(),
         });
-        let tid = ThreadId(self.threads.len() as u32);
-        self.threads.push(th);
+        let tid = self.alloc_thread(th);
+        // GC root for as long as the execution is live
+        self.exec_roots.insert(tid.0, tid.0);
         Execution { thread: tid, current: tid, debt: 0, finished: false }
     }
 
@@ -463,8 +515,20 @@ impl Lua {
     }
 
     pub(crate) fn add_native_kind(&mut self, name: &str, kind: NativeKind) -> Value {
-        let id = NativeId(self.natives.len() as u32);
-        self.natives.push(Native { name: name.into(), kind });
+        self.allocs_since_gc += 1;
+        let n = Native { name: name.into(), kind };
+        let id = match self.natives_free.pop() {
+            Some(i) => {
+                self.natives[i as usize] = n;
+                self.natives_live[i as usize] = true;
+                NativeId(i)
+            }
+            None => {
+                self.natives.push(n);
+                self.natives_live.push(true);
+                NativeId(self.natives.len() as u32 - 1)
+            }
+        };
         Value::Native(id)
     }
 
@@ -476,13 +540,57 @@ impl Lua {
     }
 
     pub fn new_string(&mut self, s: &[u8]) -> Value {
+        self.allocs_since_gc += 1;
         Value::Str(self.strings.intern(s))
     }
 
     pub fn new_table(&mut self) -> Value {
-        let id = TableId(self.tables.len() as u32);
-        self.tables.push(Table::default());
+        self.allocs_since_gc += 1;
+        let id = match self.tables_free.pop() {
+            Some(i) => {
+                self.tables[i as usize] = Table::default();
+                self.tables_live[i as usize] = true;
+                TableId(i)
+            }
+            None => {
+                self.tables.push(Table::default());
+                self.tables_live.push(true);
+                TableId(self.tables.len() as u32 - 1)
+            }
+        };
         Value::Table(id)
+    }
+
+    pub(crate) fn alloc_closure(&mut self, c: LuaClosure) -> ClosId {
+        self.allocs_since_gc += 1;
+        match self.closures_free.pop() {
+            Some(i) => {
+                self.closures[i as usize] = c;
+                self.closures_live[i as usize] = true;
+                ClosId(i)
+            }
+            None => {
+                self.closures.push(c);
+                self.closures_live.push(true);
+                ClosId(self.closures.len() as u32 - 1)
+            }
+        }
+    }
+
+    fn alloc_thread(&mut self, th: Thread) -> ThreadId {
+        self.allocs_since_gc += 1;
+        match self.threads_free.pop() {
+            Some(i) => {
+                self.threads[i as usize] = th;
+                self.threads_live[i as usize] = true;
+                ThreadId(i)
+            }
+            None => {
+                self.threads.push(th);
+                self.threads_live.push(true);
+                ThreadId(self.threads.len() as u32 - 1)
+            }
+        }
     }
 
     /// Creates a coroutine from a function value (for `coroutine.create`).
@@ -490,15 +598,23 @@ impl Lua {
         let mut th = Thread::default();
         th.stack.push(f); // consumed on first resume
         th.status = CoStatus::Start;
-        let tid = ThreadId(self.threads.len() as u32);
-        self.threads.push(th);
-        Value::Thread(tid)
+        Value::Thread(self.alloc_thread(th))
     }
 
     fn new_upval(&mut self, u: Upval) -> UpvalId {
-        let id = UpvalId(self.upvals.len() as u32);
-        self.upvals.push(u);
-        id
+        self.allocs_since_gc += 1;
+        match self.upvals_free.pop() {
+            Some(i) => {
+                self.upvals[i as usize] = u;
+                self.upvals_live[i as usize] = true;
+                UpvalId(i)
+            }
+            None => {
+                self.upvals.push(u);
+                self.upvals_live.push(true);
+                UpvalId(self.upvals.len() as u32 - 1)
+            }
+        }
     }
 
     pub fn get_global(&self, name: &str) -> Value {
@@ -619,9 +735,10 @@ impl Lua {
                     }
                 }
                 Err(mut e) => loop {
-                    // error escaped this thread entirely
+                    // error escaped this thread entirely; close its open
+                    // upvalues (closures may outlive the thread) and kill it
+                    self.close_upvals(&mut th, 0);
                     th.frames.clear();
-                    th.open_upvals.clear();
                     th.status = CoStatus::Dead;
                     let parent = th.parent.take();
                     let rr = th.resume_ret.take();
@@ -842,6 +959,7 @@ impl Lua {
             Instr::NewTable { dst } => {
                 *fuel -= 2;
                 th.stack[base + dst as usize] = self.new_table();
+                self.maybe_gc(tid, th)?;
             }
             Instr::SetList { obj, base: b, n, start } => {
                 let t = match th.stack[base + obj as usize] {
@@ -891,6 +1009,7 @@ impl Lua {
             }
             Instr::Concat { dst, base: b, n } => {
                 self.concat_run(th, fuel, dst, b, n)?;
+                self.maybe_gc(tid, th)?;
             }
             Instr::Jump { off } => {
                 jump(th, off);
@@ -980,9 +1099,9 @@ impl Lua {
                         }
                     }
                 }
-                let cid = ClosId(self.closures.len() as u32);
-                self.closures.push(LuaClosure { proto, upvals: ups });
+                let cid = self.alloc_closure(LuaClosure { proto, upvals: ups });
                 th.stack[base + dst as usize] = Value::Closure(cid);
+                self.maybe_gc(tid, th)?;
             }
             Instr::Close { from } => {
                 self.close_upvals(th, base + from as usize);
@@ -1980,6 +2099,264 @@ impl Lua {
         let source = th.frames.last().map(|f| f.proto.source.clone());
         VmError { val: ErrVal::Msg(message), line: line_of(th), source }
     }
+
+    // ---- garbage collection ----
+
+    /// Pins a value so the host can hold it across collections. Without an
+    /// anchor (or reachability from Lua), a `Value` held only in Rust can
+    /// be collected and its handle becomes stale.
+    pub fn anchor(&mut self, v: Value) {
+        self.anchors.push(v);
+    }
+
+    /// Removes one anchor pin of `v`.
+    pub fn unanchor(&mut self, v: Value) {
+        if let Some(i) = self.anchors.iter().position(|&a| a == v) {
+            self.anchors.swap_remove(i);
+        }
+    }
+
+    /// Runs a full mark-sweep collection. Returns the (approximate) bytes
+    /// in use afterwards.
+    pub fn gc(&mut self) -> usize {
+        self.collect(None);
+        self.memory_used()
+    }
+
+    /// Approximate live heap footprint in bytes.
+    pub fn memory_used(&self) -> usize {
+        let mut total = self.strings.bytes() + self.strings.live_count() * 40;
+        for (i, t) in self.tables.iter().enumerate() {
+            if self.tables_live.get(i).copied().unwrap_or(true) {
+                total += t.mem_estimate();
+            }
+        }
+        for (i, th) in self.threads.iter().enumerate() {
+            if self.threads_live.get(i).copied().unwrap_or(true) {
+                total += 128
+                    + th.stack.capacity() * 16
+                    + th.frames.len() * 192
+                    + th.frames.iter().map(|f| f.varargs.len() * 16).sum::<usize>();
+            }
+        }
+        for (i, c) in self.closures.iter().enumerate() {
+            if self.closures_live.get(i).copied().unwrap_or(true) {
+                total += 48 + c.upvals.len() * 8;
+            }
+        }
+        total += self.upvals.len() * 24;
+        total += self.natives.len() * 56;
+        total
+    }
+
+    /// Auto-GC trigger from allocation sites inside the dispatch loop.
+    /// `th` is the running thread (moved out of the arena), which must be
+    /// traced as an extra root. Enforces the memory ceiling.
+    fn maybe_gc(&mut self, tid: ThreadId, th: &Thread) -> Result<(), VmError> {
+        let due = self.gc_alloc_threshold != 0
+            && (self.allocs_since_gc >= self.gc_alloc_threshold
+                || self.strings.bytes() > self.str_bytes_at_gc + (8 << 20));
+        if due {
+            self.collect(Some((tid, th)));
+        }
+        if let Some(limit) = self.memory_limit {
+            // only re-measured at collection points; cheap proxy otherwise
+            if due && self.memory_used() > limit {
+                return Err(self.rt_err(th, "not enough memory".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect(&mut self, extra: Option<(ThreadId, &Thread)>) {
+        let mut m = Marks {
+            strings: vec![false; self.strings.len()],
+            tables: vec![false; self.tables.len()],
+            closures: vec![false; self.closures.len()],
+            natives: vec![false; self.natives.len()],
+            upvals: vec![false; self.upvals.len()],
+            threads: vec![false; self.threads.len()],
+        };
+        let mut work: Vec<Value> = Vec::with_capacity(64);
+        // roots
+        work.push(Value::Table(self.globals));
+        work.push(self.builtin_next);
+        work.push(self.builtin_ipairs_iter);
+        if let Some(sm) = self.string_meta {
+            work.push(Value::Table(sm));
+        }
+        work.extend_from_slice(&self.anchors);
+        for (&root, &cur) in &self.exec_roots {
+            work.push(Value::Thread(ThreadId(root)));
+            work.push(Value::Thread(ThreadId(cur)));
+        }
+        if let Some((etid, eth)) = extra {
+            m.threads[etid.0 as usize] = true;
+            Self::trace_thread(eth, &mut m, &mut work, &self.upvals);
+        }
+        while let Some(v) = work.pop() {
+            match v {
+                Value::Str(s) => m.strings[s.0 as usize] = true,
+                Value::Table(t) => {
+                    let i = t.0 as usize;
+                    if !m.tables[i] {
+                        m.tables[i] = true;
+                        self.tables[i].trace(|v| work.push(v));
+                        if let Some(mt) = self.tables[i].metatable {
+                            work.push(Value::Table(mt));
+                        }
+                    }
+                }
+                Value::Closure(c) => {
+                    let i = c.0 as usize;
+                    if !m.closures[i] {
+                        m.closures[i] = true;
+                        for &uid in &self.closures[i].upvals {
+                            mark_upval(uid, &mut m, &mut work, &self.upvals);
+                        }
+                    }
+                }
+                Value::Native(n) => {
+                    let i = n.0 as usize;
+                    if !m.natives[i] {
+                        m.natives[i] = true;
+                        if let NativeKind::Intrinsic(Intrinsic::WrapResume(t)) =
+                            self.natives[i].kind
+                        {
+                            work.push(Value::Thread(t));
+                        }
+                    }
+                }
+                Value::Thread(t) => {
+                    let i = t.0 as usize;
+                    if !m.threads[i] {
+                        m.threads[i] = true;
+                        Self::trace_thread(&self.threads[i], &mut m, &mut work, &self.upvals);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.sweep(&m);
+        self.allocs_since_gc = 0;
+        self.str_bytes_at_gc = self.strings.bytes();
+    }
+
+    fn trace_thread(th: &Thread, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
+        for &v in &th.stack {
+            work.push(v);
+        }
+        for f in &th.frames {
+            work.push(Value::Closure(f.closure));
+            if let Some(h) = f.handler {
+                work.push(h);
+            }
+            for &v in &f.varargs {
+                work.push(v);
+            }
+            for p in &f.pending {
+                match *p {
+                    Pending::CallClose { v, err } => {
+                        work.push(v);
+                        work.push(err);
+                    }
+                    Pending::DeliverError { err, handler, .. } => {
+                        work.push(err);
+                        if let Some(h) = handler {
+                            work.push(h);
+                        }
+                    }
+                    Pending::CloseTbc { err, .. } => work.push(err),
+                    Pending::Concat { .. } | Pending::FinishReturn { .. } => {}
+                }
+            }
+        }
+        for &(_, uid) in &th.open_upvals {
+            mark_upval(uid, m, work, upvals);
+        }
+        if let Some(p) = th.parent {
+            work.push(Value::Thread(p));
+        }
+    }
+
+    fn sweep(&mut self, m: &Marks) {
+        // dying threads may have open upvalues that survive through
+        // closures: close them (copy the values out) first
+        for i in 0..self.threads.len() {
+            if m.threads[i] || !self.threads_live[i] {
+                continue;
+            }
+            let ou = std::mem::take(&mut self.threads[i].open_upvals);
+            for (idx, uid) in ou {
+                if m.upvals[uid.0 as usize] {
+                    let v = self.threads[i].stack.get(idx).copied().unwrap_or(Value::Nil);
+                    self.upvals[uid.0 as usize] = Upval::Closed(v);
+                }
+            }
+        }
+        for i in 0..self.tables.len() {
+            if !m.tables[i] && self.tables_live[i] {
+                self.tables_live[i] = false;
+                self.tables_free.push(i as u32);
+                self.tables[i] = Table::default();
+            }
+        }
+        for i in 0..self.closures.len() {
+            if !m.closures[i] && self.closures_live[i] {
+                self.closures_live[i] = false;
+                self.closures_free.push(i as u32);
+                self.closures[i] =
+                    LuaClosure { proto: self.empty_proto.clone(), upvals: Vec::new() };
+            }
+        }
+        for i in 0..self.upvals.len() {
+            if !m.upvals[i] && self.upvals_live[i] {
+                self.upvals_live[i] = false;
+                self.upvals_free.push(i as u32);
+                self.upvals[i] = Upval::Closed(Value::Nil);
+            }
+        }
+        for i in 0..self.threads.len() {
+            if !m.threads[i] && self.threads_live[i] {
+                self.threads_live[i] = false;
+                self.threads_free.push(i as u32);
+                self.threads[i] = Thread::default();
+            }
+        }
+        for i in 0..self.natives.len() {
+            if !m.natives[i] && self.natives_live[i] {
+                self.natives_live[i] = false;
+                self.natives_free.push(i as u32);
+                self.natives[i] = Native { name: String::new(), kind: NativeKind::Plain(n_dead) };
+            }
+        }
+        self.strings.sweep(&m.strings);
+    }
+}
+
+fn n_dead(_: &mut Lua, _: &[Value]) -> Result<Vec<Value>, String> {
+    Err("attempt to call a collected function".into())
+}
+
+struct Marks {
+    strings: Vec<bool>,
+    tables: Vec<bool>,
+    closures: Vec<bool>,
+    natives: Vec<bool>,
+    upvals: Vec<bool>,
+    threads: Vec<bool>,
+}
+
+fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
+    let i = uid.0 as usize;
+    if m.upvals[i] {
+        return;
+    }
+    m.upvals[i] = true;
+    match upvals[i] {
+        Upval::Closed(v) => work.push(v),
+        Upval::Open(t, _) => work.push(Value::Thread(t)),
+    }
 }
 
 struct CallSpec {
@@ -2046,18 +2423,29 @@ impl Execution {
         match lua.run(self.current, &mut remaining) {
             Ok(RunOutcome::Done(vals)) => {
                 self.finished = true;
+                lua.exec_roots.remove(&self.thread.0);
                 Ok(Step::Done(vals))
             }
             Ok(RunOutcome::Pending(current)) => {
                 self.current = current;
+                lua.exec_roots.insert(self.thread.0, current.0);
                 self.debt = (-remaining).max(0);
                 Ok(Step::Pending)
             }
             Err(e) => {
                 self.finished = true;
+                lua.exec_roots.remove(&self.thread.0);
                 Err(Error::Runtime(e))
             }
         }
+    }
+
+    /// Abandons a suspended execution, releasing its GC roots. Without
+    /// this (or running to completion), the execution's threads stay
+    /// rooted for the lifetime of the `Lua`.
+    pub fn abort(mut self, lua: &mut Lua) {
+        self.finished = true;
+        lua.exec_roots.remove(&self.thread.0);
     }
 
     pub fn is_finished(&self) -> bool {

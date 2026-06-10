@@ -55,20 +55,52 @@ impl Value {
 
 /// String interner. Every live Lua string is interned, so `StrId` equality
 /// is string equality and strings hash O(1) as table keys.
+///
+/// Strings referenced from compiled `Proto` constants are interned as
+/// *fixed*: protos live outside the GC heap (host-held `Chunk`s, `Rc`s in
+/// closures), so their strings are never swept. Everything created at
+/// runtime is collectable.
 #[derive(Default)]
 pub struct Strings {
-    vec: Vec<Rc<[u8]>>,
+    vec: Vec<Option<Rc<[u8]>>>,
+    fixed: Vec<bool>,
     map: HashMap<Rc<[u8]>, StrId>,
+    free: Vec<u32>,
+    /// Total bytes of live string data.
+    bytes: usize,
 }
 
 impl Strings {
     pub fn intern(&mut self, s: &[u8]) -> StrId {
+        self.intern_impl(s, false)
+    }
+
+    /// Interns a string that is never garbage collected.
+    pub fn intern_fixed(&mut self, s: &[u8]) -> StrId {
+        self.intern_impl(s, true)
+    }
+
+    fn intern_impl(&mut self, s: &[u8], fixed: bool) -> StrId {
         if let Some(&id) = self.map.get(s) {
+            if fixed {
+                self.fixed[id.0 as usize] = true;
+            }
             return id;
         }
         let rc: Rc<[u8]> = s.into();
-        let id = StrId(self.vec.len() as u32);
-        self.vec.push(rc.clone());
+        self.bytes += s.len();
+        let id = match self.free.pop() {
+            Some(slot) => {
+                self.vec[slot as usize] = Some(rc.clone());
+                self.fixed[slot as usize] = fixed;
+                StrId(slot)
+            }
+            None => {
+                self.vec.push(Some(rc.clone()));
+                self.fixed.push(fixed);
+                StrId(self.vec.len() as u32 - 1)
+            }
+        };
         self.map.insert(rc, id);
         id
     }
@@ -79,11 +111,44 @@ impl Strings {
     }
 
     pub fn get(&self, id: StrId) -> &[u8] {
-        &self.vec[id.0 as usize]
+        self.vec[id.0 as usize].as_deref().expect("stale StrId")
     }
 
     pub fn get_str_lossy(&self, id: StrId) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(self.get(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vec.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Number of live (interned, unswept) strings.
+    pub fn live_count(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Sweeps unmarked, non-fixed strings. `marked` is indexed by `StrId`.
+    pub(crate) fn sweep(&mut self, marked: &[bool]) -> usize {
+        let mut freed = 0;
+        for i in 0..self.vec.len() {
+            if self.fixed[i] || marked.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(rc) = self.vec[i].take() else { continue };
+            self.bytes -= rc.len();
+            self.map.remove(&rc);
+            self.free.push(i as u32);
+            freed += 1;
+        }
+        freed
     }
 }
 
@@ -208,6 +273,23 @@ impl Table {
             i += 1;
         }
         i
+    }
+
+    /// Visits every value reachable from this table (array values, hash
+    /// keys and values) — for the garbage collector.
+    pub(crate) fn trace(&self, mut f: impl FnMut(Value)) {
+        for &v in &self.array {
+            f(v);
+        }
+        for (&k, &v) in &self.hash {
+            f(key_to_value(k));
+            f(v);
+        }
+    }
+
+    /// Rough heap footprint in bytes, for memory budgeting.
+    pub fn mem_estimate(&self) -> usize {
+        64 + self.array.capacity() * 16 + self.hash.capacity() * 48
     }
 
     /// Iteration support for `next`: a stable snapshot order is array part
