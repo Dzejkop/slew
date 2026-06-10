@@ -4,7 +4,7 @@
 //! as VM intrinsics.
 
 use crate::value::{to_key, Value};
-use crate::vm::{Intrinsic, Lua};
+use crate::vm::{CoStatus, Intrinsic, Lua, NativeKind};
 
 pub fn install(lua: &mut Lua) {
     lua.register_native("print", n_print);
@@ -28,6 +28,77 @@ pub fn install(lua: &mut Lua) {
     lua.register_intrinsic("tostring", Intrinsic::ToString);
     lua.register_intrinsic("pcall", Intrinsic::Pcall);
     lua.register_intrinsic("xpcall", Intrinsic::Xpcall);
+    install_coroutine(lua);
+}
+
+fn set_field(lua: &mut Lua, t: Value, name: &str, v: Value) {
+    let Value::Table(id) = t else { unreachable!() };
+    let k = lua.new_string(name.as_bytes());
+    lua.tables[id.0 as usize].set(k, v).unwrap();
+}
+
+fn install_coroutine(lua: &mut Lua) {
+    let ct = lua.new_table();
+    lua.set_global("coroutine", ct);
+    let create = lua.add_native("create", n_co_create);
+    set_field(lua, ct, "create", create);
+    let status = lua.add_native("status", n_co_status);
+    set_field(lua, ct, "status", status);
+    let wrap = lua.add_native("wrap", n_co_wrap);
+    set_field(lua, ct, "wrap", wrap);
+    let resume = lua.add_native_kind("resume", NativeKind::Intrinsic(Intrinsic::Resume));
+    set_field(lua, ct, "resume", resume);
+    let yield_ = lua.add_native_kind("yield", NativeKind::Intrinsic(Intrinsic::Yield));
+    set_field(lua, ct, "yield", yield_);
+    let isyieldable =
+        lua.add_native_kind("isyieldable", NativeKind::Intrinsic(Intrinsic::IsYieldable));
+    set_field(lua, ct, "isyieldable", isyieldable);
+    let running = lua.add_native_kind("running", NativeKind::Intrinsic(Intrinsic::Running));
+    set_field(lua, ct, "running", running);
+}
+
+fn n_co_create(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    match arg(args, 0) {
+        f @ (Value::Closure(_) | Value::Native(_)) => Ok(vec![lua.create_coroutine(f)]),
+        v => Err(format!(
+            "bad argument #1 to 'create' (function expected, got {})",
+            v.type_name()
+        )),
+    }
+}
+
+fn n_co_status(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Value::Thread(co) = arg(args, 0) else {
+        return Err("bad argument #1 to 'status' (coroutine expected)".into());
+    };
+    let s: &str = if co == lua.current_thread {
+        "running"
+    } else {
+        match lua.threads[co.0 as usize].status {
+            CoStatus::Start | CoStatus::Suspended => "suspended",
+            CoStatus::Normal => "normal",
+            CoStatus::Running => "running",
+            CoStatus::Dead => "dead",
+        }
+    };
+    Ok(vec![lua.new_string(s.as_bytes())])
+}
+
+fn n_co_wrap(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    match arg(args, 0) {
+        f @ (Value::Closure(_) | Value::Native(_)) => {
+            let Value::Thread(tid) = lua.create_coroutine(f) else { unreachable!() };
+            let wrapper = lua.add_native_kind(
+                "(coroutine wrapper)",
+                NativeKind::Intrinsic(Intrinsic::WrapResume(tid)),
+            );
+            Ok(vec![wrapper])
+        }
+        v => Err(format!(
+            "bad argument #1 to 'wrap' (function expected, got {})",
+            v.type_name()
+        )),
+    }
 }
 
 fn n_setmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {

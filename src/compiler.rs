@@ -284,7 +284,7 @@ impl<'h> Compiler<'h> {
         let mut close_from: Option<u8> = None;
         while fs.locals.len() > floor {
             let l = fs.locals.pop().unwrap();
-            if l.captured {
+            if l.captured || l.attrib == Attrib::Close {
                 close_from = Some(close_from.map_or(l.reg, |c| c.min(l.reg)));
             }
         }
@@ -464,17 +464,16 @@ impl<'h> Compiler<'h> {
             }
             Stmt::Local { names, values, line } => {
                 self.at_line(*line);
-                for (name, attrib) in names {
-                    if *attrib == Attrib::Close {
-                        return self.err(format!(
-                            "to-be-closed variable '{name}' is not supported yet (milestone M3)"
-                        ));
-                    }
+                if names.iter().filter(|(_, a)| *a == Attrib::Close).count() > 1 {
+                    return self.err("multiple to-be-closed variables in local list");
                 }
                 let base = self.fs().free_reg;
                 self.explist_to(values, names.len())?;
                 for (i, (name, attrib)) in names.iter().enumerate() {
                     self.declare_local(name.clone(), base + i as u8, *attrib);
+                    if *attrib == Attrib::Close {
+                        self.emit(Instr::Tbc { reg: base + i as u8 });
+                    }
                 }
                 // locals stay allocated
                 self.fs().free_reg = base + names.len() as u8;

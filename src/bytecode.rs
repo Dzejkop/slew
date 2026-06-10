@@ -72,8 +72,11 @@ pub enum Instr {
     Return { base: u8, n: u8 },
     Vararg { dst: u8, n: u8 },
     Closure { dst: u8, p: u16 },
-    /// Closes open upvalues at register `from` and above.
+    /// Closes open upvalues at register `from` and above, and runs
+    /// `__close` on to-be-closed variables at or above it.
     Close { from: u8 },
+    /// Marks the register as a to-be-closed variable (`local x <close>`).
+    Tbc { reg: u8 },
     /// Numeric for: `base` holds (counter, limit, step); `base+3` is the
     /// visible variable. ForPrep validates and jumps past ForLoop when the
     /// loop runs zero times; ForLoop steps and jumps back while in range.

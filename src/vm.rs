@@ -84,7 +84,7 @@ pub(crate) struct VmError {
 pub type NativeFn = fn(&mut Lua, &[Value]) -> Result<Vec<Value>, String>;
 
 /// Builtins that must interact with the frame machinery (raise error
-/// values, set up protected calls, call metamethods).
+/// values, set up protected calls, call metamethods, switch threads).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Intrinsic {
     Pcall,
@@ -92,6 +92,13 @@ pub(crate) enum Intrinsic {
     Error,
     Assert,
     ToString,
+    Resume,
+    Yield,
+    /// The function returned by `coroutine.wrap`: resumes its thread,
+    /// returns results bare, propagates errors.
+    WrapResume(ThreadId),
+    IsYieldable,
+    Running,
 }
 
 pub(crate) enum NativeKind {
@@ -129,12 +136,23 @@ enum RetShape {
 }
 
 /// A continuation the frame must run when it becomes the top of the stack
-/// again (after a metamethod call it triggered returns).
+/// again (after a metamethod call it triggered returns). Processed LIFO,
+/// one per dispatch step, before the next instruction fetch.
 #[derive(Clone, Copy, Debug)]
 enum Pending {
     /// Re-run concatenation over registers `base..base+n` into `dst`; the
     /// metamethod result was stored at `base+n-1`.
     Concat { dst: u8, base: u8, n: u8 },
+    /// Run `__close` on to-be-closed variables at register `from` and
+    /// above (one call per step; re-arms itself).
+    CloseTbc { from: u8, err: Value },
+    /// Call `__close(v, err)` for a value collected during error unwind.
+    CallClose { v: Value, err: Value },
+    /// Final step of error recovery: deliver `false, err` (or run the
+    /// xpcall handler) at the protected call's result slots.
+    DeliverError { ret_to: usize, nres: u8, err: Value, handler: Option<Value> },
+    /// Final step of a return that had to run `__close` handlers first.
+    FinishReturn { start: usize, count: usize },
 }
 
 struct Frame {
@@ -152,7 +170,33 @@ struct Frame {
     /// xpcall message handler.
     handler: Option<Value>,
     pending: Vec<Pending>,
+    /// Registers holding active to-be-closed variables (ascending).
+    tbc: Vec<u8>,
     varargs: Vec<Value>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CoStatus {
+    /// Created, never resumed.
+    #[default]
+    Start,
+    Suspended,
+    Running,
+    /// Resumed another coroutine and is waiting for it.
+    Normal,
+    Dead,
+}
+
+/// Where a coroutine's yield/return values go in the thread that resumed it.
+#[derive(Clone, Copy)]
+struct ResumeRet {
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    /// Prepend the ok/fail boolean (resume) or not (wrap).
+    status_bool: bool,
+    /// Propagate errors into the resumer (wrap) instead of returning them.
+    wrap: bool,
 }
 
 #[derive(Default)]
@@ -163,6 +207,13 @@ pub(crate) struct Thread {
     open_upvals: Vec<(usize, UpvalId)>,
     /// Top of the last multret sequence (absolute).
     top: usize,
+    pub(crate) status: CoStatus,
+    /// The thread that resumed this one.
+    parent: Option<ThreadId>,
+    /// Result-delivery info in the parent (set at each resume).
+    resume_ret: Option<ResumeRet>,
+    /// Where the next resume's arguments land (set at each yield).
+    yield_ret: Option<(usize, u8, RetShape)>,
 }
 
 /// A compiled script, reusable across executions.
@@ -189,7 +240,12 @@ pub enum Step {
 /// A suspendable run of a chunk. Created by [`Lua::execute`]; all VM state
 /// lives in the `Lua`, this is a handle plus fuel-debt bookkeeping.
 pub struct Execution {
+    /// Root thread of this execution (a GC root while the execution lives).
+    #[allow(dead_code)]
     thread: ThreadId,
+    /// Thread to resume on the next step (a coroutine may have been
+    /// running when fuel ran out).
+    current: ThreadId,
     /// Fuel overdrawn by the last step (surcharges can overshoot), repaid
     /// from the next budget.
     debt: i64,
@@ -286,6 +342,12 @@ pub struct Lua {
     pub(crate) builtin_ipairs_iter: Value,
     pub(crate) string_meta: Option<TableId>,
     mm_names: Vec<StrId>,
+    /// Thread being dispatched right now (its `Thread` is temporarily
+    /// moved out of the arena).
+    pub(crate) current_thread: ThreadId,
+    /// Set by resume/yield intrinsics; the dispatch loop performs the
+    /// actual thread switch.
+    switch_to: Option<ThreadId>,
 }
 
 impl Default for Lua {
@@ -310,6 +372,8 @@ impl Lua {
             builtin_ipairs_iter: Value::Nil,
             string_meta: None,
             mm_names,
+            current_thread: ThreadId(u32::MAX),
+            switch_to: None,
         };
         crate::stdlib::install(&mut lua);
         lua
@@ -346,11 +410,12 @@ impl Lua {
             protected: false,
             handler: None,
             pending: Vec::new(),
+            tbc: Vec::new(),
             varargs: Vec::new(),
         });
         let tid = ThreadId(self.threads.len() as u32);
         self.threads.push(th);
-        Execution { thread: tid, debt: 0, finished: false }
+        Execution { thread: tid, current: tid, debt: 0, finished: false }
     }
 
     /// Registers a native function as a global.
@@ -387,6 +452,16 @@ impl Lua {
         let id = TableId(self.tables.len() as u32);
         self.tables.push(Table::default());
         Value::Table(id)
+    }
+
+    /// Creates a coroutine from a function value (for `coroutine.create`).
+    pub(crate) fn create_coroutine(&mut self, f: Value) -> Value {
+        let mut th = Thread::default();
+        th.stack.push(f); // consumed on first resume
+        th.status = CoStatus::Start;
+        let tid = ThreadId(self.threads.len() as u32);
+        self.threads.push(th);
+        Value::Thread(tid)
     }
 
     fn new_upval(&mut self, u: Upval) -> UpvalId {
@@ -433,6 +508,7 @@ impl Lua {
             Value::Table(t) => format!("table: 0x{:08x}", t.0),
             Value::Closure(c) => format!("function: 0x{:08x}", c.0),
             Value::Native(n) => format!("function: builtin: {}", self.natives[n.0 as usize].name),
+            Value::Thread(t) => format!("thread: 0x{:08x}", t.0),
         }
     }
 
@@ -476,15 +552,77 @@ impl Lua {
 
     // ---- dispatch ----
 
-    fn run(&mut self, tid: ThreadId, fuel: &mut i64) -> Result<Option<Vec<Value>>, RuntimeError> {
-        let mut th = std::mem::take(&mut self.threads[tid.0 as usize]);
-        let r = self.dispatch(tid, &mut th, fuel);
-        if r.is_err() {
-            th.frames.clear();
-            th.stack.clear();
+    /// Drives execution starting at `start`, following coroutine switches,
+    /// until fuel runs out, the root thread finishes, or an error escapes
+    /// every protection boundary.
+    fn run(&mut self, start: ThreadId, fuel: &mut i64) -> Result<RunOutcome, RuntimeError> {
+        let mut cur = start;
+        let mut th = std::mem::take(&mut self.threads[cur.0 as usize]);
+        th.status = CoStatus::Running;
+        loop {
+            self.current_thread = cur;
+            match self.dispatch(cur, &mut th, fuel) {
+                Ok(DispatchEnd::Pending) => {
+                    self.threads[cur.0 as usize] = th;
+                    return Ok(RunOutcome::Pending(cur));
+                }
+                Ok(DispatchEnd::Switch(next)) => {
+                    self.threads[cur.0 as usize] = th;
+                    cur = next;
+                    th = std::mem::take(&mut self.threads[cur.0 as usize]);
+                }
+                Ok(DispatchEnd::Finished(vals)) => {
+                    // thread ran to completion
+                    th.status = CoStatus::Dead;
+                    let parent = th.parent.take();
+                    let rr = th.resume_ret.take();
+                    self.threads[cur.0 as usize] = th;
+                    match parent {
+                        None => return Ok(RunOutcome::Done(vals)),
+                        Some(p) => {
+                            cur = p;
+                            th = std::mem::take(&mut self.threads[cur.0 as usize]);
+                            th.status = CoStatus::Running;
+                            deliver_resume(&mut th, rr.unwrap(), true, &vals);
+                        }
+                    }
+                }
+                Err(mut e) => loop {
+                    // error escaped this thread entirely
+                    th.frames.clear();
+                    th.open_upvals.clear();
+                    th.status = CoStatus::Dead;
+                    let parent = th.parent.take();
+                    let rr = th.resume_ret.take();
+                    th.stack.clear();
+                    self.threads[cur.0 as usize] = th;
+                    match parent {
+                        None => return Err(self.materialize_error(e)),
+                        Some(p) => {
+                            cur = p;
+                            self.current_thread = cur;
+                            th = std::mem::take(&mut self.threads[cur.0 as usize]);
+                            th.status = CoStatus::Running;
+                            let rr = rr.unwrap();
+                            if rr.wrap {
+                                // wrap propagates the error into the resumer
+                                match self.recover(&mut th, e) {
+                                    Ok(()) => break,
+                                    Err(e2) => {
+                                        e = e2;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                let errv = self.err_value(&e);
+                                deliver_resume(&mut th, rr, false, &[errv]);
+                                break;
+                            }
+                        }
+                    }
+                },
+            }
         }
-        self.threads[tid.0 as usize] = th;
-        r.map_err(|e| self.materialize_error(e))
     }
 
     fn materialize_error(&mut self, e: VmError) -> RuntimeError {
@@ -510,58 +648,65 @@ impl Lua {
         tid: ThreadId,
         th: &mut Thread,
         fuel: &mut i64,
-    ) -> Result<Option<Vec<Value>>, VmError> {
+    ) -> Result<DispatchEnd, VmError> {
         loop {
             if *fuel <= 0 {
-                return Ok(None);
+                return Ok(DispatchEnd::Pending);
             }
             match self.exec_one(tid, th, fuel) {
                 Ok(Flow::Continue) => {}
-                Ok(Flow::Finished(vals)) => return Ok(Some(vals)),
-                Err(e) => self.recover(th, e, fuel)?,
+                Ok(Flow::Finished(vals)) => return Ok(DispatchEnd::Finished(vals)),
+                Err(e) => self.recover(th, e)?,
+            }
+            if let Some(next) = self.switch_to.take() {
+                return Ok(DispatchEnd::Switch(next));
             }
         }
     }
 
     /// Unwinds to the nearest protected frame; re-raises if none exists.
-    fn recover(&mut self, th: &mut Thread, mut e: VmError, fuel: &mut i64) -> Result<(), VmError> {
+    /// Recovery is staged as pendings on the frame below the protection
+    /// boundary: first any `__close` handlers of unwound to-be-closed
+    /// variables (with the error object), then error delivery (directly or
+    /// via the xpcall handler).
+    fn recover(&mut self, th: &mut Thread, e: VmError) -> Result<(), VmError> {
+        // values of to-be-closed variables in unwound frames, innermost first
+        let mut to_close: Vec<Value> = Vec::new();
         loop {
-            loop {
-                match th.frames.last() {
-                    None => return Err(e),
-                    Some(f) if f.protected => break,
-                    Some(_) => {
-                        let f = th.frames.pop().unwrap();
-                        self.close_upvals(th, f.base);
+            match th.frames.last() {
+                None => return Err(e),
+                Some(f) if f.protected => break,
+                Some(_) => {
+                    let f = th.frames.pop().unwrap();
+                    for &r in f.tbc.iter().rev() {
+                        to_close.push(th.stack[f.base + r as usize]);
                     }
-                }
-            }
-            let pf = th.frames.pop().unwrap();
-            self.close_upvals(th, pf.base);
-            let errv = self.err_value(&e);
-            match pf.handler {
-                None => {
-                    place_results(th, pf.ret_to, pf.nres, &[Value::Bool(false), errv]);
-                    return Ok(());
-                }
-                Some(h) => {
-                    match self.call_value(
-                        th,
-                        h,
-                        &[errv],
-                        pf.ret_to,
-                        pf.nres,
-                        RetShape::PrependFalse,
-                        fuel,
-                    ) {
-                        Ok(()) => return Ok(()),
-                        // handler itself failed (e.g. not callable): keep
-                        // unwinding toward the next protected frame
-                        Err(e2) => e = e2,
-                    }
+                    self.close_upvals(th, f.base);
                 }
             }
         }
+        let pf = th.frames.pop().unwrap();
+        for &r in pf.tbc.iter().rev() {
+            to_close.push(th.stack[pf.base + r as usize]);
+        }
+        self.close_upvals(th, pf.base);
+        let errv = self.err_value(&e);
+        let Some(below) = th.frames.last_mut() else {
+            // a protected root frame shouldn't exist (pcall always pushes
+            // below an existing frame), but fail safe
+            return Err(e);
+        };
+        below.pending.push(Pending::DeliverError {
+            ret_to: pf.ret_to,
+            nres: pf.nres,
+            err: errv,
+            handler: pf.handler,
+        });
+        // outermost closes are pushed first so the innermost pops first
+        for v in to_close.into_iter().rev() {
+            below.pending.push(Pending::CallClose { v, err: errv });
+        }
+        Ok(())
     }
 
     fn exec_one(
@@ -571,12 +716,39 @@ impl Lua {
         fuel: &mut i64,
     ) -> Result<Flow, VmError> {
         *fuel -= 1;
-        // run continuations (e.g. a concat interrupted by a metamethod call)
-        // before fetching the next instruction
+        // run continuations (e.g. a concat interrupted by a metamethod call,
+        // staged __close handlers) before fetching the next instruction
         if !th.frames.last().unwrap().pending.is_empty() {
             let p = th.frames.last_mut().unwrap().pending.pop().unwrap();
             match p {
                 Pending::Concat { dst, base, n } => self.concat_run(th, fuel, dst, base, n)?,
+                Pending::CloseTbc { from, err } => self.run_close_tbc(th, fuel, from, err)?,
+                Pending::CallClose { v, err } => {
+                    let mm = self.metamethod(v, Mm::Close);
+                    if mm != Value::Nil {
+                        let scratch = scratch_base(th);
+                        self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel)?;
+                    }
+                }
+                Pending::DeliverError { ret_to, nres, err, handler } => match handler {
+                    None => {
+                        place_results(th, ret_to, nres, &[Value::Bool(false), err]);
+                    }
+                    Some(h) => {
+                        self.call_value(th, h, &[err], ret_to, nres, RetShape::PrependFalse, fuel)?;
+                    }
+                },
+                Pending::FinishReturn { start, count } => {
+                    let frame = th.frames.pop().unwrap();
+                    self.close_upvals(th, frame.base);
+                    if th.frames.is_empty() {
+                        let vals = th.stack[start..start + count].to_vec();
+                        th.stack.clear();
+                        th.top = 0;
+                        return Ok(Flow::Finished(vals));
+                    }
+                    deliver_return(th, &frame, start, count);
+                }
             }
             return Ok(Flow::Continue);
         }
@@ -720,6 +892,18 @@ impl Lua {
                 )?;
             }
             Instr::Return { base: b, n } => {
+                if !th.frames.last().unwrap().tbc.is_empty() {
+                    // run __close handlers before completing the return;
+                    // snapshot the value window now (closes may clobber top)
+                    let fb = th.frames.last().unwrap().base;
+                    let start = fb + b as usize;
+                    let count =
+                        if n == 0 { th.top.saturating_sub(start) } else { (n - 1) as usize };
+                    let f = th.frames.last_mut().unwrap();
+                    f.pending.push(Pending::FinishReturn { start, count });
+                    f.pending.push(Pending::CloseTbc { from: 0, err: Value::Nil });
+                    return Ok(Flow::Continue);
+                }
                 let frame = th.frames.pop().unwrap();
                 self.close_upvals(th, frame.base);
                 let start = frame.base + b as usize;
@@ -771,6 +955,25 @@ impl Lua {
             }
             Instr::Close { from } => {
                 self.close_upvals(th, base + from as usize);
+                self.run_close_tbc(th, fuel, from, Value::Nil)?;
+            }
+            Instr::Tbc { reg } => {
+                let v = th.stack[base + reg as usize];
+                match v {
+                    Value::Nil | Value::Bool(false) => {}
+                    _ if self.metamethod(v, Mm::Close) != Value::Nil => {
+                        th.frames.last_mut().unwrap().tbc.push(reg);
+                    }
+                    _ => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "variable of a <close> declaration got a non-closable {} value",
+                                v.type_name()
+                            ),
+                        ))
+                    }
+                }
             }
             Instr::ForPrep { base: b, off } => {
                 self.for_prep(th, base + b as usize, off)?;
@@ -878,6 +1081,7 @@ impl Lua {
                         protected,
                         handler,
                         pending: Vec::new(),
+                        tbc: Vec::new(),
                         varargs,
                     });
                     return Ok(());
@@ -1066,6 +1270,174 @@ impl Lua {
                 th.stack[wb] = f;
                 th.stack.copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
                 self.protected_call(th, fuel, wb, n_args, ret_to, nres, Some(handler))
+            }
+            Intrinsic::Resume => {
+                let co = arg(th, 0);
+                let Value::Thread(co) = co else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'resume' (coroutine expected, got {})",
+                            co.type_name()
+                        ),
+                    ));
+                };
+                let args: Vec<Value> = th.stack[func_abs + 2..func_abs + 1 + argc].to_vec();
+                self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, false)
+            }
+            Intrinsic::WrapResume(co) => {
+                let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
+                self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, true)
+            }
+            Intrinsic::Yield => {
+                let Some(parent) = th.parent else {
+                    return Err(
+                        self.rt_err(th, "attempt to yield from outside a coroutine".into())
+                    );
+                };
+                *fuel -= 3;
+                let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
+                let rr = th.resume_ret.expect("resumed thread has resume_ret");
+                th.status = CoStatus::Suspended;
+                // the next resume's arguments become this yield call's results
+                th.yield_ret = Some((ret_to, nres, shape));
+                let parent_th = &mut self.threads[parent.0 as usize];
+                parent_th.status = CoStatus::Running;
+                deliver_resume(parent_th, rr, true, &args);
+                self.switch_to = Some(parent);
+                Ok(())
+            }
+            Intrinsic::IsYieldable => {
+                let r = Value::Bool(th.parent.is_some());
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::Running => {
+                let cur = Value::Thread(self.current_thread);
+                let is_main = Value::Bool(th.parent.is_none());
+                place_shaped(th, ret_to, nres, shape, &[cur, is_main]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Shared by `coroutine.resume` and wrapped coroutines.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_thread(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        co: ThreadId,
+        args: &[Value],
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+        wrap: bool,
+    ) -> Result<(), VmError> {
+        let fail = |me: &mut Self, th: &mut Thread, msg: &str| -> Result<(), VmError> {
+            if wrap {
+                Err(me.rt_err(th, msg.into()))
+            } else {
+                let m = me.new_string(msg.as_bytes());
+                place_shaped(th, ret_to, nres, shape, &[Value::Bool(false), m]);
+                Ok(())
+            }
+        };
+        if co == self.current_thread {
+            return fail(self, th, "cannot resume non-suspended coroutine");
+        }
+        let status = self.threads[co.0 as usize].status;
+        match status {
+            CoStatus::Dead => fail(self, th, "cannot resume dead coroutine"),
+            CoStatus::Running | CoStatus::Normal => {
+                fail(self, th, "cannot resume non-suspended coroutine")
+            }
+            CoStatus::Start | CoStatus::Suspended => {
+                *fuel -= 3;
+                let rr = ResumeRet { ret_to, nres, shape, status_bool: !wrap, wrap };
+                {
+                    let co_th = &mut self.threads[co.0 as usize];
+                    co_th.resume_ret = Some(rr);
+                    co_th.parent = Some(self.current_thread);
+                }
+                if status == CoStatus::Start {
+                    // body function was stashed at stack[0] by create()
+                    let f = self.threads[co.0 as usize].stack[0];
+                    match f {
+                        Value::Closure(cid) => {
+                            let proto = self.closures[cid.0 as usize].proto.clone();
+                            let co_th = &mut self.threads[co.0 as usize];
+                            let np = proto.nparams as usize;
+                            ensure_len(
+                                &mut co_th.stack,
+                                1 + (proto.max_regs as usize).max(args.len()),
+                            );
+                            co_th.stack[1..1 + args.len()].copy_from_slice(args);
+                            for i in args.len()..np {
+                                co_th.stack[1 + i] = Value::Nil;
+                            }
+                            let varargs = if proto.is_vararg && args.len() > np {
+                                args[np..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            co_th.status = CoStatus::Running;
+                            co_th.frames.push(Frame {
+                                closure: cid,
+                                proto,
+                                pc: 0,
+                                base: 1,
+                                ret_to: 0,
+                                nres: 0,
+                                shape: RetShape::Normal,
+                                protected: false,
+                                handler: None,
+                                pending: Vec::new(),
+                                tbc: Vec::new(),
+                                varargs,
+                            });
+                        }
+                        Value::Native(nid) => {
+                            // native coroutine body: cannot yield; run it to
+                            // completion right here
+                            let co_th = &mut self.threads[co.0 as usize];
+                            co_th.status = CoStatus::Dead;
+                            co_th.parent = None;
+                            co_th.resume_ret = None;
+                            let kind_result = match &self.natives[nid.0 as usize].kind {
+                                NativeKind::Plain(f) => f(self, args),
+                                NativeKind::Intrinsic(_) => {
+                                    Err("cannot use this builtin as a coroutine body".into())
+                                }
+                            };
+                            return match kind_result {
+                                Ok(res) => {
+                                    let mut all = Vec::with_capacity(res.len() + 1);
+                                    if !wrap {
+                                        all.push(Value::Bool(true));
+                                        all.extend_from_slice(&res);
+                                        place_shaped(th, ret_to, nres, shape, &all);
+                                    } else {
+                                        place_shaped(th, ret_to, nres, shape, &res);
+                                    }
+                                    Ok(())
+                                }
+                                Err(msg) => fail(self, th, &msg),
+                            };
+                        }
+                        _ => return fail(self, th, "cannot resume dead coroutine"),
+                    }
+                } else {
+                    // deliver resume args as the pending yield's results
+                    let co_th = &mut self.threads[co.0 as usize];
+                    co_th.status = CoStatus::Running;
+                    let (yret, ynres, yshape) =
+                        co_th.yield_ret.take().expect("suspended thread has yield_ret");
+                    place_shaped(co_th, yret, ynres, yshape, args);
+                }
+                th.status = CoStatus::Normal;
+                self.switch_to = Some(co);
+                Ok(())
             }
         }
     }
@@ -1280,6 +1652,35 @@ impl Lua {
                         self.call_value(th, mm, &[a, b], dst_abs, 2, RetShape::ToBool, fuel)
                     }
                 }
+            }
+        }
+    }
+
+    /// Runs `__close` handlers for to-be-closed variables at or above
+    /// register `from`, one call per dispatch step (re-arms itself as a
+    /// pending so suspension and nested calls work).
+    fn run_close_tbc(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        from: u8,
+        err: Value,
+    ) -> Result<(), VmError> {
+        loop {
+            let f = th.frames.last_mut().unwrap();
+            match f.tbc.last() {
+                Some(&r) if r >= from => {
+                    f.tbc.pop();
+                    let v = th.stack[f.base + r as usize];
+                    let mm = self.metamethod(v, Mm::Close);
+                    if mm == Value::Nil {
+                        continue; // metatable changed since Tbc; skip
+                    }
+                    th.frames.last_mut().unwrap().pending.push(Pending::CloseTbc { from, err });
+                    let scratch = scratch_base(th);
+                    return self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel);
+                }
+                _ => return Ok(()),
             }
         }
     }
@@ -1569,6 +1970,30 @@ enum Flow {
     Finished(Vec<Value>),
 }
 
+enum DispatchEnd {
+    Pending,
+    Finished(Vec<Value>),
+    Switch(ThreadId),
+}
+
+pub(crate) enum RunOutcome {
+    Done(Vec<Value>),
+    Pending(ThreadId),
+}
+
+/// Delivers a coroutine's yield/return values (or failure) into the thread
+/// that resumed it.
+fn deliver_resume(parent: &mut Thread, rr: ResumeRet, ok: bool, vals: &[Value]) {
+    if rr.status_bool {
+        let mut all = Vec::with_capacity(vals.len() + 1);
+        all.push(Value::Bool(ok));
+        all.extend_from_slice(vals);
+        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, &all);
+    } else {
+        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, vals);
+    }
+}
+
 impl Execution {
     /// Runs the script for at most `fuel` units of work (roughly one unit
     /// per VM instruction, with surcharges for calls and allocations).
@@ -1587,12 +2012,13 @@ impl Execution {
             self.debt -= budget;
             return Ok(Step::Pending);
         }
-        match lua.run(self.thread, &mut remaining) {
-            Ok(Some(vals)) => {
+        match lua.run(self.current, &mut remaining) {
+            Ok(RunOutcome::Done(vals)) => {
                 self.finished = true;
                 Ok(Step::Done(vals))
             }
-            Ok(None) => {
+            Ok(RunOutcome::Pending(current)) => {
+                self.current = current;
                 self.debt = (-remaining).max(0);
                 Ok(Step::Pending)
             }

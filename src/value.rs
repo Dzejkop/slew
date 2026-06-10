@@ -32,6 +32,7 @@ pub enum Value {
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),
+    Thread(ThreadId),
 }
 
 impl Value {
@@ -47,6 +48,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Table(_) => "table",
             Value::Closure(_) | Value::Native(_) => "function",
+            Value::Thread(_) => "thread",
         }
     }
 }
@@ -97,6 +99,7 @@ pub enum HKey {
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),
+    Thread(ThreadId),
 }
 
 /// Converts a value to a table key per Lua 5.4 rules.
@@ -118,6 +121,7 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
         Value::Table(t) => HKey::Table(t),
         Value::Closure(c) => HKey::Closure(c),
         Value::Native(n) => HKey::Native(n),
+        Value::Thread(t) => HKey::Thread(t),
     })
 }
 
@@ -243,6 +247,7 @@ pub fn key_to_value(k: HKey) -> Value {
         HKey::Table(t) => Value::Table(t),
         HKey::Closure(c) => Value::Closure(c),
         HKey::Native(n) => Value::Native(n),
+        HKey::Thread(t) => Value::Thread(t),
     }
 }
 
