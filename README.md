@@ -45,6 +45,13 @@ Commands: `:fuel N`, `:more`, `:mem`, `:gc`, `:help`, `:quit`.
 The `repl` feature (on by default) pulls in reedline; library consumers can
 use `default-features = false`.
 
+## Browser (WebAssembly)
+
+The library also runs in the browser. `wasm/` is a wasm-bindgen wrapper around
+`slew` (`default-features = false`, no REPL) plus a small page where an
+infinite Lua loop suspends after each fuel budget instead of freezing the tab.
+See [wasm/README.md](wasm/README.md).
+
 ## Conformance
 
 The official Lua 5.4.9 test archive is the conformance corpus:
