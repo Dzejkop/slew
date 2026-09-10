@@ -3,9 +3,10 @@
 vararg.lua	ok
 closure.lua	timeout
 nextvar.lua	line:364
-pm.lua	line:98
+pm.lua	line:436
+utf8.lua	ok
 sort.lua	line:199
-strings.lua	line:165
+strings.lua	line:171
 math.lua	line:290
 verybig.lua	ok
 constructs.lua	line:247

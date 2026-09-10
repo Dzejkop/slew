@@ -1,5 +1,5 @@
 //! The standard library: base functions, `coroutine`, `string` (with the
-//! pattern engine), `table`, and `math`.
+//! pattern engine), `table`, `math`, and `utf8`.
 //!
 //! Functions that call back into Lua code (table.sort's comparator,
 //! gsub's function replacements, gmatch iterators) are defined in
@@ -11,6 +11,7 @@
 mod math;
 mod string;
 mod table;
+mod utf8;
 
 use crate::value::{fmt_number, to_key, Value};
 use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind, Step};
@@ -45,6 +46,7 @@ pub fn install(lua: &mut Lua) {
     string::install(lua);
     table::install(lua);
     math::install(lua);
+    utf8::install(lua);
     // dynamic loading: `load` is pure; `loadfile` goes through the host
     // reader installed with `Lua::set_file_reader` (none by default)
     lua.register_native("load", n_load);
@@ -115,7 +117,7 @@ fn install_package(lua: &mut Lua) {
     let globals = Value::Table(lua.globals);
     lua.set_global("_G", globals);
     set_field(lua, loaded, "_G", globals);
-    for name in ["string", "table", "math", "coroutine", "package"] {
+    for name in ["string", "table", "math", "utf8", "coroutine", "package"] {
         let v = lua.get_global(name);
         set_field(lua, loaded, name, v);
     }
@@ -173,7 +175,12 @@ fn text_error(lua: &mut Lua, chunkname: &str, line: u32, message: &str) -> Vec<V
 
 /// `luaL_checkstring`-ish: strings pass, numbers are rendered, anything
 /// else (including nil) is an error.
-fn check_bytes(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
+pub(super) fn check_bytes(
+    lua: &Lua,
+    args: &[Value],
+    i: usize,
+    who: &str,
+) -> Result<Vec<u8>, String> {
     match arg(args, i) {
         Value::Str(id) => Ok(lua.strings.get(id).to_vec()),
         v @ (Value::Int(_) | Value::Float(_)) => Ok(fmt_number(v).into_bytes()),

@@ -357,6 +357,8 @@ fn match_class(c: u8, cl: u8) -> bool {
         b'u' => c.is_ascii_uppercase(),
         b'w' => c.is_ascii_alphanumeric(),
         b'x' => c.is_ascii_hexdigit(),
+        // deprecated `%z`: matches only the zero byte (`%Z` its complement)
+        b'z' => c == 0,
         _ => return cl == c, // escaped literal (%%, %., ...)
     };
     if cl.is_ascii_uppercase() { !res } else { res }

@@ -269,20 +269,39 @@ function table.move(a1, f, e, t, a2)
   return tt
 end
 
-function string.gmatch(s, p)
+-- PUC's `posrelatI`: 1-based start position, clipped to 1 (unlike find's
+-- `u_posrelat`, which returns 0 for a too-negative index).
+local function posrelatI(pos, len)
+  if pos > 0 then return pos
+  elseif pos == 0 then return 1
+  elseif -pos > len then return 1
+  else return len + pos + 1 end
+end
+
+function string.gmatch(s, p, init)
   if type(s) == 'number' then s = tostring(s) end
-  local pos = 1
   local len = #s
+  if init == nil then init = 1 else init = check_integer(init, 3, 'gmatch') end
+  local pos = posrelatI(init, len)
+  if pos > len + 1 then pos = len + 2 end  -- start after end: no matches
+  -- PUC's `lastmatch`: an empty match at the end of the previous match is
+  -- rejected, so a following byte is copied instead (5.3.3 semantics).
+  local last = nil
   return function()
-    if pos > len + 1 then return nil end
-    local r = {find(s, p, pos)}
-    local st, en = r[1], r[2]
-    if not st then
-      pos = len + 2
-      return nil
+    while pos <= len + 1 do
+      local r = {find(s, p, pos)}
+      local st, en = r[1], r[2]
+      if not st then break end
+      local e = en + 1
+      if e == last then
+        pos = st + 1
+      else
+        last = e
+        if en < st then pos = st + 1 else pos = en + 1 end
+        if r[3] ~= nil then return unpack(r, 3) else return sub(s, st, en) end
+      end
     end
-    if en < st then pos = st + 1 else pos = en + 1 end
-    if r[3] ~= nil then return unpack(r, 3) else return sub(s, st, en) end
+    return nil
   end
 end
 
@@ -324,44 +343,58 @@ function string.gsub(s, pat, repl, maxn)
   local anchored = sub(pat, 1, 1) == '^'
   local out, pos, count = {}, 1, 0
   local len = #s
+  -- PUC's `lastmatch`: reject an empty match that would begin exactly where
+  -- the previous match ended, copying a byte and retrying instead.
+  local last = nil
   while pos <= len + 1 do
     if maxn and count >= maxn then break end
     local r = {find(s, pat, pos)}
     local st = r[1]
     if not st then break end
     local en = r[2]
-    out[#out+1] = sub(s, pos, st - 1)
-    local whole = sub(s, st, en)
-    local caps = {}
-    for i = 3, #r do caps[i-2] = r[i] end
-    if caps[1] == nil then caps[1] = whole end
-    local value
-    if tr == 'string' then
-      value = expand_repl(repl, whole, caps)
-    elseif tr == 'table' then
-      value = repl[caps[1]]
-    elseif tr == 'function' then
-      value = repl(unpack(caps))
+    local e = en + 1
+    if e == last then
+      if pos <= len then
+        out[#out+1] = sub(s, pos, pos)
+        pos = pos + 1
+      else
+        break
+      end
     else
-      error("bad argument #3 to 'gsub' (string/function/table expected)")
+      out[#out+1] = sub(s, pos, st - 1)
+      local whole = sub(s, st, en)
+      local caps = {}
+      for i = 3, #r do caps[i-2] = r[i] end
+      if caps[1] == nil then caps[1] = whole end
+      local value
+      if tr == 'string' then
+        value = expand_repl(repl, whole, caps)
+      elseif tr == 'table' then
+        value = repl[caps[1]]
+      elseif tr == 'function' then
+        value = repl(unpack(caps))
+      else
+        error("bad argument #3 to 'gsub' (string/function/table expected)")
+      end
+      if value == nil or value == false then
+        value = whole
+      elseif type(value) == 'number' then
+        value = tostring(value)
+      elseif type(value) ~= 'string' then
+        error("invalid replacement value (a " .. type(value) .. ")")
+      end
+      out[#out+1] = value
+      count = count + 1
+      last = e
+      if en < st then
+        -- empty match: copy one char and advance
+        if st <= len then out[#out+1] = sub(s, st, st) end
+        pos = st + 1
+      else
+        pos = en + 1
+      end
+      if anchored then break end
     end
-    if value == nil or value == false then
-      value = whole
-    elseif type(value) == 'number' then
-      value = tostring(value)
-    elseif type(value) ~= 'string' then
-      error("invalid replacement value (a " .. type(value) .. ")")
-    end
-    out[#out+1] = value
-    count = count + 1
-    if en < st then
-      -- empty match: copy one char and advance
-      if st <= len then out[#out+1] = sub(s, st, st) end
-      pos = st + 1
-    else
-      pos = en + 1
-    end
-    if anchored then break end
   end
   out[#out+1] = sub(s, pos)
   return concat(out), count

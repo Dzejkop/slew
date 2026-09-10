@@ -429,6 +429,7 @@ fn format_one(
             format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes()
         }
         b'a' | b'A' => return Err("format '%a' is not supported".into()),
+        b'p' => pointer_text(v).into_bytes(),
         b's' => {
             let mut s = match v {
                 Value::Str(id) => lua.strings.get(id).to_vec(),
@@ -468,6 +469,22 @@ fn format_one(
         }
         c => return Err(format!("invalid conversion '%{}' to 'format'", c as char)),
     };
-    let numeric = !matches!(conv, b's' | b'q' | b'c');
+    let numeric = !matches!(conv, b's' | b'q' | b'c' | b'p');
     Ok(pad(s, width, flags, numeric))
+}
+
+/// `string.format("%p", v)`: nil/booleans/numbers have no address in Lua and
+/// render as `(null)` (as PUC does when `lua_topointer` is NULL). Everything
+/// else is a stable, type-tagged handle rendered as hex; equal strings share
+/// an id because slew interns them.
+fn pointer_text(v: Value) -> String {
+    let tag = match v {
+        Value::Str(id) => 0x1000_0000u64 + id.0 as u64,
+        Value::Table(id) => 0x2000_0000u64 + id.0 as u64,
+        Value::Native(id) => 0x3000_0000u64 + id.0 as u64,
+        Value::Closure(id) => 0x4000_0000u64 + id.0 as u64,
+        Value::Thread(id) => 0x5000_0000u64 + id.0 as u64,
+        _ => return "(null)".to_string(),
+    };
+    format!("0x{tag:x}")
 }
