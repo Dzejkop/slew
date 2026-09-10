@@ -7,6 +7,63 @@ local find, sub, byte = string.find, string.sub, string.byte
 local unpack, concat = table.unpack, table.concat
 local raw_remove = table.remove
 local getmetatable = getmetatable
+local next, select, tostring, rawget = next, select, tostring, rawget
+local raw_print = print
+-- Raw metatable (bypasses the `__metatable` guard); the native is a private
+-- seed global, removed from the environment once captured.
+local raw_metatable = __slew_getmetatable
+__slew_getmetatable = nil
+
+-- ---- base functions that must call back into Lua -----------------------
+-- Natives cannot invoke metamethods, so `print` (via `tostring`), `pairs`
+-- (`__pairs`) and `ipairs` (`__index`) live here and run through the VM.
+
+-- PUC's `print` applies `luaL_tolstring` to each argument, i.e. it honors
+-- `__tostring`/`__name`. `tostring` is captured above, so redefining the
+-- global later does not change `print`, matching PUC.
+function print(...)
+  local n = select('#', ...)
+  local out = {}
+  for i = 1, n do
+    out[i] = tostring((select(i, ...)))
+  end
+  raw_print(unpack(out, 1, n))
+end
+
+function pairs(...)
+  if select('#', ...) == 0 then
+    error("bad argument #1 to 'pairs' (value expected)", 2)
+  end
+  local t = ...
+  local mt = raw_metatable(t)
+  if mt ~= nil then
+    local mm = rawget(mt, '__pairs')
+    if mm ~= nil then
+      -- PUC's luaB_pairs returns exactly the three values it reads from the
+      -- metamethod.
+      local f, s, c = mm(t)
+      return f, s, c
+    end
+  end
+  return next, t, nil
+end
+
+-- A single shared iterator, so `ipairs(t) == ipairs(t)` holds (nextvar.lua
+-- asserts the identity). `t[i]` indexes through the VM, honoring `__index`;
+-- the `+ 1` wraps around like PUC's `luaL_intop(+, i, 1)`.
+local function ipairs_iter(t, i)
+  i = i + 1
+  local v = t[i]
+  if v == nil then return nil end
+  return i, v
+end
+
+function ipairs(...)
+  if select('#', ...) == 0 then
+    error("bad argument #1 to 'ipairs' (value expected)", 2)
+  end
+  return ipairs_iter, (...), 0
+end
 
 -- table.insert lives here rather than as a native so that it can honor
 -- __len and __newindex metamethods through the regular VM machinery.

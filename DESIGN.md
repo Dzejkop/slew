@@ -131,8 +131,8 @@ through a capability the embedder installs explicitly.
   to across the switch); `coroutine.resume`'s `false, err` convention works.
 - An error raised by a `__close` handler during unwinding supersedes the
   original error and skips remaining closes up to the next handler.
-- `ipairs` uses raw indexing (no `__index` metamethods).
-- `print` uses raw tostring (no `__tostring`); `tostring()` itself honors it.
+- `tostring`/`print` honor `__tostring` and fall back to `__name`; `pairs`
+  honors `__pairs` and `ipairs` honors `__index` (PUC 5.4 semantics).
 - No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
   rarely needs them; resources should be host-managed.
 - `string.format` lacks `%a`.

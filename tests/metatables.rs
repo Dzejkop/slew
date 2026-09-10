@@ -214,6 +214,124 @@ fn tostring_metamethod() {
     );
 }
 
+#[test]
+fn tostring_name_fallback() {
+    // `__name` replaces the type tag in the default rendering.
+    assert_eq!(
+        eval("local t = setmetatable({}, {__name = 'My Type'}) \
+              return tostring(t):match('^My Type: 0x') ~= nil"),
+        "true"
+    );
+    // `__tostring` takes precedence over `__name`.
+    assert_eq!(
+        eval("local t = setmetatable({}, {__name = 'N', \
+                                          __tostring = function() return 'T' end}) \
+              return tostring(t)"),
+        "T"
+    );
+    // threads render as `thread: 0x...`.
+    assert_eq!(
+        eval("local co = coroutine.create(function() end) \
+              return tostring(co):match('^thread: 0x') ~= nil"),
+        "true"
+    );
+}
+
+#[test]
+fn print_honors_tostring() {
+    // `print` must route each argument through `tostring` (luaL_tolstring).
+    assert_eq!(
+        eval("local seen = 0 \
+              local t = setmetatable({}, {__tostring = function() \
+                  seen = seen + 1 return 'X' end}) \
+              print(t) \
+              return seen"),
+        "1"
+    );
+    // An error raised by `__tostring` propagates out of `print`.
+    assert!(
+        run_err("local t = setmetatable({}, {__tostring = function() error('boom') end}) \
+                 print(t)")
+            .contains("boom")
+    );
+}
+
+#[test]
+fn pairs_metamethod() {
+    // No metamethod: `next, t, nil`, and the iterator is the shared `next`.
+    assert_eq!(
+        eval("local f, s, c = pairs({}) \
+              return f == next and type(s) == 'table' and c == nil"),
+        "true"
+    );
+    // `__pairs` supplies its own iteration protocol.
+    assert_eq!(
+        eval("local a = {} \
+              setmetatable(a, {__pairs = function(x) return function(_, i) \
+                  if i < 3 then return i + 1, (i + 1) * 10 end end, x, 0 end}) \
+              local out = {} \
+              for k, v in pairs(a) do out[#out + 1] = k .. '=' .. v end \
+              return table.concat(out, ',')"),
+        "1=10,2=20,3=30"
+    );
+    // PUC returns exactly the three values read from the metamethod.
+    assert_eq!(
+        eval("return select('#', pairs(setmetatable({}, {__pairs = function() \
+                 return function() end, 1, 2, 3, 4 end})))"),
+        "3"
+    );
+    // A `__metatable` guard must not hide `__pairs`.
+    assert_eq!(
+        eval("local a = setmetatable({}, {__metatable = 'locked', \
+                 __pairs = function(x) return function() end, 'st', 0 end}) \
+              local f, s, c = pairs(a) \
+              return s == 'st' and c == 0 and type(f) == 'function'"),
+        "true"
+    );
+    assert!(run_err("pairs()").contains("bad argument"));
+}
+
+#[test]
+fn ipairs_metamethod() {
+    // `__index` drives the iteration (PUC 5.4 uses `lua_geti`).
+    assert_eq!(
+        eval("local a = {n = 3} \
+              setmetatable(a, {__index = function(t, k) \
+                  if k <= t.n then return k * 10 end end}) \
+              local out = {} \
+              for k, v in ipairs(a) do out[#out + 1] = k .. '=' .. v end \
+              return table.concat(out, ',')"),
+        "1=10,2=20,3=30"
+    );
+    // Iterator identity is stable across calls (nextvar.lua asserts this).
+    assert_eq!(
+        eval("return type(ipairs{}) == 'function' and ipairs{} == ipairs{}"),
+        "true"
+    );
+    // The index wraps around like PUC's `luaL_intop(+, i, 1)`.
+    assert_eq!(
+        eval("local f = ipairs{} \
+              local k, v = f({[math.mininteger] = 10}, math.maxinteger) \
+              return k == math.mininteger and v == 10"),
+        "true"
+    );
+    assert!(run_err("ipairs()").contains("bad argument"));
+}
+
+#[test]
+fn len_metamethod_gets_operand_twice() {
+    // PUC invokes unary metamethods with the operand duplicated; events.lua
+    // observes `__len`'s argument list.
+    assert_eq!(
+        eval("local t = setmetatable({}, {__len = function(...) \
+                  local n = select('#', ...) \
+                  local a, b = ... \
+                  return tostring(n) .. ':' .. tostring(a == b) end}) \
+              return #t"),
+        "2:true"
+    );
+}
+
 // ---- pcall / error values ----
 
 #[test]

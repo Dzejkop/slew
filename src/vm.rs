@@ -352,8 +352,6 @@ pub struct Lua {
     pub(crate) upvals: Vec<Upval>,
     pub(crate) threads: Vec<Thread>,
     pub(crate) globals: TableId,
-    pub(crate) builtin_next: Value,
-    pub(crate) builtin_ipairs_iter: Value,
     pub(crate) string_meta: Option<TableId>,
     mm_names: Vec<StrId>,
     /// Thread being dispatched right now (its `Thread` is temporarily
@@ -413,8 +411,6 @@ impl Lua {
             upvals: Vec::new(),
             threads: Vec::new(),
             globals: TableId(0),
-            builtin_next: Value::Nil,
-            builtin_ipairs_iter: Value::Nil,
             string_meta: None,
             mm_names,
             current_thread: ThreadId(u32::MAX),
@@ -697,6 +693,36 @@ impl Lua {
         match v {
             Value::Str(id) => Some(self.strings.get(id)),
             _ => None,
+        }
+    }
+
+    /// `luaL_tolstring`'s fallback path, used after `__tostring` has been
+    /// ruled out: a string `__name` field replaces the type tag, then the
+    /// default rendering (`name: 0x...`). Strings keep their raw rendering
+    /// (PUC only consults `__tostring` for them), and `display_value`'s
+    /// output is used when there is no `__name`.
+    pub(crate) fn tostring_default(&mut self, v: Value) -> String {
+        let custom = match v {
+            Value::Table(_) | Value::Closure(_) | Value::Native(_) | Value::Thread(_) => {
+                match self.metamethod_pub(v, "__name") {
+                    Value::Str(id) => Some(self.strings.get_str_lossy(id).into_owned()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match custom {
+            Some(name) => {
+                let ptr = match v {
+                    Value::Table(t) => t.0,
+                    Value::Closure(c) => c.0,
+                    Value::Thread(t) => t.0,
+                    Value::Native(n) => n.0,
+                    _ => unreachable!(),
+                };
+                format!("{name}: 0x{ptr:08x}")
+            }
+            None => self.display_value(v),
         }
     }
 
@@ -1473,7 +1499,7 @@ impl Lua {
                 let v = arg(th, 0);
                 let mm = self.metamethod(v, Mm::ToString);
                 if mm == Value::Nil {
-                    let s = self.display_value(v);
+                    let s = self.tostring_default(v);
                     let sv = self.new_string(s.as_bytes());
                     place_shaped(th, ret_to, nres, shape, &[sv]);
                     Ok(())
@@ -2091,7 +2117,10 @@ impl Lua {
                     if mm == Value::Nil {
                         (Some(Value::Int(self.tables[t.0 as usize].length())), None)
                     } else {
-                        self.call_value(th, mm, &[v], dst_abs, 2, RetShape::Normal, fuel)?;
+                        // PUC calls unary metamethods with the operand twice
+                        // (`luaT_callTMres`), and `events.lua` observes the
+                        // argument list __len is invoked with.
+                        self.call_value(th, mm, &[v, v], dst_abs, 2, RetShape::Normal, fuel)?;
                         return Ok(());
                     }
                 }
@@ -2275,8 +2304,6 @@ impl Lua {
         let mut work: Vec<Value> = Vec::with_capacity(64);
         // roots
         work.push(Value::Table(self.globals));
-        work.push(self.builtin_next);
-        work.push(self.builtin_ipairs_iter);
         if let Some(sm) = self.string_meta {
             work.push(Value::Table(sm));
         }

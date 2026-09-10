@@ -26,10 +26,14 @@ pub fn install(lua: &mut Lua) {
     lua.register_native("rawlen", n_rawlen);
     lua.register_native("setmetatable", n_setmetatable);
     lua.register_native("getmetatable", n_getmetatable);
-    lua.builtin_next = lua.register_native("next", n_next);
-    lua.register_native("pairs", n_pairs);
-    lua.builtin_ipairs_iter = lua.add_native("(ipairs iterator)", n_ipairs_iter);
-    lua.register_native("ipairs", n_ipairs);
+    // Private helper for the prelude's `__pairs` lookup: the public
+    // `getmetatable` honors the `__metatable` guard, but metamethod lookup
+    // must bypass it (PUC's `luaL_getmetafield`). The prelude captures this
+    // and clears the global immediately.
+    lua.register_native("__slew_getmetatable", n_raw_metatable);
+    lua.register_native("next", n_next);
+    // `pairs`/`ipairs` and `print` are defined in the prelude (they must call
+    // metamethods, which natives cannot do).
     // intrinsics: these interact with frames (raise error values, set up
     // protected calls, call __tostring)
     lua.register_intrinsic("error", Intrinsic::Error);
@@ -344,6 +348,15 @@ fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
+/// The raw metatable (ignoring a `__metatable` guard), for the prelude's
+/// metamethod lookups.
+fn n_raw_metatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    match lua.get_metatable(arg(args, 0)) {
+        Some(mt) => Ok(vec![Value::Table(mt)]),
+        None => Ok(vec![Value::Nil]),
+    }
+}
+
 pub(super) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::Nil)
 }
@@ -511,28 +524,4 @@ fn n_next(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_pairs(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = check_table(lua, args, 0, "pairs")?;
-    Ok(vec![lua.builtin_next, t, Value::Nil])
-}
 
-fn n_ipairs(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    if args.is_empty() {
-        return Err("bad argument #1 to 'ipairs' (value expected)".into());
-    }
-    let t = arg(args, 0);
-    Ok(vec![lua.builtin_ipairs_iter, t, Value::Int(0)])
-}
-
-fn n_ipairs_iter(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = check_table(lua, args, 0, "ipairs")?;
-    let i = match arg(args, 1) {
-        Value::Int(i) => i,
-        _ => return Err("bad argument #2 to 'ipairs' (integer expected)".into()),
-    };
-    let next = i.wrapping_add(1);
-    match lua.table_get(t, Value::Int(next)) {
-        Value::Nil => Ok(vec![Value::Nil]),
-        v => Ok(vec![Value::Int(next), v]),
-    }
-}
