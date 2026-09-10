@@ -16,3 +16,6 @@ repl = ["dep:reedline"]
 name = "slew"
 path = "src/bin/repl.rs"
 required-features = ["repl"]
+
+[dev-dependencies]
+ratatui = "0.30.2"

@@ -2459,6 +2459,15 @@ impl Execution {
     pub fn is_finished(&self) -> bool {
         self.finished
     }
+
+    /// `(chunk name, source line)` of the instruction the execution would
+    /// run next, for debuggers and tracers. `None` once it has finished.
+    pub fn current_location(&self, lua: &Lua) -> Option<(String, u32)> {
+        let th = lua.threads.get(self.current.0 as usize)?;
+        let f = th.frames.last()?;
+        let line = f.proto.lines.get(f.pc).copied().unwrap_or(0);
+        Some((f.proto.source.to_string(), line))
+    }
 }
 
 // ---- free helpers ----

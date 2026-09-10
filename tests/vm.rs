@@ -512,6 +512,23 @@ fn step_after_done_errors() {
 }
 
 #[test]
+fn execution_location_tracks_current_line() {
+    let mut lua = Lua::new();
+    let chunk = lua.load("local n = 0\nn = n + 1\nreturn n").unwrap();
+    let mut exec = lua.execute(&chunk);
+    assert_eq!(exec.step(&mut lua, 1).unwrap(), Step::Pending);
+    let (source, line) = exec.current_location(&lua).expect("pending has a location");
+    assert_eq!(source, "chunk");
+    assert!((1..=3).contains(&line), "line out of range: {line}");
+    loop {
+        if let Step::Done(_) = exec.step(&mut lua, 100).unwrap() {
+            break;
+        }
+    }
+    assert!(exec.current_location(&lua).is_none());
+}
+
+#[test]
 fn two_executions_share_globals_but_not_control() {
     let mut lua = Lua::new();
     let writer = lua.load("i = (i or 0) while true do i = i + 1 end").unwrap();
