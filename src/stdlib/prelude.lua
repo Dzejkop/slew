@@ -2,7 +2,11 @@
 -- Lua so they go through the regular (suspendable) VM machinery.
 
 local find, sub, byte = string.find, string.sub, string.byte
+-- Captured here, before the wrappers below replace the globals, so the
+-- prelude's own (and the wrappers' raw) uses stay on the native fast paths.
 local unpack, concat = table.unpack, table.concat
+local raw_remove = table.remove
+local getmetatable = getmetatable
 
 -- table.insert lives here rather than as a native so that it can honor
 -- __len and __newindex metamethods through the regular VM machinery.
@@ -31,6 +35,36 @@ local function table_len(t)
   return i
 end
 
+-- luaL_checkinteger-ish: integers, floats with an exact integer value, and
+-- numeric strings; everything else raises the PUC-style argument error.
+local function check_integer(v, n, who)
+  local i = to_integer(v)
+  if i ~= nil then return i end
+  local numeric = type(v) == 'number' or
+                  (type(v) == 'string' and tonumber(v) ~= nil)
+  if numeric then
+    error("bad argument #" .. n .. " to '" .. who ..
+          "' (number has no integer representation)", 3)
+  end
+  error("bad argument #" .. n .. " to '" .. who ..
+        "' (number expected, got " .. type(v) .. ")", 3)
+end
+
+-- luaL_checktab: a table, or a non-table whose metatable supplies the
+-- metamethods the operation needs.
+local function check_tab(v, n, who, need_r, need_w, need_l)
+  if type(v) == 'table' then return end
+  local mt = getmetatable(v)
+  if type(mt) == 'table' and
+     (not need_r or mt.__index ~= nil) and
+     (not need_w or mt.__newindex ~= nil) and
+     (not need_l or mt.__len ~= nil) then
+    return
+  end
+  error("bad argument #" .. n .. " to '" .. who ..
+        "' (table expected, got " .. type(v) .. ")", 3)
+end
+
 function table.insert(t, ...)
   if type(t) ~= 'table' then
     error("bad argument #1 to 'insert' (table expected, got " .. type(t) .. ")", 2)
@@ -56,6 +90,126 @@ function table.insert(t, ...)
   else
     error("wrong number of arguments to 'insert'", 2)
   end
+end
+
+-- `table.remove`, `table.concat` and `table.unpack` are metamethod-aware.
+-- With no metatable the raw native fast path is exact; otherwise the body
+-- drives `#t`, `t[k]` and `t[k] = v` through the VM so `__len`, `__index`
+-- and `__newindex` are honored (PUC 5.4 semantics).
+
+function table.remove(t, pos)
+  if getmetatable(t) == nil then return raw_remove(t, pos) end
+  check_tab(t, 1, 'remove', true, true, true)
+  local size = table_len(t)
+  if pos == nil then pos = size else pos = check_integer(pos, 2, 'remove') end
+  if pos ~= size and math.ult(size, pos - 1) then
+    error("bad argument #2 to 'remove' (position out of bounds)", 2)
+  end
+  local removed = t[pos]
+  while pos < size do
+    t[pos] = t[pos + 1]
+    pos = pos + 1
+  end
+  t[pos] = nil
+  return removed
+end
+
+function table.concat(t, sep, i, j)
+  if getmetatable(t) == nil then return concat(t, sep, i, j) end
+  check_tab(t, 1, 'concat', true, false, true)
+  if sep == nil then
+    sep = ''
+  elseif type(sep) == 'number' then
+    sep = tostring(sep)
+  elseif type(sep) ~= 'string' then
+    error("bad argument #2 to 'concat' (string expected, got " ..
+          type(sep) .. ")", 2)
+  end
+  local last = table_len(t)
+  local first = 1
+  if i ~= nil then first = check_integer(i, 3, 'concat') end
+  if j ~= nil then last = check_integer(j, 4, 'concat') end
+  local out, n = {}, 0
+  while first < last do
+    local v = t[first]
+    if type(v) == 'string' or type(v) == 'number' then
+      n = n + 1; out[n] = v
+    else
+      error("invalid value (at index " .. first ..
+            ") in table for 'concat'", 2)
+    end
+    n = n + 1; out[n] = sep
+    first = first + 1
+  end
+  if first == last then
+    local v = t[first]
+    if type(v) == 'string' or type(v) == 'number' then
+      n = n + 1; out[n] = v
+    else
+      error("invalid value (at index " .. first ..
+            ") in table for 'concat'", 2)
+    end
+  end
+  return concat(out)
+end
+
+function table.unpack(t, i, j)
+  if getmetatable(t) == nil then return unpack(t, i, j) end
+  check_tab(t, 1, 'unpack', true, false, true)
+  local first = 1
+  if i ~= nil then first = check_integer(i, 2, 'unpack') end
+  local last
+  if j == nil then last = table_len(t) else last = check_integer(j, 3, 'unpack') end
+  if first > last then return end
+  -- `last - first` is the result count minus one; it wraps on an overflowing
+  -- span (e.g. mininteger..maxinteger), which must be reported as too many.
+  local n = last - first
+  if n < 0 or n >= 1000000 then
+    error("too many results to unpack", 2)
+  end
+  local res = {}
+  local k = 1
+  while first <= last do
+    res[k] = t[first]
+    k = k + 1
+    first = first + 1
+  end
+  return unpack(res, 1, k - 1)
+end
+
+-- `table.move` (PUC 5.4): copy a1[f..e] to a2[t..], honoring `__index` on the
+-- source and `__newindex` on the destination, and returning a2 (or a1).
+function table.move(a1, f, e, t, a2)
+  f = check_integer(f, 2, 'move')
+  e = check_integer(e, 3, 'move')
+  t = check_integer(t, 4, 'move')
+  local tt, dest_arg = a2, 5
+  if tt == nil then tt = a1; dest_arg = 1 end
+  check_tab(a1, 1, 'move', true, false, false)
+  check_tab(tt, dest_arg, 'move', false, true, false)
+  if e >= f then
+    if not (f > 0 or e < math.maxinteger + f) then
+      error("bad argument #3 to 'move' (too many elements to move)", 2)
+    end
+    local n = e - f + 1
+    if not (t <= math.maxinteger - n + 1) then
+      error("bad argument #4 to 'move' (destination wrap around)", 2)
+    end
+    if t > e or t <= f or (a2 ~= nil and a1 ~= tt) then
+      local i = 0
+      while i < n do
+        tt[t + i] = a1[f + i]
+        i = i + 1
+      end
+    else
+      local i = n - 1
+      while i >= 0 do
+        tt[t + i] = a1[f + i]
+        i = i - 1
+      end
+    end
+  end
+  return tt
 end
 
 function string.gmatch(s, p)

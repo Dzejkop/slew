@@ -301,6 +301,123 @@ fn table_sort() {
     );
 }
 
+#[test]
+fn table_move() {
+    // forward, overlapping, backward, and explicit-destination forms
+    assert_eq!(
+        eval("local a = {10,20,30} table.move(a,1,3,2) return table.concat(a, ',')"),
+        "10,10,20,30"
+    );
+    assert_eq!(
+        eval("local a = {10,20,30} table.move(a,1,3,3) return table.concat(a, ',')"),
+        "10,20,10,20,30"
+    );
+    assert_eq!(
+        eval("local a = {10,20,30} table.move(a,2,3,1) return table.concat(a, ',')"),
+        "20,30,30"
+    );
+    assert_eq!(
+        eval(
+            "local a = {} \
+             assert(table.move({10,20,30}, 1, 3, 1, a) == a) \
+             return table.concat(a, ',')"
+        ),
+        "10,20,30"
+    );
+    // empty range and same-place move leave the table alone
+    assert_eq!(
+        eval(
+            "local a = {1,2,3} \
+             assert(table.move({10,20,30}, 1, 0, 3, a) == a) \
+             table.move(a, 1, 10, 1) \
+             return table.concat(a, ',')"
+        ),
+        "1,2,3"
+    );
+    // fringes of the integer range
+    assert_eq!(
+        eval(
+            "local a = table.move({[math.maxinteger] = 100}, math.maxinteger, \
+             math.maxinteger, math.mininteger) \
+             return a[math.mininteger]"
+        ),
+        "100"
+    );
+    // bounds / overflow errors
+    assert!(run_err("table.move(1, 2, 3, 4)").contains("table expected"));
+    assert!(run_err("table.move({}, 1, math.maxinteger, 2)").contains("wrap around"));
+    assert!(run_err("table.move({}, math.mininteger, math.maxinteger, 1)").contains("too many"));
+}
+
+#[test]
+fn table_move_respects_metamethods() {
+    // __index on the source, __newindex never touched (writes go to the dest)
+    assert_eq!(
+        eval(
+            "local a = setmetatable({}, {__index = function(_, k) return k * 10 end, \
+                                        __newindex = error}) \
+             local b = table.move(a, 1, 10, 3, {}) \
+             return b[3] .. ',' .. b[12]"
+        ),
+        "10,100"
+    );
+    // overlapping move into the source itself is done backwards
+    assert_eq!(
+        eval(
+            "local t = {1, 2, 3} \
+             local p = setmetatable({}, {__len = function() return #t end, \
+                                        __index = t, __newindex = t}) \
+             table.move(p, 1, 3, 2) \
+             return table.concat(t, ',')"
+        ),
+        "1,1,2,3"
+    );
+}
+
+#[test]
+fn table_remove_concat_unpack_respect_metamethods() {
+    // remove drives __len/__index/__newindex
+    assert_eq!(
+        eval(
+            "local t = {1, 2, 3} \
+             local p = setmetatable({}, {__len = function() return #t end, \
+                                        __index = t, __newindex = t}) \
+             local v = table.remove(p, 1) \
+             return v .. ':' .. #t .. ':' .. table.concat(t, ',')"
+        ),
+        "1:2:2,3"
+    );
+    // concat drives __len/__index
+    assert_eq!(
+        eval(
+            "local p = setmetatable({}, {__len = function() return 5 end, \
+                                        __index = function(_, k) return k + 1 end}) \
+             return table.concat(p, ';')"
+        ),
+        "2;3;4;5;6"
+    );
+    // unpack drives __len/__index
+    assert_eq!(
+        eval(
+            "local t = {9, 10} \
+             local p = setmetatable({}, {__len = function() return #t end, __index = t}) \
+             local a, b, c = table.unpack(p) \
+             return a .. ',' .. b .. ',' .. tostring(c)"
+        ),
+        "9,10,nil"
+    );
+    // plain tables keep the raw fast-path behavior
+    assert_eq!(eval("return table.concat({1, 2, 3}, '-')"), "1-2-3");
+    assert_eq!(eval("return tostring(table.remove({}))"), "nil");
+    assert!(run_err("table.remove({1, 2}, 0)").contains("position out of bounds"));
+    // border-0 element is returned and cleared, as in PUC
+    assert_eq!(eval("local a = {[0] = 'ban'} return table.remove(a)"), "ban");
+    assert_eq!(
+        eval("local a = {[0] = 'ban'} table.remove(a) return tostring(a[0])"),
+        "nil"
+    );
+}
+
 // ---- math ----
 
 #[test]

@@ -4,7 +4,7 @@ vararg.lua	ok
 closure.lua	timeout
 nextvar.lua	line:364
 pm.lua	line:98
-sort.lua	line:94
+sort.lua	line:199
 strings.lua	line:165
 math.lua	line:290
 verybig.lua	ok
