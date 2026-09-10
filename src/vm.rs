@@ -431,7 +431,7 @@ impl Lua {
             gc_alloc_threshold: 50_000,
             memory_limit: None,
         };
-        lua.seed_random(0x5375734c75615f31); // "SusLua_1"
+        lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
         lua
     }

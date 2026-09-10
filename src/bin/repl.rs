@@ -1,4 +1,4 @@
-//! Interactive REPL for suslua.
+//! Interactive REPL for slew.
 //!
 //! Doubles as a demo of the execution-profile machinery: every input runs
 //! under a fuel budget; a runaway computation suspends instead of hanging
@@ -11,15 +11,15 @@ use reedline::{
     DefaultHinter, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal,
     ValidationResult, Validator,
 };
-use suslua::{Execution, Lua, Step, Value};
+use slew::{Execution, Lua, Step, Value};
 
 const DEFAULT_FUEL: u64 = 1_000_000;
 
 fn main() {
-    // script-runner modes: `suslua file.lua`, or piped stdin
+    // script-runner modes: `slew file.lua`, or piped stdin
     if let Some(path) = std::env::args().nth(1) {
         let src = std::fs::read(&path).unwrap_or_else(|e| {
-            eprintln!("suslua: cannot read {path}: {e}");
+            eprintln!("slew: cannot read {path}: {e}");
             std::process::exit(1);
         });
         run_script(&path, &src);
@@ -41,7 +41,7 @@ fn run_script(name: &str, src: &[u8]) {
     let chunk = match lua.load_named(name, src) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("suslua: {e}");
+            eprintln!("slew: {e}");
             std::process::exit(1);
         }
     };
@@ -51,7 +51,7 @@ fn run_script(name: &str, src: &[u8]) {
             Ok(Step::Done(_)) => return,
             Ok(Step::Pending) => continue,
             Err(e) => {
-                eprintln!("suslua: {e}");
+                eprintln!("slew: {e}");
                 std::process::exit(1);
             }
         }
@@ -66,7 +66,7 @@ fn repl() {
     let mut fuel = DEFAULT_FUEL;
     let mut suspended: Option<Execution> = None;
 
-    println!("suslua {} — a suspendable Lua 5.4", env!("CARGO_PKG_VERSION"));
+    println!("slew {} — a suspendable Lua 5.4", env!("CARGO_PKG_VERSION"));
     println!("fuel budget per input: {fuel} (:help for commands)");
 
     loop {
@@ -176,7 +176,7 @@ struct LuaPrompt;
 
 impl Prompt for LuaPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("suslua")
+        Cow::Borrowed("slew")
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -215,7 +215,7 @@ impl Validator for LuaValidator {
 }
 
 fn is_incomplete(src: &str) -> bool {
-    use suslua::parser::parse;
+    use slew::parser::parse;
     if parse(format!("return {src}").as_bytes()).is_ok() {
         return false;
     }

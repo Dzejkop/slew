@@ -1,5 +1,5 @@
-use suslua::ast::*;
-use suslua::parser::parse;
+use slew::ast::*;
+use slew::parser::parse;
 
 fn ok(src: &str) -> Block {
     parse(src.as_bytes()).unwrap_or_else(|e| panic!("{e}\nsource: {src}"))

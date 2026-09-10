@@ -506,6 +506,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slew"
+version = "0.1.0"
+dependencies = [
+ "reedline",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,13 +546,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "suslua"
-version = "0.1.0"
-dependencies = [
- "reedline",
 ]
 
 [[package]]

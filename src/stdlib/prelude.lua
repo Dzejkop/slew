@@ -1,4 +1,4 @@
--- suslua prelude: stdlib functions that call back into Lua code, written in
+-- slew prelude: stdlib functions that call back into Lua code, written in
 -- Lua so they go through the regular (suspendable) VM machinery.
 
 local find, sub, byte = string.find, string.sub, string.byte

@@ -1,4 +1,4 @@
-use suslua::{Lua, Step, Value};
+use slew::{Lua, Step, Value};
 
 /// Runs a script to completion with a generous fuel budget; panics if it
 /// doesn't finish. Returns the script's return values.

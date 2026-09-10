@@ -1,5 +1,5 @@
 [package]
-name = "suslua"
+name = "slew"
 version = "0.1.0"
 edition = "2024"
 description = "A suspendable Lua interpreter with strict, embedder-controlled execution budgets"
@@ -13,6 +13,6 @@ default = ["repl"]
 repl = ["dep:reedline"]
 
 [[bin]]
-name = "suslua"
+name = "slew"
 path = "src/bin/repl.rs"
 required-features = ["repl"]

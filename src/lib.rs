@@ -1,4 +1,4 @@
-//! suslua — a suspendable Lua 5.4 interpreter.
+//! slew — a suspendable Lua 5.4 interpreter.
 //!
 //! Scripts are compiled once and then driven by the embedder with explicit
 //! fuel budgets: `Execution::step(fuel)` runs at most `fuel` units of work

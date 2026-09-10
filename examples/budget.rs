@@ -3,7 +3,7 @@
 //!
 //!     cargo run --example budget
 
-use suslua::{Lua, Step};
+use slew::{Lua, Step};
 
 fn main() {
     let mut lua = Lua::new();

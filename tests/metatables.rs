@@ -1,6 +1,6 @@
 //! M2: metatables/metamethods, pcall/error values, goto.
 
-use suslua::{Lua, Step, Value};
+use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
@@ -327,7 +327,7 @@ fn uncaught_error_value_reaches_host() {
         match exec.step(&mut lua, 10_000) {
             Ok(Step::Pending) => continue,
             Ok(Step::Done(_)) => panic!("expected error"),
-            Err(suslua::Error::Runtime(e)) => break e,
+            Err(slew::Error::Runtime(e)) => break e,
             Err(e) => panic!("unexpected: {e}"),
         }
     };

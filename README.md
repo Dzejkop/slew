@@ -1,4 +1,4 @@
-# suslua
+# slew
 
 A suspendable Lua 5.4 interpreter in Rust. Load a script once, then run it with an
 exact fuel budget — the embedder controls precisely how fast a Lua program executes.
@@ -33,9 +33,9 @@ The REPL runs every input under a fuel budget — a runaway loop suspends
 instead of hanging, and `:more` grants it another budget:
 
 ```
-suslua> n = 0 while true do n = n + 1 end
+slew> n = 0 while true do n = n + 1 end
 ~ suspended after 1000000 fuel (:more to continue, new input to abandon)
-suslua> n
+slew> n
 (abandoned suspended execution)
 333327
 ```

@@ -1,4 +1,4 @@
-# suslua — design
+# slew — design
 
 A Lua 5.4 interpreter written from scratch in Rust, built around one core property:
 **the embedder controls execution exactly**. A script is loaded once, then driven with

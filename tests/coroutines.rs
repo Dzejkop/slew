@@ -1,6 +1,6 @@
 //! M3: coroutines and to-be-closed variables.
 
-use suslua::{Lua, Step, Value};
+use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
