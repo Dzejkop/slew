@@ -552,6 +552,27 @@ fn runtime_error_reports_line() {
 }
 
 #[test]
+fn runtime_error_reports_root_line() {
+    let mut lua = Lua::new();
+    let chunk = lua
+        .load("local function boom()\n  error('kaboom')\nend\nreturn boom()")
+        .unwrap();
+    let mut exec = lua.execute(&chunk);
+    let err = loop {
+        match exec.step(&mut lua, 100_000) {
+            Ok(Step::Done(_)) => panic!("expected error"),
+            Ok(Step::Pending) => continue,
+            Err(e) => break e,
+        }
+    };
+    let slew::Error::Runtime(e) = err else {
+        panic!("expected runtime error: {err:?}")
+    };
+    assert_eq!(e.line, 2, "innermost raise site");
+    assert_eq!(e.root_line, 4, "call site in the root chunk");
+}
+
+#[test]
 fn deep_recursion_hits_depth_limit_not_host_stack() {
     let err = run_err("local function f() return f() + 1 end return f()");
     assert!(err.contains("stack overflow"), "got: {err}");

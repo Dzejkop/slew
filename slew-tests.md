@@ -1,8 +1,10 @@
 # Handoff: slew — Lua 5.4 conformance harness and the missing-API plan
 
-Date: 2026-09-10
+Date: 2026-09-11
 Repo: `/Users/jakubtrad/Projects/github.com/Dzejkop/slew`
-Branch: `main`, in sync with `origin/main` at `d264d67`; working tree clean.
+Branch: `main`. Phase 1 (modules + dynamic loading) is implemented in the
+working tree (uncommitted at time of writing); the rest of this document is
+the original plan and still applies to Phases 2–8.
 
 This handoff focuses on the testing setup and the functionality still missing,
 per the request. The TUI example (`d264d67`) is unrelated and only relevant as
@@ -29,35 +31,31 @@ a demo of the suspendable-execution API.
 
 ## Current conformance state (summary only; baseline is authoritative)
 
-- 1/17 files runs to completion: `verybig.lua` (early-returns under `_soft`).
-- 15/17 stop at a missing API or one unsupported formatter.
-- 1/17 (`closure.lua`) times out in an infinite loop that waits for a weak
-  table to be collected — weak tables are intentionally unimplemented.
-- Zero Rust panics across all 33 upstream files (verified by a full scan).
-
-Grouped by cause, the stops are:
-
-| Cause | Files |
-|---|---|
-| `require`/`package` absent | constructs, locals, calls, events, bitwise, literals, attrib, coroutine |
-| `load` absent | vararg, math, goto |
-| `package.loaded` | nextvar |
-| `utf8` absent | pm |
-| `table.move` absent | sort (baseline line is inside its `checkerror` helper; real call at line 94) |
-| `string.format("%p")` | strings |
-| weak tables absent | closure (timeout) |
+After Phase 1: 3/17 files run to completion (`verybig`, `vararg`, `bitwise`),
+zero Rust panics. The remaining first stops are: `debug` (still an empty
+stub: constructs, goto, coroutine, events, literals), tail-call stack depth
+(calls), `collectgarbage`/weak tables (closure timeout, nextvar), `tracegc`
+(locals), `table.move` (sort), `utf8`/`%p` (pm, strings), a math gap (math),
+and `io` (attrib, terminal for now). Re-check `tests/lua-conformance.baseline`
+rather than trusting this list.
 
 ## How the harness works (operational notes)
 
 - Env: `SLEW_LUA_TESTS_DIR` to reuse an extraction, `SLEW_LUA_TESTS_TIMEOUT`
-  per-file wall clock (default 20s), `SLEW_BLESS=1` to rewrite the baseline.
+  per-file wall clock (default 20s), `SLEW_BLESS=1` to rewrite the baseline,
+  `SLEW_LUA_TESTS_VERBOSE=1` to print each case's error.
 - The baseline is a **ratchet**: failing *earlier* than the recorded point is
   a regression; getting further passes. A Rust panic always fails, even when
-  blessing.
+  blessing. Progress is measured by `RuntimeError::root_line` (the case
+  file's own call site), so failures inside helpers, the prelude, or loaded
+  chunks don't misrank.
 - Per-case shims exist only for `collectgarbage` (no-op) and
   `string.packsize` (returns 8). Remove them as the real APIs land.
 - Add a file to `CASES` in `tests/conformance.rs` to widen coverage; bless
   afterward.
+- The harness installs a suite-rooted reader via `set_fs_file_reader` (or a
+  plain closure when the `fs` feature is off) and sets
+  `package.path = "?.lua;libs/?.lua"` in the preamble.
 
 ## The plan (the main thing not captured in any artifact)
 
@@ -81,7 +79,7 @@ authority out of the core. Verify + bless + commit per phase.
 | API | Uses | Mechanism |
 |---|---|---|
 | `package` + `require` | attrib(40), locals, goto, calls, events, bitwise, literals, coroutine, closure, nextvar, strings | Prelude + host loader hook |
-| `load`/`loadfile`/`dofile` | calls(40), literals(20), attrib(17), constructs(8), locals(8), strings(4), bitwise(4), math, vararg, goto, nextvar, coroutine, pm, sort | Intrinsic (string and function chunks, `mode`, `env`) |
+| `load`/`loadfile`/`dofile` | calls(40), literals(20), attrib(17), constructs(8), locals(8), strings(4), bitwise(4), math, vararg, goto, nextvar, coroutine, pm, sort | Native + prelude (string chunks compile in Rust; reader chunks concatenated in the prelude) |
 | `table.move` + metamethod-aware `remove`/`concat`/`unpack` | sort(24), nextvar | Prelude |
 | `print`→`__tostring`, `pairs`→`__pairs`, `ipairs`→`__index` | events, nextvar, broadly | Prelude |
 | `utf8.*` | pm(2), strings | Native |
@@ -93,13 +91,17 @@ authority out of the core. Verify + bless + commit per phase.
 
 ### Phases
 
-1. **Modules + dynamic loading** — biggest win (11 files' first failure).
-   `package{loaded,preload,path,searchers}` + `require` in the prelude;
-   `load` intrinsic (string chunks via `parse`/`compile`, function-reader
-   chunks by driving the VM, `nil, message` on errors, `chunkname`, `mode`,
-   `env`); host loader hook (`Lua::set_file_loader`-style) plus a public way
-   to make a callable closure from a `Chunk` so embedders can install
-   `package.preload`. The harness installs a suite-rooted loader.
+1. **Modules + dynamic loading — done (Phase 1).** Landed as:
+   `package{loaded,preload,path,cpath,config,searchers,searchpath}` created in
+   `src/stdlib/mod.rs` with `require`, the four PUC searchers, `load`'s
+   reader loop, and `dofile` in `src/stdlib/prelude.lua`; `load`/`loadfile`
+   natives (string chunks via `parse`/`compile`, function-reader chunks
+   concatenated in the prelude under `pcall`, `nil, message` on errors,
+   `chunkname`, `mode`, present-but-nil `env`); `Lua::set_file_reader` seam
+   plus `Lua::make_function` for `package.preload`; default-on `fs` feature
+   adding only `Lua::set_fs_file_reader(root)` (`src/fs.rs`). An empty
+   `debug` stub is registered so the six `require "debug"` files reveal
+   their real next stop. New tests live in `tests/modules.rs`.
 2. **Table library** — `table.move` in the prelude; migrate `remove`,
    `concat`, `unpack` to use `lua_len` + metamethod-aware indexing.
 3. **Base metamethod conformance** — `print` via `tostring`, `pairs` via
@@ -115,6 +117,11 @@ authority out of the core. Verify + bless + commit per phase.
    compiler local-name metadata); tier (c): `sethook` (needs dispatch hooks).
 8. **Explicit non-goals** — `io`, `os` time/process, `string.dump`/binary
    chunks. Keep them absent; note terminal stops.
+
+Not in the original inventory: `calls.lua` now stops at line 120 on
+"stack overflow" in its tail-call tests — proper tail calls are unimplemented
+(a frame-reuse change in the dispatch loop), and `locals.lua` stops inside
+`tracegc.lua`, which likely needs `collectgarbage` introspection.
 
 ### Verification loop (per phase)
 
@@ -170,8 +177,11 @@ only move forward.
 
 ## Suggested immediate next step
 
-Start at Phase 1: `package`/`require` and `load`. It unblocks the most first
-failures and forces the closure-creation and loader-hook APIs that later
-phases reuse. Phase 2 and 3 are small follow-ups.
+Phase 1 is done. Next: **Phase 2** (`table.move` + metamethod-aware
+`remove`/`concat`/`unpack` in the prelude) and **Phase 3** (`print`/`pairs`/
+`ipairs` metamethod conformance), both small and independent. Then `utf8`
+(Phase 4) and the string/math gaps (Phase 5). The `debug` stub is deliberate
+recon and gets replaced in Phase 7; the `calls.lua` tail-call stop is new and
+may deserve its own phase.
 
 No secrets, credentials, or personal data are included in this handoff.

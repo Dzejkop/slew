@@ -89,6 +89,28 @@ Everything implemented follows 5.4 rules from the start, in particular:
   `memory_used()`, auto-collection by allocation threshold, and
   `memory_limit` as part of the execution profile.
 
+## Host capabilities
+
+The interpreter has no ambient authority: it never opens files, reads the
+environment, or spawns processes. Anything that would need the host goes
+through a capability the embedder installs explicitly.
+
+- `Lua::set_file_reader` installs the byte source used by `loadfile`,
+  `dofile`, and `package.searchpath`'s probes. Without one, `loadfile`
+  reports "cannot open", and `require` resolves only `package.preload` and
+  modules already in `package.loaded`.
+- The `fs` (default-on) feature adds just `Lua::set_fs_file_reader(root)`, a
+  filesystem adapter confined to `root` (absolute paths, `..`, and symlinks
+  escaping the root are refused). Disable the feature for targets without a
+  filesystem; the core still compiles.
+- Module policy lives one level up, in the Lua prelude: `package.path`,
+  `package.searchers`, and `require` are ordinary Lua and can be replaced or
+  extended. `package.path` is not a security boundary; the reader (or a
+  custom searcher) is.
+- `load` (string or reader-function chunks) is pure. Only `loadfile`,
+  `dofile`, and `package.searchpath`'s existence probes cross the host seam,
+  so the filesystem surface stays a single function.
+
 ## Execution profile knobs
 
 - `Execution::step(fuel)` — the core budget; debt from surcharges carries.
@@ -114,6 +136,12 @@ Everything implemented follows 5.4 rules from the start, in particular:
 - No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
   rarely needs them; resources should be host-managed.
 - `string.format` lacks `%a`.
+- Binary chunks are rejected: `string.dump` is absent and `load` refuses the
+  `\x1bLua` signature.
+- `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
+  supported.
+- `debug` is an empty placeholder in the globals and in `package.loaded`; the
+  real library is unimplemented.
 - `next` iteration order is stable per table state but not PUC's; per-call
   cost is O(n) (acceptable until tables move to an insertion-ordered map).
 

@@ -7,6 +7,8 @@
 pub mod ast;
 pub mod bytecode;
 pub mod compiler;
+#[cfg(feature = "fs")]
+pub mod fs;
 pub mod lexer;
 pub mod parser;
 pub mod pattern;

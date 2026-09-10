@@ -39,7 +39,13 @@ pub struct RuntimeError {
     pub message: String,
     /// The Lua error value (`error()` can raise any value).
     pub value: Value,
+    /// Line where the error was raised; for errors inside a called function
+    /// or a `load`ed chunk this points into that chunk, not the root script.
     pub line: u32,
+    /// Line of the outermost frame (the root script) when the error escaped.
+    /// Handy for progress reporting: a script that calls a helper still
+    /// reports its own call site here.
+    pub root_line: u32,
 }
 
 impl fmt::Display for Error {
@@ -76,12 +82,20 @@ pub(crate) enum ErrVal {
 pub(crate) struct VmError {
     pub val: ErrVal,
     pub line: u32,
+    /// Line of the outermost frame at raise time (the script's own call
+    /// site). Set by the dispatcher before unwinding pops frames, since
+    /// `recover` discards them.
+    pub root_line: u32,
     /// Chunk name for the position prefix; `None` for native errors,
     /// which carry no position (matching PUC).
     pub source: Option<Rc<str>>,
 }
 
 pub type NativeFn = fn(&mut Lua, &[Value]) -> Result<Vec<Value>, String>;
+
+/// Host-provided module byte source. `Ok(None)` means "not found"; `Err` is
+/// a hard failure. See [`Lua::set_file_reader`].
+type FileReaderFn = dyn FnMut(&str) -> Result<Option<Vec<u8>>, String>;
 
 /// Builtins that must interact with the frame machinery (raise error
 /// values, set up protected calls, call metamethods, switch threads).
@@ -375,6 +389,10 @@ pub struct Lua {
     /// Memory ceiling in (approximate) bytes; allocation past it raises a
     /// Lua error once detected at a collection point.
     pub memory_limit: Option<usize>,
+    /// Host-supplied source reader for `loadfile`/`dofile` and
+    /// `package.searchpath`. Absent by default: the core has no filesystem
+    /// authority of its own.
+    file_reader: Option<Box<FileReaderFn>>,
 }
 
 impl Default for Lua {
@@ -430,6 +448,7 @@ impl Lua {
             str_bytes_at_gc: 0,
             gc_alloc_threshold: 50_000,
             memory_limit: None,
+            file_reader: None,
         };
         lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
@@ -499,6 +518,43 @@ impl Lua {
         // GC root for as long as the execution is live
         self.exec_roots.insert(tid.0, tid.0);
         Execution { thread: tid, current: tid, debt: 0, finished: false }
+    }
+
+    /// Instantiates a compiled chunk as a function value whose `_ENV` is
+    /// `env`: `None` means the globals table, while `Some(Value::Nil)` is a
+    /// real nil environment (as `load(chunk, name, mode, nil)` produces).
+    /// The result is a normal Lua function: callable, closure-capturing, and
+    /// GC-managed, which is what embedders need to populate
+    /// `package.preload` with compiled modules.
+    pub fn make_function(&mut self, chunk: &Chunk, env: Option<Value>) -> Value {
+        let env = env.unwrap_or(Value::Table(self.globals));
+        let up = self.new_upval(Upval::Closed(env));
+        let cid = self.alloc_closure(LuaClosure {
+            proto: chunk.proto.clone(),
+            upvals: vec![up],
+        });
+        Value::Closure(cid)
+    }
+
+    /// Installs the host reader behind `loadfile`, `dofile`, and
+    /// `package.searchpath`. `Ok(None)` means "not found"; `Err` is a hard
+    /// failure. Without a reader those functions report "cannot open" and
+    /// `require` resolves only `package.preload` and already-loaded modules:
+    /// the interpreter has no ambient filesystem access.
+    pub fn set_file_reader(
+        &mut self,
+        reader: impl FnMut(&str) -> Result<Option<Vec<u8>>, String> + 'static,
+    ) {
+        self.file_reader = Some(Box::new(reader));
+    }
+
+    /// Reads a module source through the installed reader; no reader means
+    /// "not found".
+    pub(crate) fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        match &mut self.file_reader {
+            Some(reader) => reader(path),
+            None => Ok(None),
+        }
     }
 
     /// Registers a native function as a global.
@@ -734,37 +790,53 @@ impl Lua {
                         }
                     }
                 }
-                Err(mut e) => loop {
-                    // error escaped this thread entirely; close its open
-                    // upvalues (closures may outlive the thread) and kill it
-                    self.close_upvals(&mut th, 0);
-                    th.frames.clear();
-                    th.status = CoStatus::Dead;
-                    let parent = th.parent.take();
-                    let rr = th.resume_ret.take();
-                    th.stack.clear();
-                    self.threads[cur.0 as usize] = th;
-                    match parent {
-                        None => return Err(self.materialize_error(e)),
-                        Some(p) => {
-                            cur = p;
-                            self.current_thread = cur;
-                            th = std::mem::take(&mut self.threads[cur.0 as usize]);
-                            th.status = CoStatus::Running;
-                            let rr = rr.unwrap();
-                            if rr.wrap {
-                                // wrap propagates the error into the resumer
-                                match self.recover(&mut th, e) {
-                                    Ok(()) => break,
-                                    Err(e2) => {
-                                        e = e2;
-                                        continue;
+                Err(mut e) => {
+                    let mut root_line = None;
+                    loop {
+                        // capture the root script's own position before the
+                        // frames are cleared below (on coroutine propagation
+                        // this is the resume call site; for root-origin
+                        // errors the frames are already gone and the
+                        // dispatcher's `root_line` stands)
+                        if root_line.is_none() && th.parent.is_none() {
+                            root_line = Some(
+                                th.frames.first().map(frame_line).unwrap_or(e.root_line),
+                            );
+                        }
+                        // error escaped this thread entirely; close its open
+                        // upvalues (closures may outlive the thread) and kill it
+                        self.close_upvals(&mut th, 0);
+                        th.frames.clear();
+                        th.status = CoStatus::Dead;
+                        let parent = th.parent.take();
+                        let rr = th.resume_ret.take();
+                        th.stack.clear();
+                        self.threads[cur.0 as usize] = th;
+                        match parent {
+                            None => {
+                                let root_line = root_line.unwrap_or(e.line);
+                                return Err(self.materialize_error(e, root_line));
+                            }
+                            Some(p) => {
+                                cur = p;
+                                self.current_thread = cur;
+                                th = std::mem::take(&mut self.threads[cur.0 as usize]);
+                                th.status = CoStatus::Running;
+                                let rr = rr.unwrap();
+                                if rr.wrap {
+                                    // wrap propagates the error into the resumer
+                                    match self.recover(&mut th, e) {
+                                        Ok(()) => break,
+                                        Err(e2) => {
+                                            e = e2;
+                                            continue;
+                                        }
                                     }
+                                } else {
+                                    let errv = self.err_value(&e);
+                                    deliver_resume(&mut th, rr, false, &[errv]);
+                                    break;
                                 }
-                            } else {
-                                let errv = self.err_value(&e);
-                                deliver_resume(&mut th, rr, false, &[errv]);
-                                break;
                             }
                         }
                     }
@@ -773,9 +845,14 @@ impl Lua {
         }
     }
 
-    fn materialize_error(&mut self, e: VmError) -> RuntimeError {
+    fn materialize_error(&mut self, e: VmError, root_line: u32) -> RuntimeError {
         let value = self.err_value(&e);
-        RuntimeError { message: self.display_value(value), value, line: e.line }
+        RuntimeError {
+            message: self.display_value(value),
+            value,
+            line: e.line,
+            root_line,
+        }
     }
 
     fn err_value(&mut self, e: &VmError) -> Value {
@@ -804,7 +881,14 @@ impl Lua {
             match self.exec_one(tid, th, fuel) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Finished(vals)) => return Ok(DispatchEnd::Finished(vals)),
-                Err(e) => self.recover(th, e)?,
+                Err(mut e) => {
+                    // capture the script's own call site before `recover`
+                    // pops the frames it unwinds
+                    if e.root_line == 0 {
+                        e.root_line = th.frames.first().map(frame_line).unwrap_or(0);
+                    }
+                    self.recover(th, e)?;
+                }
             }
             if let Some(next) = self.switch_to.take() {
                 return Ok(DispatchEnd::Switch(next));
@@ -1289,6 +1373,7 @@ impl Lua {
                 let res = f(self, &args).map_err(|message| VmError {
                     val: ErrVal::Msg(message),
                     line: line_of(th),
+                    root_line: 0,
                     source: None,
                 })?;
                 place_shaped(th, ret_to, nres, shape, &res);
@@ -1350,7 +1435,7 @@ impl Lua {
                     }
                     _ => v,
                 };
-                Err(VmError { val: ErrVal::Val(val), line: line_of(th), source: None })
+                Err(VmError { val: ErrVal::Val(val), line: line_of(th), root_line: 0, source: None })
             }
             Intrinsic::Assert => {
                 if argc == 0 {
@@ -1371,12 +1456,14 @@ impl Lua {
                             Err(VmError {
                                 val: ErrVal::Msg("assertion failed!".into()),
                                 line: line_of(th),
+                                root_line: 0,
                                 source,
                             })
                         }
                         v => Err(VmError {
                             val: ErrVal::Val(v),
                             line: line_of(th),
+                            root_line: 0,
                             source: None,
                         }),
                     }
@@ -2105,7 +2192,7 @@ impl Lua {
 
     fn rt_err(&self, th: &Thread, message: String) -> VmError {
         let source = th.frames.last().map(|f| f.proto.source.clone());
-        VmError { val: ErrVal::Msg(message), line: line_of(th), source }
+        VmError { val: ErrVal::Msg(message), line: line_of(th), root_line: 0, source }
     }
 
     // ---- garbage collection ----
@@ -2420,6 +2507,7 @@ impl Execution {
                 message: "execution already finished".into(),
                 value: Value::Nil,
                 line: 0,
+                root_line: 0,
             }));
         }
         let budget = fuel.min(i64::MAX as u64) as i64;
@@ -2483,6 +2571,11 @@ fn jump(th: &mut Thread, off: i32) {
 
 fn line_of(th: &Thread) -> u32 {
     let Some(f) = th.frames.last() else { return 0 };
+    frame_line(f)
+}
+
+/// Source line the frame's next instruction belongs to.
+fn frame_line(f: &Frame) -> u32 {
     f.proto.lines.get(f.pc.wrapping_sub(1)).copied().unwrap_or(0)
 }
 

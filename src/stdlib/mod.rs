@@ -12,8 +12,8 @@ mod math;
 mod string;
 mod table;
 
-use crate::value::{to_key, Value};
-use crate::vm::{CoStatus, Intrinsic, Lua, NativeKind, Step};
+use crate::value::{fmt_number, to_key, Value};
+use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind, Step};
 
 pub fn install(lua: &mut Lua) {
     lua.register_native("print", n_print);
@@ -41,6 +41,11 @@ pub fn install(lua: &mut Lua) {
     string::install(lua);
     table::install(lua);
     math::install(lua);
+    // dynamic loading: `load` is pure; `loadfile` goes through the host
+    // reader installed with `Lua::set_file_reader` (none by default)
+    lua.register_native("load", n_load);
+    lua.register_native("loadfile", n_loadfile);
+    install_package(lua);
     run_prelude(lua);
 }
 
@@ -82,6 +87,185 @@ fn install_coroutine(lua: &mut Lua) {
     set_field(lua, ct, "isyieldable", isyieldable);
     let running = lua.add_native_kind("running", NativeKind::Intrinsic(Intrinsic::Running));
     set_field(lua, ct, "running", running);
+}
+
+/// Creates the `package` table: `loaded`/`preload`/paths plus the
+/// `searchpath` probe. `require` and the searchers live in the prelude so
+/// they can call back into Lua loaders through the regular VM machinery.
+fn install_package(lua: &mut Lua) {
+    let pkg = lua.new_table();
+    lua.set_global("package", pkg);
+    let loaded = lua.new_table();
+    set_field(lua, pkg, "loaded", loaded);
+    let preload = lua.new_table();
+    set_field(lua, pkg, "preload", preload);
+    let path = lua.new_string(b"?.lua");
+    set_field(lua, pkg, "path", path);
+    let cpath = lua.new_string(b"");
+    set_field(lua, pkg, "cpath", cpath);
+    let config = lua.new_string(b"/\n;\n?\n!\n-\n");
+    set_field(lua, pkg, "config", config);
+    let searchpath = lua.add_native("searchpath", n_searchpath);
+    set_field(lua, pkg, "searchpath", searchpath);
+
+    let globals = Value::Table(lua.globals);
+    lua.set_global("_G", globals);
+    set_field(lua, loaded, "_G", globals);
+    for name in ["string", "table", "math", "coroutine", "package"] {
+        let v = lua.get_global(name);
+        set_field(lua, loaded, name, v);
+    }
+    // `debug` is not implemented yet (Phase 7); an empty stand-in keeps
+    // dependent test files past their initial `require "debug"`.
+    let debug = lua.new_table();
+    lua.set_global("debug", debug);
+    set_field(lua, loaded, "debug", debug);
+}
+
+/// Compiles `src` the way `load`/`loadfile` do: the function on success,
+/// `nil, message` on any failure. Text/binary `mode` is enforced, and
+/// binary chunks are rejected outright (no `string.dump` support).
+fn load_source(
+    lua: &mut Lua,
+    src: Vec<u8>,
+    chunkname: &str,
+    mode: &[u8],
+    env: Option<Value>,
+) -> Vec<Value> {
+    if src.starts_with(b"\x1bLua") {
+        if !mode.contains(&b'b') {
+            return vec![
+                Value::Nil,
+                lua.new_string(b"attempt to load a binary chunk (mode is 't')"),
+            ];
+        }
+        return vec![
+            Value::Nil,
+            lua.new_string(b"binary chunks are not supported (no string.dump/undump)"),
+        ];
+    }
+    if !mode.contains(&b't') {
+        return vec![
+            Value::Nil,
+            lua.new_string(b"attempt to load a text chunk (mode is 'b')"),
+        ];
+    }
+    match lua.load_named(chunkname, &src) {
+        Ok(chunk) => vec![lua.make_function(&chunk, env)],
+        Err(Error::Parse(e)) => text_error(lua, chunkname, e.line, &e.message),
+        Err(Error::Compile(e)) => text_error(lua, chunkname, e.line, &e.message),
+        Err(Error::Runtime(e)) => {
+            vec![Value::Nil, lua.new_string(e.message.as_bytes())]
+        }
+    }
+}
+
+/// `nil, "chunkname:line: message"`, the shape `load`/`loadfile` use for
+/// compile failures.
+fn text_error(lua: &mut Lua, chunkname: &str, line: u32, message: &str) -> Vec<Value> {
+    let msg = format!("{chunkname}:{line}: {message}");
+    vec![Value::Nil, lua.new_string(msg.as_bytes())]
+}
+
+/// `luaL_checkstring`-ish: strings pass, numbers are rendered, anything
+/// else (including nil) is an error.
+fn check_bytes(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
+    match arg(args, i) {
+        Value::Str(id) => Ok(lua.strings.get(id).to_vec()),
+        v @ (Value::Int(_) | Value::Float(_)) => Ok(fmt_number(v).into_bytes()),
+        v => Err(format!(
+            "bad argument #{} to '{who}' (string expected, got {})",
+            i + 1,
+            v.type_name()
+        )),
+    }
+}
+
+fn opt_bytes(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Option<Vec<u8>>, String> {
+    if arg(args, i) == Value::Nil { Ok(None) } else { check_bytes(lua, args, i, who).map(Some) }
+}
+
+fn replace_all(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hay.len() {
+        if hay[i..].starts_with(needle) {
+            out.extend_from_slice(with);
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn n_load(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let src = check_bytes(lua, args, 0, "load")?;
+    // PUC defaults the chunk name of a string chunk to the source itself
+    let chunkname = match opt_bytes(lua, args, 1, "load")? {
+        Some(name) => String::from_utf8_lossy(&name).into_owned(),
+        None => String::from_utf8_lossy(&src).into_owned(),
+    };
+    let mode = opt_bytes(lua, args, 2, "load")?.unwrap_or_else(|| b"bt".to_vec());
+    // an explicitly passed `env` (even nil) replaces `_ENV`; absent means
+    // the globals table
+    let env = (args.len() > 3).then(|| arg(args, 3));
+    Ok(load_source(lua, src, &chunkname, &mode, env))
+}
+
+fn n_loadfile(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(filename) = opt_bytes(lua, args, 0, "loadfile")? else {
+        return Ok(vec![
+            Value::Nil,
+            lua.new_string(b"cannot read stdin: no input stream"),
+        ]);
+    };
+    let name = String::from_utf8_lossy(&filename).into_owned();
+    let mode = opt_bytes(lua, args, 1, "loadfile")?.unwrap_or_else(|| b"bt".to_vec());
+    let env = (args.len() > 2).then(|| arg(args, 2));
+    match lua.read_file(&name) {
+        Ok(Some(src)) => Ok(load_source(lua, src, &name, &mode, env)),
+        Ok(None) => {
+            let msg = format!("cannot open {name}");
+            Ok(vec![Value::Nil, lua.new_string(msg.as_bytes())])
+        }
+        Err(e) => {
+            let msg = format!("cannot open {name}: {e}");
+            Ok(vec![Value::Nil, lua.new_string(msg.as_bytes())])
+        }
+    }
+}
+
+/// `package.searchpath(name, path [, sep [, rep]])`: substitutes `sep` with
+/// `rep` in `name`, replaces every `?` in each `;`-separated template, and
+/// probes candidates through the host reader. On failure returns
+/// `nil, "no file '...'\n\tno file '...'"` like PUC (built from the whole
+/// expanded path, so empty templates still produce their line). A hard
+/// reader error counts as "not readable", matching PUC's `fopen` probe.
+fn n_searchpath(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    let name = check_bytes(lua, args, 0, "searchpath")?;
+    let path = check_bytes(lua, args, 1, "searchpath")?;
+    let sep = opt_bytes(lua, args, 2, "searchpath")?.unwrap_or_else(|| b".".to_vec());
+    let rep = opt_bytes(lua, args, 3, "searchpath")?.unwrap_or_else(|| b"/".to_vec());
+    let name = if sep.is_empty() { name } else { replace_all(&name, &sep, &rep) };
+    let expanded = replace_all(&path, b"?", &name);
+    for tmpl in expanded.split(|&b| b == b';') {
+        if tmpl.is_empty() {
+            continue;
+        }
+        let candidate = String::from_utf8_lossy(tmpl);
+        if matches!(lua.read_file(&candidate), Ok(Some(_))) {
+            return Ok(vec![lua.new_string(tmpl)]);
+        }
+    }
+    let mut msg = Vec::from(&b"no file '"[..]);
+    msg.extend_from_slice(&replace_all(&expanded, b";", b"'\n\tno file '"));
+    msg.push(b'\'');
+    Ok(vec![Value::Nil, lua.new_string(&msg)])
 }
 
 fn n_co_create(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {

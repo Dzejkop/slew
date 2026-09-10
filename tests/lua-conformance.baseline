@@ -1,19 +1,19 @@
 # First failure per official Lua 5.4.9 test file.
 # status: ok | line:N | timeout | panic
-vararg.lua	line:102
+vararg.lua	ok
 closure.lua	timeout
-nextvar.lua	line:297
-pm.lua	line:61
-sort.lua	line:16
+nextvar.lua	line:364
+pm.lua	line:98
+sort.lua	line:94
 strings.lua	line:165
-math.lua	line:288
+math.lua	line:290
 verybig.lua	ok
-constructs.lua	line:6
-locals.lua	line:6
-goto.lua	line:7
-calls.lua	line:6
-events.lua	line:6
-bitwise.lua	line:6
-literals.lua	line:6
-attrib.lua	line:6
-coroutine.lua	line:6
+constructs.lua	line:247
+locals.lua	line:8
+goto.lua	line:21
+calls.lua	line:120
+events.lua	line:180
+bitwise.lua	ok
+literals.lua	line:41
+attrib.lua	line:9
+coroutine.lua	line:50

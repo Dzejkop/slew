@@ -29,6 +29,7 @@ _soft = true
 _port = true
 _nomsg = true
 T = nil
+package.path = "?.lua;libs/?.lua"
 "#;
 
 /// Test-only stand-in for the absent GC controls.
@@ -214,12 +215,32 @@ fn run_case(dir: &Path, case: &Case) -> Status {
     let Ok(src) = std::fs::read(&path) else {
         return Status::Line(0);
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| run_source(&path, &src, case.shims)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| run_source(dir, &path, &src, case.shims)));
     outcome.unwrap_or(Status::Panic)
 }
 
-fn run_source(path: &Path, src: &[u8], shims: &str) -> Status {
+/// Module files are resolved under the suite root. The `fs` feature supplies
+/// the sandboxed adapter; without it, tests still get a reader (test code may
+/// touch the filesystem even when the library does not).
+fn install_suite_reader(lua: &mut Lua, dir: &Path) {
+    #[cfg(feature = "fs")]
+    {
+        lua.set_fs_file_reader(dir);
+    }
+    #[cfg(not(feature = "fs"))]
+    {
+        let root = dir.to_path_buf();
+        lua.set_file_reader(move |path| match std::fs::read(root.join(path)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        });
+    }
+}
+
+fn run_source(dir: &Path, path: &Path, src: &[u8], shims: &str) -> Status {
     let mut lua = Lua::new();
+    install_suite_reader(&mut lua, dir);
     if let Err(e) = drive(&mut lua, "=preamble", PREAMBLE.as_bytes()) {
         return Status::Line(error_line(&e));
     }
@@ -244,7 +265,12 @@ fn run_source(path: &Path, src: &[u8], shims: &str) -> Status {
                     return Status::Timeout;
                 }
             }
-            Err(e) => return Status::Line(error_line(&e)),
+            Err(e) => {
+                if std::env::var_os("SLEW_LUA_TESTS_VERBOSE").is_some() {
+                    eprintln!("    {e}");
+                }
+                return Status::Line(error_line(&e));
+            }
         }
     }
 }
@@ -264,6 +290,9 @@ fn error_line(e: &Error) -> u32 {
     match e {
         Error::Parse(e) => e.line,
         Error::Compile(e) => e.line,
+        // progress is measured in the case file itself, not in a helper or a
+        // dynamically loaded chunk the case happened to call
+        Error::Runtime(e) if e.root_line != 0 => e.root_line,
         Error::Runtime(e) => e.line,
     }
 }

@@ -206,3 +206,131 @@ function table.sort(t, cmp)
   end
   qs(1, #t)
 end
+
+-- ---- package and require ------------------------------------------------
+-- Module bytes come from `loadfile`, which is backed by the host reader (or
+-- by nothing at all): the interpreter has no filesystem authority of its
+-- own. `package.searchers` is the Lua-level seam, so an embedder can replace
+-- or extend it to serve modules from anywhere.
+
+local raw_load = load
+
+function load(chunk, ...)
+  if type(chunk) == 'function' then
+    -- Reader chunks run under pcall: a failing reader surfaces as
+    -- `nil, message` from load, exactly as PUC's protected parser does.
+    local parts, n = {}, 0
+    local ok, err = pcall(function()
+      while true do
+        local piece = chunk()
+        if piece == nil then break end
+        if type(piece) == 'number' then
+          piece = tostring(piece)
+        elseif type(piece) ~= 'string' then
+          error("reader function must return a string", 0)
+        end
+        if #piece == 0 then break end
+        n = n + 1
+        parts[n] = piece
+      end
+    end)
+    if not ok then return nil, err end
+    local chunkname, mode, env = ...
+    if chunkname == nil then chunkname = "=(load)" end
+    local text = table.concat(parts)
+    local nargs = select('#', ...)
+    if nargs >= 3 then return raw_load(text, chunkname, mode, env) end
+    if nargs == 2 then return raw_load(text, chunkname, mode) end
+    return raw_load(text, chunkname)
+  end
+  -- forward the argument tail verbatim so an absent `env` stays absent
+  return raw_load(chunk, ...)
+end
+
+local function preload_searcher(name)
+  local v = package.preload[name]
+  if v == nil then
+    return "no field package.preload['" .. name .. "']"
+  end
+  return v, ":preload:"
+end
+
+local function load_error(name, filename, msg)
+  return "error loading module '" .. name .. "' from file '" ..
+         filename .. "':\n\t" .. msg
+end
+
+local function lua_searcher(name)
+  local path = package.path
+  if type(path) ~= 'string' then
+    error("'package.path' must be a string", 0)
+  end
+  local filename, err = package.searchpath(name, path, ".", "/")
+  if not filename then return err end
+  local f, msg = loadfile(filename, "t")
+  if not f then
+    error(load_error(name, filename, msg), 0)
+  end
+  return f, filename
+end
+
+local function c_searcher(name)
+  local path = package.cpath
+  if type(path) ~= 'string' then
+    error("'package.cpath' must be a string", 0)
+  end
+  local filename, err = package.searchpath(name, path, ".", "/")
+  if not filename then return err end
+  error(load_error(name, filename, "dynamic libraries are not supported"), 0)
+end
+
+local function croot_searcher(name)
+  local p = find(name, ".", 1, true)
+  if not p then return nil end
+  local path = package.cpath
+  if type(path) ~= 'string' then
+    error("'package.cpath' must be a string", 0)
+  end
+  local filename, err = package.searchpath(sub(name, 1, p - 1), path, ".", "/")
+  if not filename then return err end
+  error(load_error(name, filename, "dynamic libraries are not supported"), 0)
+end
+
+package.searchers = {preload_searcher, lua_searcher, c_searcher, croot_searcher}
+
+function require(name)
+  local loaded = package.loaded
+  local v = loaded[name]
+  if v then return v end
+  local searchers = package.searchers
+  if type(searchers) ~= 'table' then
+    error("'package.searchers' must be a table", 0)
+  end
+  local msgs = {}
+  local loader, extra
+  local i = 1
+  while true do
+    local s = searchers[i]
+    if s == nil then
+      error("module '" .. name .. "' not found:" .. table.concat(msgs), 0)
+    end
+    local a, b = s(name)
+    if type(a) == 'function' then
+      loader, extra = a, b
+      break
+    elseif type(a) == 'string' then
+      msgs[#msgs + 1] = "\n\t" .. a
+    end
+    i = i + 1
+  end
+  local res = loader(name, extra)
+  if res ~= nil then loaded[name] = res end
+  if loaded[name] == nil then loaded[name] = true end
+  return loaded[name], extra
+end
+
+function dofile(filename)
+  local f, err = loadfile(filename)
+  if f == nil then error(err, 0) end
+  return f()
+end
