@@ -29,6 +29,19 @@ fn eval_multi(src: &str) -> Vec<String> {
     vals.iter().map(|v| lua.display_value(*v)).collect()
 }
 
+fn run_err(src: &str) -> String {
+    let mut lua = Lua::new();
+    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let mut exec = lua.execute(&chunk);
+    loop {
+        match exec.step(&mut lua, 1_000_000) {
+            Ok(Step::Done(_)) => panic!("expected error: {src}"),
+            Ok(Step::Pending) => continue,
+            Err(e) => return e.to_string(),
+        }
+    }
+}
+
 // ---- string ----
 
 #[test]
@@ -200,6 +213,62 @@ fn table_concat_pack_unpack() {
         eval("local function f(...) return select('#', ...) end return f(table.unpack({1,2,3}))"),
         "3"
     );
+    // a range wider than the result cap must error, not overflow the host
+    assert!(
+        run_err("return table.unpack({}, math.mininteger, math.maxinteger)")
+            .contains("too many results")
+    );
+    assert!(run_err("return table.unpack({}, 0, (1 << 31) - 1)").contains("too many results"));
+    // empty ranges still return nothing
+    assert!(eval("return select('#', table.unpack({}, 10, 6))") == "0");
+}
+
+#[test]
+fn ipairs_wraps_at_maxinteger() {
+    assert_eq!(
+        eval(
+            "local t = {[math.mininteger] = 10} \
+             local f = ipairs{} \
+             local k, v = f(t, math.maxinteger) \
+             assert(k == math.mininteger and v == 10) \
+             return tostring(f(t, k))"
+        ),
+        "nil"
+    );
+}
+
+#[test]
+fn table_insert_respects_len_metamethod() {
+    // `table.insert` lives in the Lua prelude so `#t` and `t[k] = v` go
+    // through __len/__newindex; maxinteger + 1 wraps like PUC.
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__len = function() return math.maxinteger end}) \
+             table.insert(t, 20) \
+             local k, v = next(t) \
+             return k .. ':' .. v"
+        ),
+        "-9223372036854775808:20"
+    );
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__len = function() return 2 end}) \
+             table.insert(t, 5) \
+             return t[3]"
+        ),
+        "5"
+    );
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__len = function() return 2 end, \
+              __newindex = function(t, k, v) rawset(t, k, v) end}) \
+             table.insert(t, 1, 5) \
+             return t[1]"
+        ),
+        "5"
+    );
+    assert!(run_err("table.insert({}, 0, 1)").contains("position out of bounds"));
+    assert!(run_err("table.insert({}, 1, 2, 3)").contains("wrong number of arguments"));
 }
 
 #[test]

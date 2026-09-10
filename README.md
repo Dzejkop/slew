@@ -44,3 +44,19 @@ Commands: `:fuel N`, `:more`, `:mem`, `:gc`, `:help`, `:quit`.
 
 The `repl` feature (on by default) pulls in reedline; library consumers can
 use `default-features = false`.
+
+## Conformance
+
+The official Lua 5.4.9 test archive is the conformance corpus:
+
+```
+scripts/run-lua-tests.sh
+```
+
+The script downloads a pinned, checksum-verified archive into `target/`,
+runs a curated set of upstream test files, and compares each file's first
+failure against `tests/lua-conformance.baseline`. Getting further passes;
+failing earlier, or panicking the host, is a regression. Refresh the
+baseline after intentional progress with `SLEW_BLESS=1 scripts/run-lua-tests.sh`.
+Known intentional gaps (no weak tables, no `io`/`os`, ...) are listed in
+[DESIGN.md](DESIGN.md).

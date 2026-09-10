@@ -221,8 +221,9 @@ fn n_tonumber(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// Parses a Lua numeral (as the `tonumber` builtin: full literal syntax,
-/// optional sign and surrounding whitespace).
-fn parse_number(bytes: &[u8]) -> Option<Value> {
+/// optional sign and surrounding whitespace). Also used by the VM for
+/// arithmetic string coercion.
+pub(crate) fn parse_number(bytes: &[u8]) -> Option<Value> {
     use crate::lexer::{Lexer, Token};
     let text = std::str::from_utf8(bytes).ok()?.trim();
     let (negate, text) = match text.strip_prefix('-') {
@@ -316,11 +317,13 @@ fn n_next(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     };
     let prev = match arg(args, 1) {
         Value::Nil => None,
-        k => Some(to_key(k).map_err(|m| m.to_string())?),
+        // only nil and NaN can fail: both mean the key can never be in a table
+        k => Some(to_key(k).map_err(|_| "invalid key to 'next'".to_string())?),
     };
     match lua.tables[id.0 as usize].next_after(prev) {
-        Some((k, v)) => Ok(vec![k, v]),
-        None => Ok(vec![Value::Nil]),
+        Ok(Some((k, v))) => Ok(vec![k, v]),
+        Ok(None) => Ok(vec![Value::Nil]),
+        Err(_) => Err("invalid key to 'next'".into()),
     }
 }
 
@@ -330,6 +333,9 @@ fn n_pairs(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn n_ipairs(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    if args.is_empty() {
+        return Err("bad argument #1 to 'ipairs' (value expected)".into());
+    }
     let t = arg(args, 0);
     Ok(vec![lua.builtin_ipairs_iter, t, Value::Int(0)])
 }
@@ -340,7 +346,7 @@ fn n_ipairs_iter(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         Value::Int(i) => i,
         _ => return Err("bad argument #2 to 'ipairs' (integer expected)".into()),
     };
-    let next = i + 1;
+    let next = i.wrapping_add(1);
     match lua.table_get(t, Value::Int(next)) {
         Value::Nil => Ok(vec![Value::Nil]),
         v => Ok(vec![Value::Int(next), v]),

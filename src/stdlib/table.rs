@@ -10,8 +10,7 @@ pub fn install(lua: &mut Lua) {
     let tt = lua.new_table();
     lua.set_global("table", tt);
     for (name, f) in [
-        ("insert", n_insert as crate::vm::NativeFn),
-        ("remove", n_remove),
+        ("remove", n_remove as crate::vm::NativeFn),
         ("concat", n_concat),
         ("pack", n_pack),
         ("unpack", n_unpack),
@@ -39,31 +38,6 @@ fn opt_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
             v.type_name()
         )),
     }
-}
-
-fn n_insert(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let t = table_id(lua, args, 0, "insert")? as usize;
-    let len = lua.tables[t].length();
-    match args.len() {
-        2 => {
-            lua.tables[t].set(Value::Int(len + 1), args[1]).map_err(|e| e.to_string())?;
-        }
-        3 => {
-            let pos = opt_int(args, 1, "insert")?.unwrap();
-            if pos < 1 || pos > len + 1 {
-                return Err("bad argument #2 to 'insert' (position out of bounds)".into());
-            }
-            let mut i = len;
-            while i >= pos {
-                let v = lua.tables[t].get(Value::Int(i));
-                lua.tables[t].set(Value::Int(i + 1), v).map_err(|e| e.to_string())?;
-                i -= 1;
-            }
-            lua.tables[t].set(Value::Int(pos), args[2]).map_err(|e| e.to_string())?;
-        }
-        _ => return Err("wrong number of arguments to 'insert'".into()),
-    }
-    Ok(vec![])
 }
 
 fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -145,7 +119,9 @@ fn n_unpack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     if i > j {
         return Ok(vec![]);
     }
-    let n = (j - i + 1) as usize;
+    // The range size can exceed `i64` (e.g. `mininteger..maxinteger`), so
+    // widen before subtracting; `i128` covers the full span of an i64 range.
+    let n = (j as i128) - (i as i128) + 1;
     if n > 1_000_000 {
         return Err("too many results to unpack".into());
     }

@@ -979,7 +979,7 @@ impl Lua {
             Instr::Arith { op, dst, lhs, rhs } => {
                 let a = th.stack[base + lhs as usize];
                 let b = th.stack[base + rhs as usize];
-                match arith(op, a, b) {
+                match arith(&self.strings, op, a, b) {
                     Ok(v) => th.stack[base + dst as usize] = v,
                     Err(msg) => {
                         let mm = self.binary_mm(a, b, mm_of_arith(op));
@@ -1977,6 +1977,14 @@ impl Lua {
             UnaryOp::Neg => match v {
                 Value::Int(i) => (Some(Value::Int(i.wrapping_neg())), None),
                 Value::Float(f) => (Some(Value::Float(-f)), None),
+                Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                    Some(Value::Int(i)) => (Some(Value::Int(i.wrapping_neg())), None),
+                    Some(Value::Float(f)) => (Some(Value::Float(-f)), None),
+                    _ => (None, Some((Mm::Unm, format!(
+                        "attempt to perform arithmetic on a {} value",
+                        v.type_name()
+                    )))),
+                },
                 _ => (None, Some((Mm::Unm, format!(
                     "attempt to perform arithmetic on a {} value",
                     v.type_name()
@@ -2654,7 +2662,18 @@ fn for_int_limit(f: f64, step_positive: bool) -> Option<i64> {
     }
 }
 
-fn arith(op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
+/// Numeric coercion for arithmetic operators: numbers pass through and
+/// numeric strings are parsed. Lua 5.4 delegates string coercion to the
+/// string library's arithmetic metamethods; bitwise operators stay strict.
+fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Some(v),
+        Value::Str(id) => crate::stdlib::parse_number(strings.get(id)),
+        _ => None,
+    }
+}
+
+fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
     use ArithOp::*;
     let num_err = |v: Value| {
         format!("attempt to perform arithmetic on a {} value", v.type_name())
@@ -2663,17 +2682,22 @@ fn arith(op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
         Value::Float(_) => "number has no integer representation".to_string(),
         _ => format!("attempt to perform bitwise operation on a {} value", v.type_name()),
     };
+    let na = to_arith_number(strings, a);
+    let nb = to_arith_number(strings, b);
+    let as_float = |n: Option<Value>, v: Value| -> Result<f64, String> {
+        to_float(n.ok_or_else(|| num_err(v))?).ok_or_else(|| num_err(v))
+    };
     match op {
-        Add | Sub | Mul => match (a, b) {
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(match op {
+        Add | Sub | Mul => match (na, nb) {
+            (Some(Value::Int(x)), Some(Value::Int(y))) => Ok(Value::Int(match op {
                 Add => x.wrapping_add(y),
                 Sub => x.wrapping_sub(y),
                 Mul => x.wrapping_mul(y),
                 _ => unreachable!(),
             })),
             _ => {
-                let x = to_float(a).ok_or_else(|| num_err(a))?;
-                let y = to_float(b).ok_or_else(|| num_err(b))?;
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
                 Ok(Value::Float(match op {
                     Add => x + y,
                     Sub => x - y,
@@ -2683,17 +2707,17 @@ fn arith(op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
             }
         },
         Div => {
-            let x = to_float(a).ok_or_else(|| num_err(a))?;
-            let y = to_float(b).ok_or_else(|| num_err(b))?;
+            let x = as_float(na, a)?;
+            let y = as_float(nb, b)?;
             Ok(Value::Float(x / y))
         }
         Pow => {
-            let x = to_float(a).ok_or_else(|| num_err(a))?;
-            let y = to_float(b).ok_or_else(|| num_err(b))?;
+            let x = as_float(na, a)?;
+            let y = as_float(nb, b)?;
             Ok(Value::Float(x.powf(y)))
         }
-        IDiv => match (a, b) {
-            (Value::Int(x), Value::Int(y)) => {
+        IDiv => match (na, nb) {
+            (Some(Value::Int(x)), Some(Value::Int(y))) => {
                 if y == 0 {
                     return Err("attempt to perform 'n//0'".into());
                 }
@@ -2702,13 +2726,13 @@ fn arith(op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
                 Ok(Value::Int(q))
             }
             _ => {
-                let x = to_float(a).ok_or_else(|| num_err(a))?;
-                let y = to_float(b).ok_or_else(|| num_err(b))?;
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
                 Ok(Value::Float((x / y).floor()))
             }
         },
-        Mod => match (a, b) {
-            (Value::Int(x), Value::Int(y)) => {
+        Mod => match (na, nb) {
+            (Some(Value::Int(x)), Some(Value::Int(y))) => {
                 if y == 0 {
                     return Err("attempt to perform 'n%0'".into());
                 }
@@ -2716,8 +2740,8 @@ fn arith(op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
                 Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
             }
             _ => {
-                let x = to_float(a).ok_or_else(|| num_err(a))?;
-                let y = to_float(b).ok_or_else(|| num_err(b))?;
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
                 let r = x % y;
                 Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }))
             }

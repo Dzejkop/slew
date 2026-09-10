@@ -82,6 +82,88 @@ fn integer_division_by_zero_errors() {
 }
 
 #[test]
+fn numeric_string_arithmetic_coercion() {
+    // Lua 5.4 provides this through the string library's arithmetic
+    // metamethods; bitwise operators deliberately do not coerce.
+    assert_eq!(eval("return '2' + ' 3e0 '"), "5.0");
+    assert_eq!(eval("return ' -0xa ' + 1"), "-9");
+    assert_eq!(eval("return '10' - ' 10 '"), "0");
+    assert_eq!(
+        eval("return math.type('2' + 1) .. ':' .. math.type('2' + 1.0)"),
+        "integer:float"
+    );
+    assert_eq!(eval("return -'  10 '"), "-10");
+    assert_eq!(eval("return '2' ^ '3'"), "8.0");
+    assert_eq!(eval("return '7' % '3'"), "1");
+    assert!(run_err("return '2' | 1").contains("bitwise"));
+    assert!(run_err("return 'x' + 1").contains("arithmetic"));
+    // a table's __add still wins when mixed with a numeric string
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__add = function(a, b) return 42 end}) \
+             return '2' + t"
+        ),
+        "42"
+    );
+}
+
+#[test]
+fn next_rejects_invalid_keys() {
+    assert!(run_err("return next({10, 20}, 3)").contains("invalid key"));
+    assert!(run_err("return next({}, 0/0)").contains("invalid key"));
+    assert_eq!(eval("local t = {10, 20} local k, v = next(t) return k .. ':' .. v"), "1:10");
+}
+
+#[test]
+fn local_env_declaration() {
+    // `local _ENV = ...` redirects global reads and writes (Lua 5.4)
+    assert_eq!(
+        eval(
+            "local e = {assert = assert, print = print} \
+             local _ENV = e \
+             x = 3 \
+             return e.x"
+        ),
+        "3"
+    );
+    assert_eq!(
+        eval(
+            "local _ENV = {assert = assert, v = 7} \
+             local function f() return v end \
+             return f()"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn labels_are_invisible_to_enclosing_blocks() {
+    // Out-of-block labels must be compile errors, never host panics.
+    let mut lua = Lua::new();
+    for src in [
+        "do goto l end do ::l:: end",
+        "if true then goto l else ::l:: end",
+        "goto l do ::l:: end",
+    ] {
+        let err = lua.load(src).unwrap_err().to_string();
+        assert!(err.contains("label"), "{src}: {err}");
+    }
+    // still works within a block
+    assert_eq!(
+        eval(
+            "local x = 0 \
+             for i = 1, 3 do \
+               if i == 2 then goto continue end \
+               x = x + 1 \
+               ::continue:: \
+             end \
+             return x"
+        ),
+        "2"
+    );
+}
+
+#[test]
 fn strings_and_concat() {
     assert_eq!(eval("return 'a' .. 'b' .. 'c'"), "abc");
     assert_eq!(eval("return 'x=' .. 1 .. ',' .. 1.5"), "x=1,1.5");

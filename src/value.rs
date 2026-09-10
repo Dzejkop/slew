@@ -199,6 +199,11 @@ pub fn float_to_exact_int(f: f64) -> Option<i64> {
     }
 }
 
+/// Returned by [`Table::next_after`] when the iteration key is not present in
+/// the table; the base library renders this as Lua's "invalid key to 'next'".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidKey;
+
 #[derive(Default)]
 pub struct Table {
     /// Dense array part for keys `1..=array.len()` (may contain trailing nils).
@@ -294,7 +299,10 @@ impl Table {
 
     /// Iteration support for `next`: a stable snapshot order is array part
     /// then hash part. O(n) per call; fine until we move to an ordered map.
-    pub fn next_after(&self, key: Option<HKey>) -> Option<(Value, Value)> {
+    ///
+    /// Returns `Err(InvalidKey)` when `key` is not present in the table,
+    /// which the base library turns into an "invalid key to 'next'" error.
+    pub fn next_after(&self, key: Option<HKey>) -> Result<Option<(Value, Value)>, InvalidKey> {
         let array_iter = (1..=self.array.len() as i64).map(HKey::Int);
         let mut all = array_iter.chain(self.hash.keys().copied());
         if let Some(prev) = key {
@@ -307,16 +315,16 @@ impl Table {
                 }
             }
             if !found {
-                return None;
+                return Err(InvalidKey);
             }
         }
         for k in all {
             let v = self.get_key(k);
             if v != Value::Nil {
-                return Some((key_to_value(k), v));
+                return Ok(Some((key_to_value(k), v)));
             }
         }
-        None
+        Ok(None)
     }
 }
 

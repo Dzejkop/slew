@@ -97,6 +97,9 @@ struct FuncState {
     loops: Vec<LoopCtx>,
     gotos: Vec<PendingGoto>,
     labels: Vec<LabelDef>,
+    /// Gotos below this index belong to enclosing blocks and cannot see a
+    /// label defined in the current statement sequence.
+    goto_floor: usize,
     nparams: u8,
     is_vararg: bool,
     free_reg: u8,
@@ -119,6 +122,7 @@ impl FuncState {
             loops: Vec::new(),
             gotos: Vec::new(),
             labels: Vec::new(),
+            goto_floor: 0,
             nparams,
             is_vararg,
             free_reg: 0,
@@ -149,6 +153,14 @@ enum NameLoc {
     Local(u8),
     Upval(u8),
     Global,
+}
+
+/// Where the current `_ENV` table can be found.
+enum EnvLoc {
+    /// A `local _ENV` in scope (use its register directly).
+    Local(u8),
+    /// The implicit upvalue (load it into a temporary first).
+    Upval(u8),
 }
 
 /// An assignment target with its prefix expressions already evaluated.
@@ -310,6 +322,8 @@ impl<'h> Compiler<'h> {
         let nact_entry = self.funcs.last().unwrap().locals.len();
         let labels_floor = self.funcs.last().unwrap().labels.len();
         let gotos_floor = self.funcs.last().unwrap().gotos.len();
+        let outer_goto_floor = self.funcs.last().unwrap().goto_floor;
+        self.funcs.last_mut().unwrap().goto_floor = gotos_floor;
         for (i, s) in stmts.iter().enumerate() {
             if let Stmt::Label(name) = s {
                 let last = stmts[i + 1..].iter().all(|s| matches!(s, Stmt::Label(_)));
@@ -318,11 +332,13 @@ impl<'h> Compiler<'h> {
                 self.stmt(s)?;
             }
         }
+        self.funcs.last_mut().unwrap().goto_floor = outer_goto_floor;
         // leaving the block: labels go out of scope; unmatched gotos float
         // up with their local count capped at this block's entry level
         let fs = self.funcs.last_mut().unwrap();
         fs.labels.truncate(labels_floor);
-        for g in &mut fs.gotos[gotos_floor..] {
+        let start = gotos_floor.min(fs.gotos.len());
+        for g in &mut fs.gotos[start..] {
             g.nact = g.nact.min(nact_entry);
         }
         Ok(())
@@ -340,9 +356,11 @@ impl<'h> Compiler<'h> {
         let fs = self.funcs.last().unwrap();
         let nact = if last_in_block { block_nact } else { fs.locals.len() };
         let reg = fs.locals[..nact].iter().map(|l| l.reg + 1).max().unwrap_or(0);
+        let floor = fs.goto_floor;
         let pc = self.here();
-        // resolve pending gotos targeting this label
-        let mut i = 0;
+        // resolve pending gotos targeting this label; only gotos opened in
+        // this block can see it (labels are not visible to enclosing blocks)
+        let mut i = floor;
         while i < self.funcs.last().unwrap().gotos.len() {
             let g = &self.funcs.last().unwrap().gotos[i];
             if &*g.name != name {
@@ -745,11 +763,17 @@ impl<'h> Compiler<'h> {
                 self.emit(Instr::SetUpval { up, src });
             }
             Target::Global(k) => {
-                let env = self.env_upval();
-                let tmp = self.alloc_reg()?;
-                self.emit(Instr::GetUpval { dst: tmp, up: env });
-                self.emit(Instr::SetField { obj: tmp, k, src });
-                self.fs().free_reg -= 1;
+                match self.env_loc() {
+                    EnvLoc::Local(r) => {
+                        self.emit(Instr::SetField { obj: r, k, src });
+                    }
+                    EnvLoc::Upval(up) => {
+                        let tmp = self.alloc_reg()?;
+                        self.emit(Instr::GetUpval { dst: tmp, up });
+                        self.emit(Instr::SetField { obj: tmp, k, src });
+                        self.fs().free_reg -= 1;
+                    }
+                }
             }
             Target::Index { obj, key } => {
                 self.emit(Instr::SetIndex { obj, key, src });
@@ -761,10 +785,12 @@ impl<'h> Compiler<'h> {
         Ok(())
     }
 
-    fn env_upval(&mut self) -> u8 {
+    /// Where the current environment table lives: a local `_ENV` (Lua 5.4
+    /// allows `local _ENV = ...`) or the implicit `_ENV` upvalue.
+    fn env_loc(&mut self) -> EnvLoc {
         match self.resolve("_ENV") {
-            NameLoc::Upval(i) => i,
-            NameLoc::Local(_) => unreachable!("_ENV as local not supported"),
+            NameLoc::Local(r) => EnvLoc::Local(r),
+            NameLoc::Upval(i) => EnvLoc::Upval(i),
             NameLoc::Global => unreachable!("_ENV always resolves"),
         }
     }
@@ -980,10 +1006,16 @@ impl<'h> Compiler<'h> {
                         self.emit(Instr::GetUpval { dst, up });
                     }
                     NameLoc::Global => {
-                        let env = self.env_upval();
                         let k = self.str_const(n.as_bytes())?;
-                        self.emit(Instr::GetUpval { dst, up: env });
-                        self.emit(Instr::GetField { dst, obj: dst, k });
+                        match self.env_loc() {
+                            EnvLoc::Local(r) => {
+                                self.emit(Instr::GetField { dst, obj: r, k });
+                            }
+                            EnvLoc::Upval(up) => {
+                                self.emit(Instr::GetUpval { dst, up });
+                                self.emit(Instr::GetField { dst, obj: dst, k });
+                            }
+                        }
                     }
                 }
             }

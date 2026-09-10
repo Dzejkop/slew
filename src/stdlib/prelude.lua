@@ -4,6 +4,60 @@
 local find, sub, byte = string.find, string.sub, string.byte
 local unpack, concat = table.unpack, table.concat
 
+-- table.insert lives here rather than as a native so that it can honor
+-- __len and __newindex metamethods through the regular VM machinery.
+local function to_integer(v)
+  if type(v) == 'string' then v = tonumber(v) end
+  return math.tointeger(v)
+end
+
+local function check_insert_pos(pos)
+  local i = to_integer(pos)
+  if i == nil then
+    if type(pos) == 'number' then
+      error("bad argument #2 to 'insert' (number has no integer representation)", 3)
+    end
+    error("bad argument #2 to 'insert' (number expected, got " .. type(pos) .. ")", 3)
+  end
+  return i
+end
+
+-- luaL_len: `#t` must produce an integer (non-integral results are errors).
+local function table_len(t)
+  local i = to_integer(#t)
+  if i == nil then
+    error("object length is not an integer", 3)
+  end
+  return i
+end
+
+function table.insert(t, ...)
+  if type(t) ~= 'table' then
+    error("bad argument #1 to 'insert' (table expected, got " .. type(t) .. ")", 2)
+  end
+  local n = select('#', ...)
+  if n == 1 then
+    local value = ...
+    t[table_len(t) + 1] = value
+  elseif n == 2 then
+    local pos, value = ...
+    pos = check_insert_pos(pos)
+    local e = table_len(t) + 1
+    -- PUC checks `(unsigned)(pos - 1) < (unsigned)e`, i.e. pos in [1, e]
+    if not math.ult(pos - 1, e) then
+      error("bad argument #2 to 'insert' (position out of bounds)", 2)
+    end
+    local i = e
+    while i > pos do
+      t[i] = t[i - 1]
+      i = i - 1
+    end
+    t[pos] = value
+  else
+    error("wrong number of arguments to 'insert'", 2)
+  end
+end
+
 function string.gmatch(s, p)
   if type(s) == 'number' then s = tostring(s) end
   local pos = 1
