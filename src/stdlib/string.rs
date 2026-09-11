@@ -3,7 +3,7 @@
 
 use crate::pattern::{self, Capture};
 use crate::value::{Value, fmt_g, fmt_number};
-use crate::vm::Lua;
+use crate::vm::{Intrinsic, Lua, NativeKind};
 
 use super::string_pack::{n_pack, n_packsize, n_unpack};
 use super::{arg, set_field};
@@ -20,7 +20,6 @@ pub fn install(lua: &mut Lua) {
         ("reverse", n_reverse),
         ("byte", n_byte),
         ("char", n_char),
-        ("format", n_format),
         ("find", n_find),
         ("match", n_match),
         ("pack", n_pack),
@@ -31,6 +30,10 @@ pub fn install(lua: &mut Lua) {
         let v = lua.add_native(name, f);
         set_field(lua, st, name, v);
     }
+    // `format` is an intrinsic: `%s` may need to run `__tostring`, which
+    // requires the frame machinery to suspend and resume.
+    let format = lua.add_native_kind("format", NativeKind::Intrinsic(Intrinsic::Format));
+    set_field(lua, st, "format", format);
     // all strings share a metatable with __index = string, enabling
     // ("x"):upper() method syntax
     let meta = lua.new_table();
@@ -262,88 +265,387 @@ fn n_match(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 // ---- format ----
 
-fn n_format(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let fmt = arg_str(lua, args, 0, "format")?;
-    let mut out: Vec<u8> = Vec::new();
-    let mut argi = 1;
-    let mut it = fmt.iter().copied().peekable();
-    while let Some(c) = it.next() {
-        if c != b'%' {
-            out.push(c);
-            continue;
+/// PUC's `MAX_FORMAT`: `getformat` rejects spans that would need a longer
+/// buffer than `MAX_FORMAT - 10`.
+const MAX_FORMAT: usize = 32;
+
+/// A parsed conversion specification: the raw `%...` text PUC's `checkformat`
+/// inspects, plus the decoded flags/width/precision used for rendering.
+pub(crate) struct FmtSpec {
+    pub conv: u8,
+    pub flags: Flags,
+    pub width: usize,
+    pub precision: Option<usize>,
+    /// The raw specification, including `%` and the conversion character.
+    pub form: Vec<u8>,
+    /// Index in the format string just past this specification.
+    pub next: usize,
+}
+
+/// PUC's `getformat`: span the accepted flags/width/precision characters, then
+/// take the following conversion character. `pos` must point at a `%` that is
+/// not part of a `%%` pair.
+pub(crate) fn parse_spec(fmt: &[u8], pos: usize) -> Result<Option<FmtSpec>, String> {
+    let rest = &fmt[pos + 1..];
+    let span = rest
+        .iter()
+        .take_while(|&&c| matches!(c, b'-' | b'+' | b'#' | b'0' | b' ' | b'1'..=b'9' | b'.'))
+        .count();
+    if span + 1 >= MAX_FORMAT - 10 {
+        return Err("invalid format (too long)".into());
+    }
+    let Some(&conv) = rest.get(span) else {
+        return Err("invalid conversion to 'format'".into());
+    };
+    let mut form = Vec::with_capacity(span + 2);
+    form.push(b'%');
+    form.extend_from_slice(&rest[..span]);
+    form.push(conv);
+    let (flags, width, precision) = decode_spec(&form);
+    Ok(Some(FmtSpec {
+        conv,
+        flags,
+        width,
+        precision,
+        form,
+        next: pos + 1 + span + 1,
+    }))
+}
+
+/// Splits a validated specification into rendering parameters. `'0'` is
+/// PUC's zero-padding flag; the remaining digit run is the width.
+fn decode_spec(form: &[u8]) -> (Flags, usize, Option<usize>) {
+    let body = &form[1..form.len() - 1];
+    let mut flags = Flags::default();
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'-' => flags.left = true,
+            b'+' => flags.plus = true,
+            b' ' => flags.space = true,
+            b'#' => flags.alt = true,
+            _ => break,
         }
-        if it.peek() == Some(&b'%') {
-            it.next();
-            out.push(b'%');
-            continue;
+        i += 1;
+    }
+    if i < body.len() && body[i] == b'0' {
+        flags.zero = true;
+        i += 1;
+    }
+    let mut width = 0usize;
+    while i < body.len() && body[i].is_ascii_digit() {
+        width = width * 10 + (body[i] - b'0') as usize;
+        i += 1;
+    }
+    let mut precision = None;
+    if i < body.len() && body[i] == b'.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < body.len() && body[i].is_ascii_digit() {
+            p = p * 10 + (body[i] - b'0') as usize;
+            i += 1;
         }
-        // parse spec: flags, width, .precision, conversion
-        let mut spec: Vec<u8> = vec![b'%'];
-        let mut flags = Flags::default();
-        while let Some(&c) = it.peek() {
-            match c {
-                b'-' => flags.left = true,
-                b'0' => flags.zero = true,
-                b'+' => flags.plus = true,
-                b' ' => flags.space = true,
-                b'#' => flags.alt = true,
-                _ => break,
+        precision = Some(p);
+    }
+    (flags, width, precision)
+}
+
+/// PUC's `checkformat`: after skipping the accepted flags and at most two
+/// width/precision digits, the specification must end at an alphabetic
+/// conversion character.
+fn checkformat(form: &[u8], flags: &[u8], precision: bool) -> Result<(), String> {
+    let mut i = 1;
+    while i < form.len() && flags.contains(&form[i]) {
+        i += 1;
+    }
+    if form.get(i) != Some(&b'0') {
+        i = skip2digits(form, i);
+        if form.get(i) == Some(&b'.') && precision {
+            i += 1;
+            i = skip2digits(form, i);
+        }
+    }
+    match form.get(i) {
+        Some(c) if c.is_ascii_alphabetic() => Ok(()),
+        _ => Err(format!(
+            "invalid conversion specification: '{}'",
+            String::from_utf8_lossy(form)
+        )),
+    }
+}
+
+fn skip2digits(form: &[u8], mut i: usize) -> usize {
+    if form.get(i).is_some_and(|c| c.is_ascii_digit()) {
+        i += 1;
+        if form.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Renders one conversion, mirroring PUC's `str_format` ordering of argument
+/// coercion and `checkformat` validation. `tostr` carries an already-resolved
+/// `%s` value from `luaL_tolstring` (the `__tostring` result, or `None` when
+/// the value has no metamethod).
+pub(crate) fn render_spec(
+    lua: &mut Lua,
+    spec: &FmtSpec,
+    v: Value,
+    argi: usize,
+    tostr: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let form = &spec.form;
+    let (flags, width, precision) = (spec.flags, spec.width, spec.precision);
+    match spec.conv {
+        b'c' => {
+            checkformat(form, b"-", false)?;
+            let n = want_int(v, argi)?;
+            Ok(pad(vec![n as u8], width, flags, false))
+        }
+        b'd' | b'i' => {
+            let n = want_int(v, argi)?;
+            checkformat(form, b"-+0 ", true)?;
+            let digits = int_digits(n.unsigned_abs(), 10, false, precision);
+            let body = format!("{}{}", sign_prefix(n < 0, flags), digits);
+            Ok(pad(
+                body.into_bytes(),
+                width,
+                zero_for_precision(flags, precision),
+                true,
+            ))
+        }
+        b'u' => {
+            let n = want_int(v, argi)?;
+            checkformat(form, b"-0", true)?;
+            let body = int_digits(n as u64, 10, false, precision);
+            Ok(pad(
+                body.into_bytes(),
+                width,
+                zero_for_precision(flags, precision),
+                true,
+            ))
+        }
+        b'o' => {
+            let n = want_int(v, argi)?;
+            checkformat(form, b"-#0", true)?;
+            let mut body = int_digits(n as u64, 8, false, precision);
+            if flags.alt && n != 0 && !body.starts_with('0') {
+                body.insert(0, '0');
             }
-            spec.push(c);
-            it.next();
+            Ok(pad(
+                body.into_bytes(),
+                width,
+                zero_for_precision(flags, precision),
+                true,
+            ))
         }
-        let mut width = 0usize;
-        while let Some(&c) = it.peek() {
-            if c.is_ascii_digit() {
-                width = width * 10 + (c - b'0') as usize;
-                spec.push(c);
-                it.next();
+        b'x' => {
+            let n = want_int(v, argi)?;
+            checkformat(form, b"-#0", true)?;
+            let digits = int_digits(n as u64, 16, false, precision);
+            let body = if flags.alt && n != 0 {
+                format!("0x{digits}")
             } else {
-                break;
-            }
+                digits
+            };
+            Ok(pad(
+                body.into_bytes(),
+                width,
+                zero_for_precision(flags, precision),
+                true,
+            ))
         }
-        let mut precision: Option<usize> = None;
-        if it.peek() == Some(&b'.') {
-            spec.push(b'.');
-            it.next();
-            let mut p = 0usize;
-            while let Some(&c) = it.peek() {
-                if c.is_ascii_digit() {
-                    p = p * 10 + (c - b'0') as usize;
-                    spec.push(c);
-                    it.next();
-                } else {
-                    break;
+        b'X' => {
+            let n = want_int(v, argi)?;
+            checkformat(form, b"-#0", true)?;
+            let digits = int_digits(n as u64, 16, true, precision);
+            let body = if flags.alt && n != 0 {
+                format!("0X{digits}")
+            } else {
+                digits
+            };
+            Ok(pad(
+                body.into_bytes(),
+                width,
+                zero_for_precision(flags, precision),
+                true,
+            ))
+        }
+        b'f' => {
+            let x = want_float(v, argi)?;
+            checkformat(form, b"-+#0 ", true)?;
+            let p = precision.unwrap_or(6);
+            let mut body = format!("{:.*}", p, x.abs());
+            if flags.alt && !body.contains('.') {
+                body.push('.');
+            }
+            Ok(pad(
+                format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes(),
+                width,
+                flags,
+                true,
+            ))
+        }
+        b'e' | b'E' => {
+            let x = want_float(v, argi)?;
+            checkformat(form, b"-+#0 ", true)?;
+            let p = precision.unwrap_or(6);
+            let mut body = format!("{:.*e}", p, x.abs());
+            // Rust: "1.5e3" → C: "1.500000e+03"
+            if let Some(epos) = body.find('e') {
+                if flags.alt && !body[..epos].contains('.') {
+                    body.insert(epos, '.');
+                }
+                let epos = body.find('e').unwrap();
+                let exp: i32 = body[epos + 1..].parse().unwrap();
+                body = format!(
+                    "{}e{}{:02}",
+                    &body[..epos],
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                );
+            }
+            if spec.conv == b'E' {
+                body = body.to_uppercase();
+            }
+            Ok(pad(
+                format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes(),
+                width,
+                flags,
+                true,
+            ))
+        }
+        b'g' | b'G' => {
+            let x = want_float(v, argi)?;
+            checkformat(form, b"-+#0 ", true)?;
+            let p = precision.unwrap_or(6).max(1);
+            let mut body = fmt_g(x.abs(), p);
+            if flags.alt && !body.contains('.') {
+                // `#` forces a decimal point before the exponent (or at end).
+                match body.find(['e', 'E']) {
+                    Some(pos) => body.insert(pos, '.'),
+                    None => body.push('.'),
                 }
             }
-            precision = Some(p);
+            if spec.conv == b'G' {
+                body = body.to_uppercase();
+            }
+            Ok(pad(
+                format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes(),
+                width,
+                flags,
+                true,
+            ))
         }
-        let conv = it.next().ok_or("invalid conversion to 'format'")?;
-        spec.push(conv);
-        // PUC's `checkformat`: '%p' accepts only the '-' flag and no precision.
-        if conv == b'p'
-            && (flags.zero || flags.plus || flags.space || flags.alt || precision.is_some())
-        {
-            return Err(format!(
-                "invalid conversion specification: '{}'",
-                String::from_utf8_lossy(&spec)
-            ));
+        b'a' | b'A' => {
+            let x = want_float(v, argi)?;
+            checkformat(form, b"-+#0 ", true)?;
+            Ok(pad(
+                format_hex_float(x, spec.conv == b'A', precision, flags),
+                width,
+                flags,
+                true,
+            ))
         }
-        let v = arg(args, argi);
-        argi += 1;
-        let piece = format_one(lua, conv, v, flags, width, precision, argi)?;
-        out.extend_from_slice(&piece);
+        b'p' => {
+            checkformat(form, b"-", false)?;
+            Ok(pad(pointer_text(v).into_bytes(), width, flags, false))
+        }
+        b's' => {
+            let mut s = match tostr {
+                Some(bytes) => bytes,
+                None => match v {
+                    Value::Str(id) => lua.strings.get(id).to_vec(),
+                    _ => lua.tostring_default(v).into_bytes(),
+                },
+            };
+            if form.len() == 2 {
+                return Ok(s);
+            }
+            // PUC measures the width with `strlen`, so embedded zeros are
+            // rejected once any modifier is present.
+            if s.contains(&0) {
+                return Err(format!(
+                    "bad argument #{argi} to 'format' (string contains zeros)"
+                ));
+            }
+            checkformat(form, b"-", true)?;
+            if precision.is_none() && s.len() >= 100 {
+                return Ok(s);
+            }
+            if let Some(p) = precision {
+                s.truncate(p);
+            }
+            Ok(pad(s, width, flags, false))
+        }
+        b'q' => {
+            if form.len() != 2 {
+                return Err("specifier '%q' cannot have modifiers".into());
+            }
+            let out = match v {
+                Value::Str(id) => {
+                    let bytes = lua.strings.get(id).to_vec();
+                    let mut out = vec![b'"'];
+                    for (i, &b) in bytes.iter().enumerate() {
+                        match b {
+                            // Quote these directly: C's `addquoted` emits a
+                            // backslash followed by the byte itself, so a
+                            // newline becomes backslash + an actual newline.
+                            b'"' | b'\\' | b'\n' => {
+                                out.push(b'\\');
+                                out.push(b);
+                            }
+                            _ if b < 32 || b == 127 => {
+                                // A decimal escape must not swallow a
+                                // following digit, so PUC zero-pads to three
+                                // digits then.
+                                if bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+                                    out.extend_from_slice(format!("\\{b:03}").as_bytes());
+                                } else {
+                                    out.extend_from_slice(format!("\\{b}").as_bytes());
+                                }
+                            }
+                            _ => out.push(b),
+                        }
+                    }
+                    out.push(b'"');
+                    out
+                }
+                // Numbers are written as a Lua literal that scans back
+                // exactly: the most-negative integer needs hex (its magnitude
+                // overflows), infinities need a value that parses to them, NaN
+                // has no numeral.
+                Value::Int(n) if n == i64::MIN => format!("0x{:x}", n as u64).into_bytes(),
+                Value::Int(n) => n.to_string().into_bytes(),
+                Value::Float(x) if x == f64::INFINITY => b"1e9999".to_vec(),
+                Value::Float(x) if x == f64::NEG_INFINITY => b"-1e9999".to_vec(),
+                Value::Float(x) if x.is_nan() => b"(0/0)".to_vec(),
+                Value::Float(x) => format_hex_float(x, false, None, Flags::default()),
+                Value::Nil => b"nil".to_vec(),
+                Value::Bool(b) => b.to_string().into_bytes(),
+                _ => {
+                    return Err(format!(
+                        "bad argument #{argi} to 'format' (value has no literal form)"
+                    ));
+                }
+            };
+            Ok(out)
+        }
+        _ => Err(format!(
+            "invalid conversion '{}' to 'format'",
+            String::from_utf8_lossy(form)
+        )),
     }
-    Ok(vec![lua.new_string(&out)])
 }
 
 #[derive(Default, Clone, Copy)]
-struct Flags {
-    left: bool,
-    zero: bool,
-    plus: bool,
-    space: bool,
-    alt: bool,
+pub(crate) struct Flags {
+    pub(crate) left: bool,
+    pub(crate) zero: bool,
+    pub(crate) plus: bool,
+    pub(crate) space: bool,
+    pub(crate) alt: bool,
 }
 
 fn pad(s: Vec<u8>, width: usize, flags: Flags, numeric: bool) -> Vec<u8> {
@@ -411,160 +713,33 @@ fn sign_prefix(neg: bool, flags: Flags) -> &'static str {
     }
 }
 
-fn format_one(
-    lua: &Lua,
-    conv: u8,
-    v: Value,
-    flags: Flags,
-    width: usize,
-    precision: Option<usize>,
-    argi: usize,
-) -> Result<Vec<u8>, String> {
-    let s: Vec<u8> = match conv {
-        b'd' | b'i' => {
-            let n = want_int(v, argi)?;
-            let body = n.unsigned_abs().to_string();
-            format!("{}{}", sign_prefix(n < 0, flags), body).into_bytes()
-        }
-        b'u' => want_int(v, argi)?.to_string().into_bytes(),
-        b'x' => {
-            let n = want_int(v, argi)? as u64;
-            let body = format!("{n:x}");
-            if flags.alt && n != 0 {
-                format!("0x{body}")
-            } else {
-                body
-            }
-            .into_bytes()
-        }
-        b'X' => {
-            let n = want_int(v, argi)? as u64;
-            let body = format!("{n:X}");
-            if flags.alt && n != 0 {
-                format!("0X{body}")
-            } else {
-                body
-            }
-            .into_bytes()
-        }
-        b'o' => format!("{:o}", want_int(v, argi)? as u64).into_bytes(),
-        b'c' => {
-            let n = want_int(v, argi)?;
-            vec![n as u8]
-        }
-        b'f' | b'F' => {
-            let x = want_float(v, argi)?;
-            let p = precision.unwrap_or(6);
-            let body = format!("{:.*}", p, x.abs());
-            format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes()
-        }
-        b'e' | b'E' => {
-            let x = want_float(v, argi)?;
-            let p = precision.unwrap_or(6);
-            let mut body = format!("{:.*e}", p, x.abs());
-            // Rust: "1.5e3" → C: "1.500000e+03"
-            if let Some(epos) = body.find('e') {
-                let exp: i32 = body[epos + 1..].parse().unwrap();
-                body = format!(
-                    "{}e{}{:02}",
-                    &body[..epos],
-                    if exp < 0 { '-' } else { '+' },
-                    exp.abs()
-                );
-            }
-            if conv == b'E' {
-                body = body.to_uppercase();
-            }
-            format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes()
-        }
-        b'g' | b'G' => {
-            let x = want_float(v, argi)?;
-            let p = precision.unwrap_or(6).max(1);
-            let mut body = fmt_g(x.abs(), p);
-            if conv == b'G' {
-                body = body.to_uppercase();
-            }
-            format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes()
-        }
-        b'a' | b'A' => {
-            let x = want_float(v, argi)?;
-            format_hex_float(x, conv == b'A', precision, flags)
-        }
-        b'p' => pointer_text(v).into_bytes(),
-        b's' => {
-            let mut s = match v {
-                Value::Str(id) => lua.strings.get(id).to_vec(),
-                _ => lua.display_value(v).into_bytes(),
-            };
-            // PUC only accepts embedded zeros for the unmodified `%s`; with
-            // any flags/width/precision the width is measured with `strlen`,
-            // so a NUL would silently truncate the value.
-            let modified = flags.left
-                || flags.zero
-                || flags.plus
-                || flags.space
-                || flags.alt
-                || width > 0
-                || precision.is_some();
-            if modified && s.contains(&0) {
-                return Err(format!(
-                    "bad argument #{argi} to 'format' (string contains zeros)"
-                ));
-            }
-            if let Some(p) = precision {
-                s.truncate(p);
-            }
-            s
-        }
-        b'q' => match v {
-            Value::Str(id) => {
-                let bytes = lua.strings.get(id).to_vec();
-                let mut out = vec![b'"'];
-                for (i, &b) in bytes.iter().enumerate() {
-                    match b {
-                        // Quote these directly: C's `addquoted` emits a
-                        // backslash followed by the byte itself, so a newline
-                        // becomes backslash + an actual newline.
-                        b'"' | b'\\' | b'\n' => {
-                            out.push(b'\\');
-                            out.push(b);
-                        }
-                        _ if b < 32 || b == 127 => {
-                            // A decimal escape must not swallow a following
-                            // digit, so PUC zero-pads to three digits then.
-                            if bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-                                out.extend_from_slice(format!("\\{b:03}").as_bytes());
-                            } else {
-                                out.extend_from_slice(format!("\\{b}").as_bytes());
-                            }
-                        }
-                        _ => out.push(b),
-                    }
-                }
-                out.push(b'"');
-                out
-            }
-            // Numbers are written as a Lua literal that scans back exactly:
-            // the most-negative integer needs hex (its magnitude overflows),
-            // infinities need a value that parses to them, NaN has no numeral.
-            Value::Int(n) if n == i64::MIN => format!("0x{:x}", n as u64).into_bytes(),
-            Value::Int(n) => n.to_string().into_bytes(),
-            Value::Float(x) if x == f64::INFINITY => b"1e9999".to_vec(),
-            Value::Float(x) if x == f64::NEG_INFINITY => b"-1e9999".to_vec(),
-            Value::Float(x) if x.is_nan() => b"(0/0)".to_vec(),
-            Value::Float(x) => format_hex_float(x, false, None, Flags::default()),
-            Value::Nil => b"nil".to_vec(),
-            Value::Bool(b) => b.to_string().into_bytes(),
-            _ => {
-                return Err(format!(
-                    "bad argument #{argi} to 'format' (value has no literal form)"
-                ));
-            }
-        },
-        c => return Err(format!("invalid conversion '%{}' to 'format'", c as char)),
+/// C's `'0'` flag is ignored once a precision is given.
+fn zero_for_precision(flags: Flags, precision: Option<usize>) -> Flags {
+    let mut f = flags;
+    if precision.is_some() {
+        f.zero = false;
+    }
+    f
+}
+
+/// Integer digits for `%d`/`%i`/`%u`/`%o`/`%x`/`%X`: `precision` is the
+/// minimum digit count (zero value with precision 0 renders no digits).
+fn int_digits(mag: u64, radix: u32, upper: bool, precision: Option<usize>) -> String {
+    let mut s = match radix {
+        8 => format!("{mag:o}"),
+        16 if upper => format!("{mag:X}"),
+        16 => format!("{mag:x}"),
+        _ => mag.to_string(),
     };
-    let numeric = !matches!(conv, b's' | b'q' | b'c' | b'p');
-    Ok(pad(s, width, flags, numeric))
+    if mag == 0 && precision == Some(0) {
+        s.clear();
+    }
+    if let Some(p) = precision
+        && s.len() < p
+    {
+        s.insert_str(0, &"0".repeat(p - s.len()));
+    }
+    s
 }
 
 /// `string.format("%p", v)`: nil/booleans/numbers have no address in Lua and

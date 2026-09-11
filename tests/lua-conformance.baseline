@@ -7,11 +7,11 @@ nextvar.lua	ok
 pm.lua	ok
 utf8.lua	ok
 sort.lua	ok
-strings.lua	line:248
+strings.lua	ok
 math.lua	ok
 verybig.lua	ok
 constructs.lua	ok
-locals.lua	line:493
+locals.lua	line:803
 goto.lua	ok
 calls.lua	ok
 events.lua	ok
@@ -19,4 +19,4 @@ bitwise.lua	ok
 tpack.lua	ok
 literals.lua	ok
 attrib.lua	ok
-coroutine.lua	line:271
+coroutine.lua	line:289

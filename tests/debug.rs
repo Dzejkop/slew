@@ -224,6 +224,51 @@ return true";
 }
 
 #[test]
+fn traceback_names_close_metamethod() {
+    // A directly-invoked `__close` handler that raises is reported by the
+    // xpcall message handler as `metamethod 'close'`: PUC runs the handler at
+    // the error site, so the close frame is still on the stack.
+    let src = "\
+local function func2close (f) return setmetatable({}, {__close = f}) end
+local function foo ()
+  local x <close> = func2close(function () error('@x') end)
+end
+local ok, msg = xpcall(foo, debug.traceback)
+assert(not ok)
+assert(string.find(msg, 'in metamethod .close.'), msg)
+return true";
+    assert!(ok(src));
+}
+
+#[test]
+fn tbc_error_messages_match_puc() {
+    // PUC names the offending local and flags a missing `__close` as a
+    // metamethod error.
+    assert_eq!(
+        eval(
+            "local ok, e = pcall(function () local x <close> = {} end)\n\
+             return tostring(not ok and string.find(e, \"variable 'x' got a non%-closable value\") ~= nil)"
+        ),
+        "true"
+    );
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__close = print})\n\
+             local ok, e = pcall(function () local x <close> = t; getmetatable(t).__close = nil end)\n\
+             return tostring(not ok and string.find(e, \"metamethod 'close'\") ~= nil)"
+        ),
+        "true"
+    );
+    assert_eq!(
+        eval(
+            "local ok, e = pcall(function () local t = setmetatable({}, {__close = 4}); local x <close> = t end)\n\
+             return tostring(not ok and string.find(e, \"metamethod 'close'\") ~= nil)"
+        ),
+        "true"
+    );
+}
+
+#[test]
 fn traceback_non_string_message_passthrough() {
     assert_eq!(eval("return type(debug.traceback({}))"), "table");
     // A non-string message is returned untouched, so the level argument is

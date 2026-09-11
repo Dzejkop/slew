@@ -12,7 +12,7 @@ mod dump;
 mod io;
 mod math;
 mod os;
-mod string;
+pub(crate) mod string;
 mod string_pack;
 mod table;
 mod utf8;

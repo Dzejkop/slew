@@ -615,8 +615,10 @@ impl<'h> Compiler<'h> {
                     self.declare_local(name.clone(), base + i as u8, *attrib);
                     if *attrib == Attrib::Close {
                         self.fs().has_tbc = true;
+                        let name_k = self.str_const(name.as_bytes())?;
                         self.emit(Instr::Tbc {
                             reg: base + i as u8,
+                            name: name_k,
                         });
                     }
                 }
@@ -792,7 +794,11 @@ impl<'h> Compiler<'h> {
                 self.declare_local("(for state)".into(), base + 2, Attrib::None);
                 self.declare_local("(for close)".into(), base + 3, Attrib::Close);
                 self.fs().has_tbc = true;
-                self.emit(Instr::Tbc { reg: base + 3 });
+                let name_k = self.str_const(b"(for state)")?;
+                self.emit(Instr::Tbc {
+                    reg: base + 3,
+                    name: name_k,
+                });
                 let vars_base = self.fs().free_reg;
                 debug_assert_eq!(vars_base, base + 4);
                 for v in vars {

@@ -378,9 +378,10 @@ fn write_instr(w: &mut Writer, ins: &Instr) {
             w.u8(23);
             w.u8(from);
         }
-        Instr::Tbc { reg } => {
+        Instr::Tbc { reg, name } => {
             w.u8(24);
             w.u8(reg);
+            w.u16(name);
         }
         Instr::ForPrep { base, off } => {
             w.u8(25);
@@ -698,7 +699,10 @@ fn read_instr(r: &mut Reader) -> Result<Instr, String> {
             p: r.u16()?,
         },
         23 => Instr::Close { from: r.u8()? },
-        24 => Instr::Tbc { reg: r.u8()? },
+        24 => Instr::Tbc {
+            reg: r.u8()?,
+            name: r.u16()?,
+        },
         25 => Instr::ForPrep {
             base: r.u8()?,
             off: r.i32()?,

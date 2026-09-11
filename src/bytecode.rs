@@ -165,6 +165,9 @@ pub enum Instr {
     /// Marks the register as a to-be-closed variable (`local x <close>`).
     Tbc {
         reg: u8,
+        /// Constant index of the variable's name, for PUC's
+        /// `variable 'x' got a non-closable value` error.
+        name: u16,
     },
     /// Numeric for: `base` holds (counter, limit, step); `base+3` is the
     /// visible variable. ForPrep validates and jumps past ForLoop when the
@@ -230,7 +233,7 @@ impl Instr {
             // 255 is the unpatched `Close` placeholder.
             Instr::Close { from: 255 } => 0,
             Instr::Close { from } => from.saturating_add(1),
-            Instr::Tbc { reg } => reg.saturating_add(1),
+            Instr::Tbc { reg, .. } => reg.saturating_add(1),
             Instr::ForPrep { base, .. } | Instr::ForLoop { base, .. } => base.saturating_add(4),
             Instr::TForLoop { base, .. } => base.saturating_add(5),
         }

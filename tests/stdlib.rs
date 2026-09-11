@@ -200,6 +200,92 @@ fn string_format() {
         "\"he said \\\"hi\\\"\\\n\""
     );
     assert_eq!(eval("return string.format('%%')"), "%");
+    // C flag/precision behaviour required by strings.lua.
+    assert_eq!(eval("return string.format('%#12o', 10)"), "         012");
+    assert_eq!(eval("return string.format('%2.5d', -100)"), "-00100");
+    assert_eq!(eval("return string.format('%.u', 0)"), "");
+    assert_eq!(
+        eval("return string.format('%+#014.0f', 100)"),
+        "+000000000100."
+    );
+}
+
+#[test]
+fn string_format_s_uses_tolstring() {
+    // `%s` follows PUC's `luaL_tolstring`: `__tostring`, then `__name`, then
+    // the default rendering; precision truncates the rendered bytes.
+    assert_eq!(
+        eval(
+            "local m = setmetatable({}, {__tostring = function() return 'hello' end,\
+             __name = 'hi'})\n\
+             return string.format('%s %.10s', m, m)"
+        ),
+        "hello hello"
+    );
+    assert_eq!(
+        eval(
+            "local m = setmetatable({}, {__name = 'hi'})\n\
+             return string.format('%.4s', m)"
+        ),
+        "hi: "
+    );
+    assert_eq!(eval("return string.format('%s %s', nil, true)"), "nil true");
+    assert_eq!(
+        eval("return string.format('%.3s %.3s', false, true)"),
+        "fal tru"
+    );
+    // A `__tostring` that does not return a string raises, catchable by pcall.
+    assert_eq!(
+        eval(
+            "local m = setmetatable({}, {__tostring = function() return {} end})\n\
+             local ok, err = pcall(string.format, '%s', m)\n\
+             return tostring(not ok and err:find(\"'__tostring' must return a string\") ~= nil)"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn tostring_checks_metamethod_result() {
+    assert_eq!(
+        eval(
+            "local m = setmetatable({}, {__tostring = function() return {} end})\n\
+             local ok, err = pcall(tostring, m)\n\
+             return tostring(not ok and err:find('must return a string') ~= nil)"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn string_format_validation() {
+    // PUC's `checkformat`/`getformat` rules (strings.lua lines 364-385).
+    for (fmt, msg) in [
+        ("%100.3d", "invalid conversion"),
+        ("%1.100d", "invalid conversion"),
+        ("%t", "invalid conversion"),
+        ("%010c", "invalid conversion"),
+        ("%.10c", "invalid conversion"),
+        ("%0.34s", "invalid conversion"),
+        ("%#i", "invalid conversion"),
+        ("%3.1p", "invalid conversion"),
+        ("%0.s", "invalid conversion"),
+        ("%10q", "cannot have modifiers"),
+        ("%F", "invalid conversion"),
+        ("%d %d", "no value"),
+    ] {
+        let src = format!(
+            "local ok, err = pcall(string.format, {fmt:?}, 10)\n\
+             return tostring(not ok and err:find({msg:?}) ~= nil)"
+        );
+        assert_eq!(eval(&src), "true", "format {fmt:?}");
+    }
+    let aux = "0".repeat(600);
+    let src = format!(
+        "local ok, err = pcall(string.format, \"%1{aux}.3d\", 10)\n\
+         return tostring(not ok and err:find('too long') ~= nil)"
+    );
+    assert_eq!(eval(&src), "true");
 }
 
 #[test]

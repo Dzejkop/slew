@@ -527,3 +527,43 @@ fn generic_for_closes_fourth_explist_value() {
         ["45", "35", "2"]
     );
 }
+
+#[test]
+fn pcall_as_coroutine_body_suspends_and_resumes() {
+    // `coroutine.create(pcall)` calls the body protected across yields; on the
+    // final error the pending `__close` handlers run in PUC's order and with
+    // PUC's error tracking before the error is returned.
+    let src = "\
+local function func2close (f) return setmetatable({}, {__close = f}) end
+local track = {}
+local function h (o) local hv <close> = o; return 1 end
+local function foo ()
+  local x <close> = func2close(function (_, msg) track[#track + 1] = msg or false; error(20) end)
+  local y <close> = func2close(function (_, msg) track[#track + 1] = msg or false; return 1000 end)
+  local z <close> = func2close(function (_, msg) track[#track + 1] = msg or false; error(10) end)
+  coroutine.yield(1)
+  h(func2close(function (_, msg) track[#track + 1] = msg or false; error(2) end))
+end
+local co = coroutine.create(pcall)
+local st, res = coroutine.resume(co, foo)
+assert(st and res == 1)
+local st2, res1, res2 = coroutine.resume(co)
+assert(coroutine.status(co) == 'dead')
+assert(st2 and not res1 and res2 == 20)
+assert(track[1] == false and track[2] == 2 and track[3] == 10 and track[4] == 10)
+return true";
+    assert_eq!(eval(src), "true");
+}
+
+#[test]
+fn pcall_as_coroutine_body_returns_results() {
+    // A non-yielding protected body returns `true, ...` as the coroutine's
+    // values, which resume then prefixes with its own success flag.
+    assert_eq!(
+        eval_multi(
+            "local co = coroutine.create(pcall)\n\
+             return coroutine.resume(co, function () return 1, 2 end)"
+        ),
+        ["true", "true", "1", "2"]
+    );
+}
