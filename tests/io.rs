@@ -1,10 +1,10 @@
 //! Regression tests for the host-capability `io` library and the userdata
 //! value type.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use slew::{Lua, StdHost, Step, Value};
+use slew::{DateParts, Host, HostError, Lua, SeekWhence, StdHost, Step, Value};
 
 fn with_host() -> Lua {
     let mut lua = Lua::new();
@@ -281,4 +281,193 @@ fn invalid_open_mode_raises() {
     let mut lua = with_host();
     let msg = run_err(&mut lua, r#"io.open("x", "z")"#);
     assert!(msg.contains("invalid mode"), "got: {msg}");
+}
+
+/// A number token that runs past the 8192-byte read buffer must not panic:
+/// `read("*n")` parses the longest valid prefix and leaves the rest unread.
+#[test]
+fn read_number_token_spans_read_buffer() {
+    let mut lua = with_host();
+    let vals = run(
+        &mut lua,
+        r#"
+        local name = os.tmpname()
+        local f = assert(io.open(name, "w"))
+        f:write("123", string.rep("a", 9000))
+        f:close()
+        local g = assert(io.open(name, "r"))
+        local n = g:read("*n")
+        local rest = g:read("a")
+        g:close()
+        os.remove(name)
+        return n, #rest
+        "#,
+    );
+    assert_eq!(vals[0], Value::Int(123));
+    assert_eq!(vals[1], Value::Int(9000));
+}
+
+/// A numeral-shaped prefix with a bad tail is rejected and the tail stays
+/// unread, matching PUC (`"12e+"` consumes the prefix but is not a number).
+#[test]
+fn read_number_rejects_bad_tail_without_consuming_it() {
+    let mut lua = with_host();
+    let vals = run(
+        &mut lua,
+        r#"
+        local name = os.tmpname()
+        local f = assert(io.open(name, "w"))
+        f:write("12e+Z")
+        f:close()
+        local g = assert(io.open(name, "r"))
+        local n = g:read("*n")
+        local rest = g:read("a")
+        g:close()
+        os.remove(name)
+        return n, rest
+        "#,
+    );
+    assert_eq!(vals[0], Value::Nil);
+    assert_eq!(lua.display_value(vals[1]), "Z");
+}
+
+/// A huge numeric read count must raise a catchable "not enough memory" error,
+/// never abort the process via an infallible allocation.
+#[test]
+fn huge_read_count_is_catchable_error() {
+    let mut lua = with_host();
+    let vals = run(
+        &mut lua,
+        r#"
+        local name = os.tmpname()
+        local f = assert(io.open(name, "w"))
+        f:write("abc")
+        f:close()
+        local g = assert(io.open(name, "r"))
+        local ok, err = pcall(g.read, g, math.maxinteger)
+        g:close()
+        os.remove(name)
+        return ok, err
+        "#,
+    );
+    assert_eq!(vals[0], Value::Bool(false));
+    let msg = lua.display_value(vals[1]);
+    assert!(msg.contains("not enough memory"), "got: {msg}");
+}
+
+#[test]
+fn rawlen_userdata_error_has_argument_context() {
+    let mut lua = with_host();
+    let msg = run_err(&mut lua, r#"return rawlen(io.stdin)"#);
+    assert!(
+        msg.contains("bad argument #1 to 'rawlen'") && msg.contains("table or string expected"),
+        "got: {msg}"
+    );
+}
+
+/// Minimal host that counts `open`/`close` calls, so the test can observe
+/// whether GC releases dropped file handles. File contents are irrelevant.
+#[derive(Default)]
+struct CountingHost {
+    opens: Rc<Cell<usize>>,
+    closes: Rc<Cell<usize>>,
+}
+
+impl Host for CountingHost {
+    fn stdout_write(&mut self, _bytes: &[u8]) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn stderr_write(&mut self, _bytes: &[u8]) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn stdin_read(&mut self, _buf: &mut [u8]) -> Result<usize, HostError> {
+        Ok(0)
+    }
+    fn open(&mut self, _path: &str, _mode: &str) -> Result<u64, HostError> {
+        let h = self.opens.get() + 1;
+        self.opens.set(h);
+        Ok(h as u64)
+    }
+    fn close(&mut self, _handle: u64) -> Result<(), HostError> {
+        self.closes.set(self.closes.get() + 1);
+        Ok(())
+    }
+    fn read(&mut self, _handle: u64, _buf: &mut [u8]) -> Result<usize, HostError> {
+        Ok(0)
+    }
+    fn write(&mut self, _handle: u64, _bytes: &[u8]) -> Result<usize, HostError> {
+        Ok(0)
+    }
+    fn seek(&mut self, _handle: u64, _whence: SeekWhence, _offset: i64) -> Result<u64, HostError> {
+        Ok(0)
+    }
+    fn flush(&mut self, _handle: u64) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn remove(&mut self, _path: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn rename(&mut self, _from: &str, _to: &str) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn tmpname(&mut self) -> Result<String, HostError> {
+        Ok("slew_mock_tmp".to_string())
+    }
+    fn getenv(&mut self, _name: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn clock(&mut self) -> f64 {
+        0.0
+    }
+    fn time(&mut self) -> i64 {
+        0
+    }
+    fn time_parts(&mut self, _t: i64, _utc: bool) -> DateParts {
+        DateParts {
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            min: 0,
+            sec: 0,
+            wday: 4,
+            yday: 1,
+            isdst: false,
+        }
+    }
+    fn make_time(&mut self, _parts: DateParts) -> i64 {
+        0
+    }
+    fn setlocale(&mut self, _locale: Option<&str>, _category: Option<&str>) -> Option<String> {
+        Some("C".to_string())
+    }
+}
+
+/// Dropped file userdata carry a *native* `__gc`; the finalizer driver must
+/// drain those like Lua-closure finalizers instead of stalling after the first
+/// one and permanently rooting `pending_finalizers`.
+#[test]
+fn native_file_finalizers_drain_on_collectgarbage() {
+    const N: usize = 50;
+    let mut lua = Lua::new();
+    let host = CountingHost::default();
+    let closes = host.closes.clone();
+    lua.set_host(host);
+
+    let src = format!(
+        r#"
+        local function make()
+          local t = {{}}
+          for i = 1, {N} do t[i] = assert(io.open('mock_' .. i, 'w')) end
+        end
+        make()
+        for _ = 1, {N} * 2 do collectgarbage() end
+        "#
+    );
+    run(&mut lua, &src);
+    assert!(
+        closes.get() >= N - 1,
+        "native __gc finalizers did not drain: closed {} of {N} dropped files",
+        closes.get()
+    );
 }

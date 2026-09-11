@@ -602,7 +602,12 @@ fn n_rawlen(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         Value::Table(t) => Ok(vec![Value::Int(lua.tables[t.0 as usize].length())]),
         Value::Str(s) => Ok(vec![Value::Int(lua.strings.get(s).len() as i64)]),
-        _ => Err("table or string expected".into()),
+        // PUC's `luaL_argerror` frames the failure with the argument context,
+        // e.g. "bad argument #1 to 'rawlen' (table or string expected, got FILE*)".
+        v => Err(format!(
+            "bad argument #1 to 'rawlen' (table or string expected, got {})",
+            v.type_name()
+        )),
     }
 }
 

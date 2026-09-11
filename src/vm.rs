@@ -3183,6 +3183,11 @@ impl Lua {
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .collect::<Vec<_>>()
             .join("\t");
+        // Deviation: `print` writes to the process stdout directly, not through
+        // the installed host's `stdout_write` sink. This matches PUC (whose
+        // `print` targets C `stdout`) and keeps tests that install a capturing
+        // host — or run without one — working unchanged; hosts that want to
+        // capture `print` output should use `io.write`/`io.stdout` instead.
         println!("{line}");
         place_shaped(th, job.ret_to, job.nres, job.shape, &[]);
         self.print_job = None;
@@ -3816,8 +3821,19 @@ impl Lua {
             th.stack[scratch + 1] = v;
             let discard = scratch + 2;
             ensure_len(&mut th.stack, discard + 2);
+            let frames_before = th.frames.len();
             self.protected_call(th, fuel, scratch, 1, discard, 0, None)?;
-            self.finalizer_depth = Some(th.frames.len());
+            // A Lua-closure handler pushes a frame that is still running when
+            // `protected_call` returns, so hold the depth guard until it
+            // unwinds. A native handler (e.g. the file `__gc`) runs to
+            // completion inside `protected_call` and leaves no frame; keeping
+            // the guard set in that case would stall the driver forever and
+            // leave `pending_finalizers` permanently rooted.
+            self.finalizer_depth = if th.frames.len() > frames_before {
+                Some(th.frames.len())
+            } else {
+                None
+            };
             return Ok(());
         }
         Ok(())

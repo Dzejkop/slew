@@ -231,7 +231,13 @@ fn read_count(lua: &mut Lua, uid: UserdataId, n: usize) -> Result<Option<Vec<u8>
     if n == 0 {
         return Ok(peek(lua, uid)?.map(|_| Vec::new()));
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out: Vec<u8> = Vec::new();
+    // PUC pre-sizes the destination buffer and raises a catchable "not enough
+    // memory" error when the reservation fails (`luaL_prepbuffsize`). Do the
+    // same via `try_reserve` so a huge numeric format cannot abort the process
+    // on an infallible allocation.
+    out.try_reserve(n)
+        .map_err(|_| "not enough memory".to_string())?;
     while out.len() < n {
         let take_from_buf = {
             let ud = &lua.userdata[uid.0 as usize];
@@ -279,6 +285,63 @@ fn read_all(lua: &mut Lua, uid: UserdataId) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// PUC's `L_MAXLENNUM`: the longest numeral prefix `read("*n")` will buffer.
+const MAX_NUMERAL_LEN: usize = 200;
+
+/// Consumes the current byte into `token` when `pred` accepts it, mirroring
+/// PUC's `nextc`: once the buffer is full the byte is left unread and `overflow`
+/// is set, so an over-long numeral fails instead of growing without bound.
+fn accept_byte(
+    lua: &mut Lua,
+    uid: UserdataId,
+    token: &mut Vec<u8>,
+    overflow: &mut bool,
+    pred: impl Fn(u8) -> bool,
+) -> Result<bool, String> {
+    let Some(b) = peek(lua, uid)? else {
+        return Ok(false);
+    };
+    if !pred(b) {
+        return Ok(false);
+    }
+    if token.len() >= MAX_NUMERAL_LEN {
+        *overflow = true;
+        return Ok(false);
+    }
+    token.push(b);
+    advance(lua, uid);
+    Ok(true)
+}
+
+/// Consumes a run of (hex)digits, returning how many were accepted.
+fn accept_digits(
+    lua: &mut Lua,
+    uid: UserdataId,
+    token: &mut Vec<u8>,
+    overflow: &mut bool,
+    hex: bool,
+) -> Result<usize, String> {
+    let mut n = 0;
+    loop {
+        let ok = accept_byte(lua, uid, token, overflow, |b| {
+            if hex {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        })?;
+        if !ok {
+            return Ok(n);
+        }
+        n += 1;
+    }
+}
+
+/// Reads a `"*n"` format. Mirrors PUC's `read_number`: scan only characters
+/// that can belong to a numeral (sign, hex prefix, digits, fraction, exponent),
+/// leaving every other byte — including a long non-numeric run — unread, then
+/// let [`super::parse_number`] validate the scanned prefix. This never rewinds
+/// `read_pos`, so a token spanning the read buffer cannot underflow.
 fn read_number(lua: &mut Lua, uid: UserdataId) -> Result<Option<Value>, String> {
     // skip leading whitespace
     while let Some(b) = peek(lua, uid)? {
@@ -289,22 +352,44 @@ fn read_number(lua: &mut Lua, uid: UserdataId) -> Result<Option<Value>, String> 
         }
     }
     let mut token: Vec<u8> = Vec::new();
-    while let Some(b) = peek(lua, uid)? {
-        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
-            token.push(b);
-            advance(lua, uid);
+    let mut overflow = false;
+    // optional sign
+    accept_byte(lua, uid, &mut token, &mut overflow, |b| {
+        matches!(b, b'+' | b'-')
+    })?;
+    // leading '0', possibly introducing a hexadecimal numeral
+    let mut hex = false;
+    let mut count = 0usize;
+    if accept_byte(lua, uid, &mut token, &mut overflow, |b| b == b'0')? {
+        if accept_byte(lua, uid, &mut token, &mut overflow, |b| {
+            matches!(b, b'x' | b'X')
+        })? {
+            hex = true;
         } else {
-            break;
+            count = 1;
         }
     }
-    while !token.is_empty() {
-        if let Some(v) = super::parse_number(&token) {
-            return Ok(Some(v));
-        }
-        token.pop();
-        lua.userdata[uid.0 as usize].read_pos -= 1;
+    count += accept_digits(lua, uid, &mut token, &mut overflow, hex)?;
+    // fractional part
+    if accept_byte(lua, uid, &mut token, &mut overflow, |b| b == b'.')? {
+        count += accept_digits(lua, uid, &mut token, &mut overflow, hex)?;
     }
-    Ok(None)
+    // exponent marker (only if there was a mantissa digit)
+    if count > 0 {
+        let (mark, mark2) = if hex { (b'p', b'P') } else { (b'e', b'E') };
+        if accept_byte(lua, uid, &mut token, &mut overflow, |b| {
+            b == mark || b == mark2
+        })? {
+            accept_byte(lua, uid, &mut token, &mut overflow, |b| {
+                matches!(b, b'+' | b'-')
+            })?;
+            accept_digits(lua, uid, &mut token, &mut overflow, false)?;
+        }
+    }
+    if overflow || token.is_empty() {
+        return Ok(None);
+    }
+    Ok(super::parse_number(&token))
 }
 
 /// One `read` format: `Value` result or `None` on failure (EOF).
