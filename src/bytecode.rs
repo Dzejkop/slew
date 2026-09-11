@@ -69,6 +69,10 @@ pub enum Instr {
     Test { src: u8, if_true: bool, off: i32 },
     /// Callee at `R[base]`, args follow it.
     Call { base: u8, nargs: u8, nres: u8 },
+    /// Proper tail call: like `Call` with an open result count, but the
+    /// current frame is replaced instead of a new one being pushed, so
+    /// unbounded tail recursion runs in constant frame depth.
+    TailCall { base: u8, nargs: u8 },
     Return { base: u8, n: u8 },
     Vararg { dst: u8, n: u8 },
     Closure { dst: u8, p: u16 },

@@ -106,6 +106,10 @@ struct FuncState {
     max_regs: u8,
     cur_line: u32,
     name: String,
+    /// True once a to-be-closed local is declared in this function; proper
+    /// tail calls are disabled while a `__close` handler may be pending
+    /// (PUC's `insidetbc` rule).
+    has_tbc: bool,
 }
 
 impl FuncState {
@@ -129,6 +133,7 @@ impl FuncState {
             max_regs: nparams.max(2),
             cur_line: 0,
             name,
+            has_tbc: false,
         }
     }
 
@@ -491,6 +496,7 @@ impl<'h> Compiler<'h> {
                 for (i, (name, attrib)) in names.iter().enumerate() {
                     self.declare_local(name.clone(), base + i as u8, *attrib);
                     if *attrib == Attrib::Close {
+                        self.fs().has_tbc = true;
                         self.emit(Instr::Tbc { reg: base + i as u8 });
                     }
                 }
@@ -670,6 +676,15 @@ impl<'h> Compiler<'h> {
             }
             Stmt::Return { exprs, line } => {
                 self.at_line(*line);
+                // `return f(...)` in a function with no pending to-be-closed
+                // variables is a proper tail call: no frame is left behind.
+                if exprs.len() == 1
+                    && !self.fs().has_tbc
+                    && matches!(exprs[0], Expr::Call { .. } | Expr::MethodCall { .. })
+                {
+                    self.tail_call_like(&exprs[0])?;
+                    return Ok(());
+                }
                 let (base, count) = self.explist_open(exprs)?;
                 self.emit(Instr::Return { base, n: enc(count) });
             }
@@ -928,6 +943,41 @@ impl<'h> Compiler<'h> {
             }
         }
         Ok(base)
+    }
+
+    /// Compiles `return <call>` as a proper tail call. Mirrors `call_like`
+    /// but emits `TailCall` (open results) so the VM reuses the frame.
+    fn tail_call_like(&mut self, e: &Expr) -> Result<(), CompileError> {
+        let base = self.alloc_reg()?;
+        match e {
+            Expr::Call { func, args, line } => {
+                self.at_line(*line);
+                self.expr_to_reg(func, base)?;
+                self.fs().free_reg = base + 1;
+                let argc = self.compile_args(args)?;
+                self.at_line(*line);
+                self.emit(Instr::TailCall {
+                    base,
+                    nargs: argc.map_or(0, |c| c as u8 + 1),
+                });
+            }
+            Expr::MethodCall { obj, name, args, line } => {
+                self.at_line(*line);
+                let selfr = self.alloc_reg()?; // base + 1
+                self.expr_to_reg(obj, selfr)?;
+                self.fs().free_reg = base + 2;
+                let k = self.str_const(name.as_bytes())?;
+                self.emit(Instr::GetField { dst: base, obj: selfr, k });
+                let argc = self.compile_args(args)?;
+                self.at_line(*line);
+                self.emit(Instr::TailCall {
+                    base,
+                    nargs: argc.map_or(0, |c| c as u8 + 2),
+                });
+            }
+            _ => unreachable!("tail_call_like on non-call"),
+        }
+        Ok(())
     }
 
     /// Compiles call arguments into consecutive registers above the current

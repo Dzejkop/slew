@@ -167,6 +167,10 @@ enum Pending {
     DeliverError { ret_to: usize, nres: u8, err: Value, handler: Option<Value> },
     /// Final step of a return that had to run `__close` handlers first.
     FinishReturn { start: usize, count: usize },
+    /// Final step of a tail call into a native/intrinsic: the callee's
+    /// results now sit at `start` (with `th.top` already updated); complete
+    /// the frame's return as usual.
+    TailReturn { start: usize },
 }
 
 struct Frame {
@@ -1007,6 +1011,18 @@ impl Lua {
                     }
                     deliver_return(th, &frame, start, count);
                 }
+                Pending::TailReturn { start } => {
+                    let count = th.top.saturating_sub(start);
+                    let frame = th.frames.pop().unwrap();
+                    self.close_upvals(th, frame.base);
+                    if th.frames.is_empty() {
+                        let vals = th.stack[start..start + count].to_vec();
+                        th.stack.clear();
+                        th.top = 0;
+                        return Ok(Flow::Finished(vals));
+                    }
+                    deliver_return(th, &frame, start, count);
+                }
             }
             return Ok(Flow::Continue);
         }
@@ -1150,6 +1166,45 @@ impl Lua {
                         native_caller: false,
                     },
                 )?;
+            }
+            Instr::TailCall { base: b, nargs } => {
+                let fb = th.frames.last().unwrap().base;
+                let func_abs = fb + b as usize;
+                let argc = if nargs == 0 {
+                    th.top.saturating_sub(func_abs + 1)
+                } else {
+                    (nargs - 1) as usize
+                };
+                let (callee, func_abs, argc) = self.resolve_callable(th, func_abs, argc)?;
+                match callee {
+                    Value::Closure(cid) => {
+                        self.tail_replace_frame(th, cid, func_abs, argc)?;
+                    }
+                    Value::Native(nid) => {
+                        // Natives do not own a Lua frame, so there is nothing
+                        // to reuse: run the call with an open result window,
+                        // then finish the frame's return via a continuation
+                        // (the callee may itself push frames, e.g. pcall).
+                        let ret_slot = fb + b as usize;
+                        th.frames
+                            .last_mut()
+                            .unwrap()
+                            .pending
+                            .push(Pending::TailReturn { start: ret_slot });
+                        self.call_native(
+                            th,
+                            fuel,
+                            nid,
+                            func_abs,
+                            argc,
+                            ret_slot,
+                            0,
+                            RetShape::Normal,
+                            false,
+                        )?;
+                    }
+                    _ => unreachable!("resolve_callable returns a callable"),
+                }
             }
             Instr::Return { base: b, n } => {
                 if !th.frames.last().unwrap().tbc.is_empty() {
@@ -1378,6 +1433,98 @@ impl Lua {
             }
         }
         Err(self.rt_err(th, "'__call' chain too long".into()))
+    }
+
+    /// Resolves the callee at `func_abs`, chasing `__call` metamethod
+    /// chains, without starting any call. Returns the final callable and the
+    /// (possibly relocated) argument window.
+    fn resolve_callable(
+        &mut self,
+        th: &mut Thread,
+        mut func_abs: usize,
+        mut argc: usize,
+    ) -> Result<(Value, usize, usize), VmError> {
+        for _ in 0..MAX_META_CHAIN {
+            match th.stack[func_abs] {
+                v @ (Value::Closure(_) | Value::Native(_)) => return Ok((v, func_abs, argc)),
+                other => {
+                    // __call: f(args...) becomes mm(f, args...)
+                    let mm = self.metamethod(other, Mm::Call);
+                    if mm == Value::Nil {
+                        return Err(self.rt_err(
+                            th,
+                            format!("attempt to call a {} value", other.type_name()),
+                        ));
+                    }
+                    let wb = scratch_base(th).max(func_abs + 1 + argc);
+                    ensure_len(&mut th.stack, wb + 2 + argc);
+                    th.stack[wb] = mm;
+                    th.stack.copy_within(func_abs..func_abs + 1 + argc, wb + 1);
+                    func_abs = wb;
+                    argc += 1;
+                }
+            }
+        }
+        Err(self.rt_err(th, "'__call' chain too long".into()))
+    }
+
+    /// Replaces the current frame with a call to `cid`, moving the callee and
+    /// its arguments down over the old frame's base so the stack does not
+    /// grow across tail calls. The new frame inherits the replaced frame's
+    /// return destination, expected count, shape, and protection boundary.
+    fn tail_replace_frame(
+        &mut self,
+        th: &mut Thread,
+        cid: ClosId,
+        func_abs: usize,
+        argc: usize,
+    ) -> Result<(), VmError> {
+        let old = th.frames.last().unwrap();
+        let fb = old.base;
+        let ret_to = old.ret_to;
+        let nres = old.nres;
+        let shape = old.shape;
+        let protected = old.protected;
+        let handler = old.handler;
+        // upvalues captured by the discarded frame must be closed before its
+        // registers are overwritten
+        self.close_upvals(th, fb);
+        let proto = self.closures[cid.0 as usize].proto.clone();
+        let np = proto.nparams as usize;
+        // Move `[func, args...]` down to occupy the old frame's function slot
+        // (if there is one), so tail recursion reuses the same stack region.
+        let new_func_abs = match fb.checked_sub(1) {
+            Some(dst) => {
+                th.stack.copy_within(func_abs..func_abs + 1 + argc, dst);
+                dst
+            }
+            None => func_abs,
+        };
+        let new_base = new_func_abs + 1;
+        let mut varargs = Vec::new();
+        if proto.is_vararg && argc > np {
+            varargs.extend_from_slice(&th.stack[new_base + np..new_base + argc]);
+        }
+        ensure_len(&mut th.stack, new_base + proto.max_regs as usize);
+        for i in argc..np {
+            th.stack[new_base + i] = Value::Nil;
+        }
+        th.frames.pop();
+        th.frames.push(Frame {
+            closure: cid,
+            proto,
+            pc: 0,
+            base: new_base,
+            ret_to,
+            nres,
+            shape,
+            protected,
+            handler,
+            pending: Vec::new(),
+            tbc: Vec::new(),
+            varargs,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2389,7 +2536,9 @@ impl Lua {
                         }
                     }
                     Pending::CloseTbc { err, .. } => work.push(err),
-                    Pending::Concat { .. } | Pending::FinishReturn { .. } => {}
+                    Pending::Concat { .. }
+                    | Pending::FinishReturn { .. }
+                    | Pending::TailReturn { .. } => {}
                 }
             }
         }

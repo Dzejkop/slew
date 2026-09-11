@@ -12,7 +12,7 @@ verybig.lua	ok
 constructs.lua	line:247
 locals.lua	line:8
 goto.lua	line:21
-calls.lua	line:120
+calls.lua	line:165
 events.lua	line:196
 bitwise.lua	ok
 tpack.lua	ok

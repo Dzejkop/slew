@@ -555,7 +555,7 @@ fn runtime_error_reports_line() {
 fn runtime_error_reports_root_line() {
     let mut lua = Lua::new();
     let chunk = lua
-        .load("local function boom()\n  error('kaboom')\nend\nreturn boom()")
+        .load("local function boom()\n  error('kaboom')\nend\nlocal x = boom()\nreturn x")
         .unwrap();
     let mut exec = lua.execute(&chunk);
     let err = loop {
@@ -575,5 +575,96 @@ fn runtime_error_reports_root_line() {
 #[test]
 fn deep_recursion_hits_depth_limit_not_host_stack() {
     let err = run_err("local function f() return f() + 1 end return f()");
+    assert!(err.contains("stack overflow"), "got: {err}");
+}
+
+// ---- proper tail calls ----
+
+#[test]
+fn tail_recursion_is_constant_depth() {
+    // 100k deep would blow MAX_CALL_DEPTH (10_000) without frame reuse.
+    assert_eq!(
+        eval(
+            "local function f(n) if n == 0 then return 101 else return f(n-1) end end return f(100000)"
+        ),
+        "101"
+    );
+}
+
+#[test]
+fn mutual_tail_recursion_is_constant_depth() {
+    assert_eq!(
+        eval(
+            "local ev, od\n\
+             function ev(n) if n == 0 then return true else return od(n-1) end end\n\
+             function od(n) if n == 0 then return false else return ev(n-1) end end\n\
+             return ev(100001)"
+        ),
+        "false"
+    );
+}
+
+#[test]
+fn tail_call_shapes() {
+    // plain call, dot access, method call, and parenthesized callee
+    assert_eq!(eval("local function f() return 1 end return f()"), "1");
+    assert_eq!(
+        eval("local t = {} function t.f() return 2 end return t.f()"),
+        "2"
+    );
+    assert_eq!(
+        eval("local t = {v = 3} function t:m() return self.v end return t:m()"),
+        "3"
+    );
+    assert_eq!(eval("local f = function() return 4 end return (f)()"), "4");
+}
+
+#[test]
+fn tail_call_with_varargs() {
+    assert_eq!(
+        eval(
+            "local function f(a, b, c) return a + b + c end\n\
+             local function g(...) return f(...) end\n\
+             return g(1, 2, 3)"
+        ),
+        "6"
+    );
+    assert_eq!(
+        eval_multi("local function f(...) return ... end return f('a', 'b', 'c')"),
+        vec!["a", "b", "c"]
+    );
+}
+
+#[test]
+fn tail_call_through_call_metamethod() {
+    // Each level tail-calls a table whose __call is the previous function.
+    // 100k would blow the depth limit if the __call frame were not reused.
+    assert_eq!(
+        eval(
+            "local t = setmetatable({}, {__call = function(self, n)\n\
+                if n == 0 then return 77 else return self(n - 1) end\n\
+             end})\n\
+             return t(100000)"
+        ),
+        "77"
+    );
+}
+
+#[test]
+fn tail_calls_inside_coroutine() {
+    assert_eq!(
+        eval(
+            "local function loop(n) if n == 0 then return 5 else return loop(n - 1) end end\n\
+             return coroutine.wrap(function() return loop(100000) end)()"
+        ),
+        "5"
+    );
+}
+
+#[test]
+fn deep_non_tail_recursion_still_errors() {
+    let err = run_err(
+        "local function f(n) if n == 0 then return 0 else return 1 + f(n - 1) end end return f(100000)",
+    );
     assert!(err.contains("stack overflow"), "got: {err}");
 }
