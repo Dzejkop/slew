@@ -55,7 +55,7 @@ pub fn compile(
 enum CKey {
     Int(i64),
     Float(u64),
-    Str(crate::value::StrId),
+    Str(crate::value::StrRef),
 }
 
 struct LocalVar {

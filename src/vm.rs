@@ -15,7 +15,7 @@ use crate::compiler::{CompileError, compile};
 use crate::host::{Host, HostObject, Userdata};
 use crate::parser::{ParseError, parse};
 use crate::value::{
-    ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId, UpvalId, UserdataId, Value,
+    ClosId, NativeId, StrRef, Strings, Table, TableId, ThreadId, UpvalId, UserdataId, Value,
     float_to_exact_int, fmt_number,
 };
 use std::fmt;
@@ -475,7 +475,7 @@ pub struct Lua {
     pub(crate) userdata: Vec<Userdata>,
     pub(crate) globals: TableId,
     pub(crate) string_meta: Option<TableId>,
-    mm_names: Vec<StrId>,
+    mm_names: Vec<StrRef>,
     /// Thread being dispatched right now (its `Thread` is temporarily
     /// moved out of the arena).
     pub(crate) current_thread: ThreadId,
@@ -862,7 +862,7 @@ impl Lua {
 
     pub fn new_string(&mut self, s: &[u8]) -> Value {
         self.allocs_since_gc += 1;
-        Value::Str(self.strings.intern(s))
+        Value::Str(self.strings.new_string(s))
     }
 
     pub fn new_table(&mut self) -> Value {
@@ -4477,7 +4477,10 @@ impl Lua {
         while let Some(v) = work.pop() {
             match v {
                 Value::Str(s) => {
-                    if let Some(slot) = m.strings.get_mut(s.0 as usize) {
+                    if let Some(slot) = m.strings.get_mut(s.obj.0 as usize) {
+                        *slot = true;
+                    }
+                    if let Some(slot) = m.strings.get_mut(s.content.0 as usize) {
                         *slot = true;
                     }
                 }
@@ -4617,10 +4620,12 @@ impl Lua {
                     self.tables[i].remove(k);
                 } else {
                     if let Value::Str(s) = k {
-                        m.strings[s.0 as usize] = true;
+                        m.strings[s.obj.0 as usize] = true;
+                        m.strings[s.content.0 as usize] = true;
                     }
                     if let Value::Str(s) = v {
-                        m.strings[s.0 as usize] = true;
+                        m.strings[s.obj.0 as usize] = true;
+                        m.strings[s.content.0 as usize] = true;
                     }
                 }
             }

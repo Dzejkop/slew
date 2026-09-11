@@ -197,7 +197,7 @@ fn string_format() {
     assert_eq!(eval("return string.format('%10s|', 'hi')"), "        hi|");
     assert_eq!(
         eval("return string.format('%q', 'he said \"hi\"\\n')"),
-        "\"he said \\\"hi\\\"\\n\""
+        "\"he said \\\"hi\\\"\\\n\""
     );
     assert_eq!(eval("return string.format('%%')"), "%");
 }

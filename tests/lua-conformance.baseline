@@ -4,10 +4,10 @@ vararg.lua	ok
 closure.lua	ok
 gc.lua	ok
 nextvar.lua	ok
-pm.lua	line:436
+pm.lua	ok
 utf8.lua	ok
 sort.lua	ok
-strings.lua	line:194
+strings.lua	line:248
 math.lua	ok
 verybig.lua	ok
 constructs.lua	ok
@@ -17,6 +17,6 @@ calls.lua	ok
 events.lua	ok
 bitwise.lua	ok
 tpack.lua	ok
-literals.lua	line:231
+literals.lua	ok
 attrib.lua	ok
 coroutine.lua	line:271

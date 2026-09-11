@@ -496,38 +496,71 @@ fn format_one(
                 Value::Str(id) => lua.strings.get(id).to_vec(),
                 _ => lua.display_value(v).into_bytes(),
             };
+            // PUC only accepts embedded zeros for the unmodified `%s`; with
+            // any flags/width/precision the width is measured with `strlen`,
+            // so a NUL would silently truncate the value.
+            let modified = flags.left
+                || flags.zero
+                || flags.plus
+                || flags.space
+                || flags.alt
+                || width > 0
+                || precision.is_some();
+            if modified && s.contains(&0) {
+                return Err(format!(
+                    "bad argument #{argi} to 'format' (string contains zeros)"
+                ));
+            }
             if let Some(p) = precision {
                 s.truncate(p);
             }
             s
         }
-        b'q' => {
-            let bytes = match v {
-                Value::Str(id) => lua.strings.get(id).to_vec(),
-                Value::Int(_) | Value::Float(_) => return Ok(fmt_number(v).into_bytes()),
-                Value::Nil => return Ok(b"nil".to_vec()),
-                Value::Bool(b) => return Ok(b.to_string().into_bytes()),
-                _ => {
-                    return Err(format!(
-                        "bad argument #{argi} to 'format' (value has no literal form)"
-                    ));
+        b'q' => match v {
+            Value::Str(id) => {
+                let bytes = lua.strings.get(id).to_vec();
+                let mut out = vec![b'"'];
+                for (i, &b) in bytes.iter().enumerate() {
+                    match b {
+                        // Quote these directly: C's `addquoted` emits a
+                        // backslash followed by the byte itself, so a newline
+                        // becomes backslash + an actual newline.
+                        b'"' | b'\\' | b'\n' => {
+                            out.push(b'\\');
+                            out.push(b);
+                        }
+                        _ if b < 32 || b == 127 => {
+                            // A decimal escape must not swallow a following
+                            // digit, so PUC zero-pads to three digits then.
+                            if bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+                                out.extend_from_slice(format!("\\{b:03}").as_bytes());
+                            } else {
+                                out.extend_from_slice(format!("\\{b}").as_bytes());
+                            }
+                        }
+                        _ => out.push(b),
+                    }
                 }
-            };
-            let mut out = vec![b'"'];
-            for b in bytes {
-                match b {
-                    b'"' => out.extend_from_slice(b"\\\""),
-                    b'\\' => out.extend_from_slice(b"\\\\"),
-                    b'\n' => out.extend_from_slice(b"\\n"),
-                    b'\r' => out.extend_from_slice(b"\\r"),
-                    0 => out.extend_from_slice(b"\\0"),
-                    _ if b < 32 || b == 127 => out.extend_from_slice(format!("\\{b}").as_bytes()),
-                    _ => out.push(b),
-                }
+                out.push(b'"');
+                out
             }
-            out.push(b'"');
-            out
-        }
+            // Numbers are written as a Lua literal that scans back exactly:
+            // the most-negative integer needs hex (its magnitude overflows),
+            // infinities need a value that parses to them, NaN has no numeral.
+            Value::Int(n) if n == i64::MIN => format!("0x{:x}", n as u64).into_bytes(),
+            Value::Int(n) => n.to_string().into_bytes(),
+            Value::Float(x) if x == f64::INFINITY => b"1e9999".to_vec(),
+            Value::Float(x) if x == f64::NEG_INFINITY => b"-1e9999".to_vec(),
+            Value::Float(x) if x.is_nan() => b"(0/0)".to_vec(),
+            Value::Float(x) => format_hex_float(x, false, None, Flags::default()),
+            Value::Nil => b"nil".to_vec(),
+            Value::Bool(b) => b.to_string().into_bytes(),
+            _ => {
+                return Err(format!(
+                    "bad argument #{argi} to 'format' (value has no literal form)"
+                ));
+            }
+        },
         c => return Err(format!("invalid conversion '%{}' to 'format'", c as char)),
     };
     let numeric = !matches!(conv, b's' | b'q' | b'c' | b'p');
@@ -536,11 +569,12 @@ fn format_one(
 
 /// `string.format("%p", v)`: nil/booleans/numbers have no address in Lua and
 /// render as `(null)` (as PUC does when `lua_topointer` is NULL). Everything
-/// else is a stable, type-tagged handle rendered as hex; equal strings share
-/// an id because slew interns them.
+/// else is a stable, type-tagged handle rendered as hex. For strings this is
+/// the *object* identity, so interned short strings share an address while
+/// distinct runtime long strings do not.
 fn pointer_text(v: Value) -> String {
     let tag = match v {
-        Value::Str(id) => 0x1000_0000u64 + id.0 as u64,
+        Value::Str(id) => 0x1000_0000u64 + id.obj.0 as u64,
         Value::Table(id) => 0x2000_0000u64 + id.0 as u64,
         Value::Native(id) => 0x3000_0000u64 + id.0 as u64,
         Value::Closure(id) => 0x4000_0000u64 + id.0 as u64,

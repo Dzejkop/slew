@@ -99,6 +99,16 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The current token as PUC spells it after `near`: end of input is the
+    /// unquoted `<eof>`, every other token is wrapped in single quotes.
+    fn near(&self) -> String {
+        if self.tok == Token::Eof {
+            "<eof>".to_string()
+        } else {
+            format!("'{}'", self.tok)
+        }
+    }
+
     fn advance(&mut self) -> Result<Token, ParseError> {
         let (tok, line) = self.lexer.next_token()?;
         self.line = line;
@@ -119,7 +129,7 @@ impl<'a> Parser<'a> {
             self.advance()?;
             Ok(())
         } else {
-            self.err(format!("'{}' expected near '{}'", tok, self.tok))
+            self.err(format!("'{}' expected near {}", tok, self.near()))
         }
     }
 
@@ -131,7 +141,7 @@ impl<'a> Parser<'a> {
                 };
                 Ok(n)
             }
-            _ => self.err(format!("<name> expected near '{}'", self.tok)),
+            _ => self.err(format!("<name> expected near {}", self.near())),
         }
     }
 
@@ -169,7 +179,7 @@ impl<'a> Parser<'a> {
         };
         self.check(&Token::Semi)?;
         if !self.block_ends() {
-            return self.err(format!("'end' expected near '{}'", self.tok));
+            return self.err(format!("'end' expected near {}", self.near()));
         }
         Ok(Stmt::Return { exprs, line })
     }
@@ -405,7 +415,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Token::Name(_) => params.push(self.expect_name()?),
-                    _ => return self.err(format!("<name> expected near '{}'", self.tok)),
+                    _ => return self.err(format!("<name> expected near {}", self.near())),
                 }
                 if !self.check(&Token::Comma)? {
                     break;
@@ -554,7 +564,7 @@ impl<'a> Parser<'a> {
                 self.expect_token(Token::RParen)?;
                 Expr::Paren(Box::new(inner))
             }
-            t => return self.err(format!("unexpected symbol near '{t}'")),
+            _ => return self.err(format!("unexpected symbol near {}", self.near())),
         };
         loop {
             let line = self.line;
@@ -621,7 +631,7 @@ impl<'a> Parser<'a> {
                 Ok(vec![Expr::Str(s)])
             }
             Token::LBrace => Ok(vec![self.table_constructor()?]),
-            t => self.err(format!("function arguments expected near '{t}'")),
+            _ => self.err(format!("function arguments expected near {}", self.near())),
         }
     }
 

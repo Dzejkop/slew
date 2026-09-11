@@ -184,6 +184,172 @@ fn strings_and_concat() {
     assert!(run_err("return {} .. 'x'").contains("concatenate"));
 }
 
+// ---- PUC string identity model (short vs long strings) ----
+
+/// Long strings created at runtime are equal by content but have distinct
+/// object identities, so `%p` differs (PUC does not intern long strings).
+#[test]
+fn long_runtime_strings_have_distinct_identity() {
+    assert_eq!(
+        eval(
+            "local s1 = string.rep('a', 300)\n\
+             local s2 = string.rep('a', 300)\n\
+             return (s1 == s2) and (string.format('%p', s1) ~= string.format('%p', s2))"
+        ),
+        "true"
+    );
+}
+
+/// Short runtime strings are interned, so equal ones are the same object.
+#[test]
+fn short_runtime_strings_are_interned() {
+    assert_eq!(
+        eval(
+            "local s1 = string.rep('a', 10)\n\
+             local s2 = string.rep('aa', 5)\n\
+             return (s1 == s2) and (string.format('%p', s1) == string.format('%p', s2))"
+        ),
+        "true"
+    );
+}
+
+/// Identical long literals in one chunk share a single object identity.
+#[test]
+fn long_literals_share_identity() {
+    assert_eq!(
+        eval(
+            "local function getadd(s) return string.format('%p', s) end\n\
+             local s1 <const> = '01234567890123456789012345678901234567890123456789'\n\
+             local s2 = '01234567890123456789012345678901234567890123456789'\n\
+             local function foo() return s1 end\n\
+             local a1 = getadd(s1)\n\
+             return (a1 == getadd(s2)) and (a1 == getadd(foo()))"
+        ),
+        "true"
+    );
+}
+
+/// A long `..` result equals a literal by content but is a fresh object.
+#[test]
+fn concat_long_result_is_fresh() {
+    assert_eq!(
+        eval(
+            "local a = '01234567890123456789012345678901234567890123456789'\n\
+             local sd = '0123456789' .. '0123456789012345678901234567890123456789'\n\
+             return (sd == a) and (string.format('%p', sd) ~= string.format('%p', a))"
+        ),
+        "true"
+    );
+}
+
+/// Table keys compare by content even across distinct long-string identities.
+#[test]
+fn table_keys_use_string_content() {
+    assert_eq!(
+        eval(
+            "local t = {}\n\
+             local k1 = string.rep('x', 300)\n\
+             local k2 = string.rep('x', 300)\n\
+             t[k1] = 1\n\
+             t[k2] = 2\n\
+             return (k1 == k2) and (t[k1] == 2) and (t[k2] == 2)"
+        ),
+        "true"
+    );
+}
+
+/// Long string keys survive a collection and stay findable by content.
+#[test]
+fn long_string_table_key_survives_gc() {
+    assert_eq!(
+        eval(
+            "local t = {}\n\
+             do local k = string.rep('y', 300) t[k] = 42 end\n\
+             collectgarbage()\n\
+             return t[string.rep('y', 300)]"
+        ),
+        "42"
+    );
+}
+
+/// `rawequal` on strings is content equality, even for long strings.
+#[test]
+fn rawequal_strings_by_content() {
+    assert_eq!(
+        eval(
+            "local a = string.rep('z', 300)\n\
+             local b = string.rep('z', 300)\n\
+             return rawequal(a, b) and a == b"
+        ),
+        "true"
+    );
+}
+
+/// `gsub` returns the original subject object when nothing was replaced.
+#[test]
+fn gsub_reuses_original_when_unchanged() {
+    assert_eq!(
+        eval(
+            "local s = string.rep('a', 100)\n\
+             local r = string.gsub(s, 'b', 'c')\n\
+             local r2 = string.gsub(s, '.', function() return nil end)\n\
+             local r3 = string.gsub(s, '.', {x = 'y'})\n\
+             return (r == s) and (r2 == s) and (r3 == s)\n\
+                and (string.format('%p', r) == string.format('%p', s))\n\
+                and (string.format('%p', r2) == string.format('%p', s))\n\
+                and (string.format('%p', r3) == string.format('%p', s))"
+        ),
+        "true"
+    );
+}
+
+/// `gsub` builds a fresh long string when a substitution actually occurs.
+#[test]
+fn gsub_creates_fresh_string_on_substitution() {
+    assert_eq!(
+        eval(
+            "local s = string.rep('a', 100)\n\
+             local r = string.gsub(s, '.', function(x) return x end)\n\
+             return (r == s) and (string.format('%p', r) ~= string.format('%p', s))"
+        ),
+        "true"
+    );
+}
+
+/// `rawget`/`rawset` and table iteration match long-string keys by content,
+/// not by object identity.
+#[test]
+fn rawget_rawset_use_long_string_content() {
+    assert_eq!(
+        eval(
+            "local t = {}\n\
+             local stored = string.rep('k', 300)\n\
+             rawset(t, stored, 7)\n\
+             local probe = string.rep('k', 300)\n\
+             return (string.format('%p', stored) ~= string.format('%p', probe))\n\
+                and (rawget(t, probe) == 7) and (next(t) == probe)"
+        ),
+        "true"
+    );
+}
+
+/// Length and lexicographic comparisons on long strings are byte-based even
+/// when the operands are distinct objects.
+#[test]
+fn long_string_length_and_ordering() {
+    assert_eq!(
+        eval(
+            "local a = string.rep('a', 300)\n\
+             local b = string.rep('a', 300)\n\
+             local c = string.rep('a', 299) .. 'b'\n\
+             local d = string.rep('a', 301)\n\
+             return (#a == 300) and (a <= b) and (a >= b) and not (a < b)\n\
+                and (c > a) and (d > a) and (a < d)"
+        ),
+        "true"
+    );
+}
+
 #[test]
 fn tostring_conversions() {
     assert_eq!(eval("return tostring(nil)"), "nil");

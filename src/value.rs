@@ -5,10 +5,59 @@
 //! collector straightforward (no `Rc` cycles, no unsafe).
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StrId(pub u32);
+
+/// PUC's `LUAI_MAXSHORTLEN`: strings up to this length are *short* and always
+/// interned; longer strings are *long* and (when created at runtime) get a
+/// fresh object identity.
+pub const MAXSHORTLEN: usize = 40;
+
+/// A reference to a Lua string.
+///
+/// `obj` is the object identity (distinct `%p` for distinct runtime long
+/// strings), `content` is a canonical object handle with the same bytes used
+/// for equality and table keys. For interned strings the two coincide.
+#[derive(Clone, Copy, Debug)]
+pub struct StrRef {
+    pub obj: StrId,
+    /// Canonical handle whose `StrId` uniquely identifies the byte content.
+    pub content: StrId,
+}
+
+impl StrRef {
+    /// A reference to a string already known to be canonical (interned), so its
+    /// object handle also identifies its content.
+    pub const fn interned(id: StrId) -> Self {
+        StrRef {
+            obj: id,
+            content: id,
+        }
+    }
+}
+
+impl PartialEq for StrRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+    }
+}
+
+impl Eq for StrRef {}
+
+impl Hash for StrRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.content.hash(state);
+    }
+}
+
+impl From<StrRef> for StrId {
+    fn from(r: StrRef) -> StrId {
+        r.obj
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TableId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -25,14 +74,15 @@ pub struct ThreadId(pub u32);
 pub struct UserdataId(pub u32);
 
 /// A Lua value. `PartialEq` is *raw* identity/bit equality (NaN ~= NaN, and
-/// `Int(1) != Float(1.0)`); Lua `==` semantics live in the VM (`Lua::values_equal`).
+/// `Int(1) != Float(1.0)`), except strings which compare by content (see
+/// [`StrRef`]); Lua `==` semantics live in the VM (`Lua::values_equal`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(StrId),
+    Str(StrRef),
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),
@@ -59,8 +109,15 @@ impl Value {
     }
 }
 
-/// String interner. Every live Lua string is interned, so `StrId` equality
-/// is string equality and strings hash O(1) as table keys.
+/// String store. Short strings (length <= [`MAXSHORTLEN`]) and compile-time
+/// literals are *interned*: equal content is one object. Long strings created
+/// at runtime are not deduplicated — each gets its own object — but every
+/// object also records a canonical *content* handle so equality and table keys
+/// stay content-based (see [`StrRef`]).
+///
+/// `map` links a byte content to the canonical live object holding it. An
+/// object's content handle is always a live object with the same bytes, and
+/// the collector keeps it alive as long as any value references that content.
 ///
 /// Strings referenced from compiled `Proto` constants are interned as
 /// *fixed*: protos live outside the GC heap (host-held `Chunk`s, `Rc`s in
@@ -70,6 +127,7 @@ impl Value {
 pub struct Strings {
     vec: Vec<Option<Rc<[u8]>>>,
     fixed: Vec<bool>,
+    /// Content bytes -> canonical object handle holding them.
     map: HashMap<Rc<[u8]>, StrId>,
     free: Vec<u32>,
     /// Total bytes of live string data.
@@ -77,16 +135,38 @@ pub struct Strings {
 }
 
 impl Strings {
-    pub fn intern(&mut self, s: &[u8]) -> StrId {
-        self.intern_impl(s, false)
+    /// Interns `s`, returning a canonical reference (deduplicated by content).
+    pub fn intern(&mut self, s: &[u8]) -> StrRef {
+        let id = self.intern_canonical(s, false);
+        StrRef::interned(id)
     }
 
     /// Interns a string that is never garbage collected.
-    pub fn intern_fixed(&mut self, s: &[u8]) -> StrId {
-        self.intern_impl(s, true)
+    pub fn intern_fixed(&mut self, s: &[u8]) -> StrRef {
+        let id = self.intern_canonical(s, true);
+        StrRef::interned(id)
     }
 
-    fn intern_impl(&mut self, s: &[u8], fixed: bool) -> StrId {
+    /// Creates a string produced at runtime. Short strings are interned exactly
+    /// like literals; long strings get a fresh object identity while sharing a
+    /// canonical content handle, matching PUC's short/long string model.
+    pub fn new_string(&mut self, s: &[u8]) -> StrRef {
+        if s.len() <= MAXSHORTLEN {
+            return self.intern(s);
+        }
+        let rc: Rc<[u8]> = s.into();
+        let obj = self.alloc(rc.clone(), false);
+        let content = match self.map.get(&rc) {
+            Some(&c) => c,
+            None => {
+                self.map.insert(rc, obj);
+                obj
+            }
+        };
+        StrRef { obj, content }
+    }
+
+    fn intern_canonical(&mut self, s: &[u8], fixed: bool) -> StrId {
         if let Some(&id) = self.map.get(s) {
             if fixed {
                 self.fixed[id.0 as usize] = true;
@@ -94,33 +174,40 @@ impl Strings {
             return id;
         }
         let rc: Rc<[u8]> = s.into();
-        self.bytes += s.len();
-        let id = match self.free.pop() {
-            Some(slot) => {
-                self.vec[slot as usize] = Some(rc.clone());
-                self.fixed[slot as usize] = fixed;
-                StrId(slot)
-            }
-            None => {
-                self.vec.push(Some(rc.clone()));
-                self.fixed.push(fixed);
-                StrId(self.vec.len() as u32 - 1)
-            }
-        };
+        let id = self.alloc(rc.clone(), fixed);
         self.map.insert(rc, id);
         id
     }
 
-    /// Looks up an already-interned string without interning.
-    pub fn lookup(&self, s: &[u8]) -> Option<StrId> {
-        self.map.get(s).copied()
+    /// Allocates a fresh object slot holding `rc`.
+    fn alloc(&mut self, rc: Rc<[u8]>, fixed: bool) -> StrId {
+        self.bytes += rc.len();
+        match self.free.pop() {
+            Some(slot) => {
+                self.vec[slot as usize] = Some(rc);
+                self.fixed[slot as usize] = fixed;
+                StrId(slot)
+            }
+            None => {
+                self.vec.push(Some(rc));
+                self.fixed.push(fixed);
+                StrId(self.vec.len() as u32 - 1)
+            }
+        }
     }
 
-    pub fn get(&self, id: StrId) -> &[u8] {
+    /// Looks up the canonical reference for `s` without interning.
+    pub fn lookup(&self, s: &[u8]) -> Option<StrRef> {
+        self.map.get(s).copied().map(StrRef::interned)
+    }
+
+    /// Returns the bytes of a string, given either an object or content handle.
+    pub fn get(&self, id: impl Into<StrId>) -> &[u8] {
+        let id = id.into();
         self.vec[id.0 as usize].as_deref().expect("stale StrId")
     }
 
-    pub fn get_str_lossy(&self, id: StrId) -> std::borrow::Cow<'_, str> {
+    pub fn get_str_lossy(&self, id: impl Into<StrId>) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(self.get(id))
     }
 
@@ -136,9 +223,9 @@ impl Strings {
         self.bytes
     }
 
-    /// Number of live (interned, unswept) strings.
+    /// Number of live (unswept) string objects.
     pub fn live_count(&self) -> usize {
-        self.map.len()
+        self.vec.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Sweeps unmarked, non-fixed strings. `marked` is indexed by `StrId`.
@@ -152,7 +239,12 @@ impl Strings {
                 continue;
             };
             self.bytes -= rc.len();
-            self.map.remove(&rc);
+            // Drop the content mapping only if this object is the canonical
+            // representative; a non-canonical long string shares its content
+            // with a (still live) canonical object.
+            if self.map.get(&rc) == Some(&StrId(i as u32)) {
+                self.map.remove(&rc);
+            }
             self.free.push(i as u32);
             freed += 1;
         }
@@ -168,7 +260,7 @@ pub enum HKey {
     /// Non-integral float, by bit pattern. Never NaN.
     Float(u64),
     Bool(bool),
-    Str(StrId),
+    Str(StrRef),
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),

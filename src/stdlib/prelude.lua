@@ -330,6 +330,7 @@ function string.gsub(s, pat, repl, maxn)
   end
   local anchored = sub(pat, 1, 1) == '^'
   local out, pos, count = {}, 1, 0
+  local changed = false
   local len = #s
   -- PUC's `lastmatch`: reject an empty match that would begin exactly where
   -- the previous match ended, copying a byte and retrying instead.
@@ -366,10 +367,13 @@ function string.gsub(s, pat, repl, maxn)
       end
       if value == nil or value == false then
         value = whole
-      elseif type(value) == 'number' then
-        value = tostring(value)
-      elseif type(value) ~= 'string' then
-        error("invalid replacement value (a " .. type(value) .. ")")
+      else
+        if type(value) == 'number' then
+          value = tostring(value)
+        elseif type(value) ~= 'string' then
+          error("invalid replacement value (a " .. type(value) .. ")")
+        end
+        changed = true
       end
       out[#out+1] = value
       count = count + 1
@@ -383,6 +387,10 @@ function string.gsub(s, pat, repl, maxn)
       end
       if anchored then break end
     end
+  end
+  if not changed then
+    -- PUC returns the original subject object when nothing was replaced.
+    return s, count
   end
   out[#out+1] = sub(s, pos)
   return concat(out), count
