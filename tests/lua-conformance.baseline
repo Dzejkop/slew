@@ -15,6 +15,7 @@ goto.lua	line:21
 calls.lua	line:120
 events.lua	line:196
 bitwise.lua	ok
+tpack.lua	ok
 literals.lua	line:41
 attrib.lua	line:9
 coroutine.lua	line:50

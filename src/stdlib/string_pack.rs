@@ -54,7 +54,8 @@ impl Header {
     fn new(who: &'static str) -> Self {
         Header {
             islittle: NATIVE_LITTLE,
-            maxalign: MAXALIGN,
+            // PUC's `initheader` starts with no alignment; `!n` opts in.
+            maxalign: 1,
             who,
         }
     }
@@ -404,16 +405,19 @@ pub(crate) fn n_unpack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, Stri
             ));
         }
     };
-    // posrelatI: positive as-is, zero means 1, negative counts from the end.
+    // posrelatI: positive as-is, zero means 1, negative counts from the end,
+    // and negatives at or before -ld clip to the start (PUC 5.4).
     // i128 avoids overflow for extreme (e.g. mininteger) positions.
+    let ld_i = ld as i128;
     let start: i128 = if init > 0 {
         init as i128
-    } else if init == 0 {
+    } else if init == 0 || (init as i128) < -ld_i {
         1
     } else {
-        ld as i128 + init as i128 + 1
+        ld_i + init as i128 + 1
     };
-    if start <= 0 || start > ld as i128 {
+    // PUC checks `pos <= ld` where `pos = start - 1`.
+    if start > ld_i + 1 {
         return Err(argerr(3, "unpack", "initial position out of string"));
     }
     let mut pos = (start - 1) as usize;

@@ -223,16 +223,27 @@ fn string_pack_round_trips() {
     assert_eq!(eval("return string.packsize('j')"), "8");
     assert_eq!(eval("return string.packsize('n')"), "8");
     assert_eq!(eval("return string.packsize('i4i4')"), "8");
-    // alignment: i1 followed by an 8-byte aligned integer
-    assert_eq!(eval("return string.packsize('i1i8')"), "16");
+    // no alignment by default (PUC's `initheader` sets maxalign = 1)
+    assert_eq!(eval("return string.packsize('i1i8')"), "9");
+    assert_eq!(eval("return string.packsize('i3')"), "3");
+    assert_eq!(eval("return string.packsize('xxi4')"), "6");
+    // `!n` enables alignment (PUC stores it directly in maxalign)
+    assert_eq!(eval("return string.packsize('!8i1i8')"), "16");
+    assert_eq!(eval("return string.packsize('!4i1i4')"), "8");
     assert_eq!(eval("return string.packsize('!8i1d')"), "16");
+    // a later `!n` replaces the previous maximum (PUC semantics)
+    assert_eq!(eval("return string.packsize('!8 i1 !2 i8')"), "10");
     assert_eq!(eval("return string.packsize('xx')"), "2");
-    assert_eq!(eval("return string.packsize('xxi4')"), "8");
     assert_eq!(eval("return string.packsize('<i4>i4')"), "8");
     let bytes = "return string.byte(string.pack('>i4', 0x01020304), 1, 4)";
     assert_eq!(eval_multi(bytes), ["1", "2", "3", "4"]);
     let bytes_le = "return string.byte(string.pack('<i4', 0x01020304), 1, 4)";
     assert_eq!(eval_multi(bytes_le), ["4", "3", "2", "1"]);
+    // no padding is inserted between unaligned fields by default
+    assert_eq!(
+        eval_multi("return string.byte(string.pack('<i1i2', 2, 3), 1, 3)"),
+        ["2", "3", "0"]
+    );
     assert_eq!(eval_multi("return string.unpack('i4', string.pack('i4', -42))"), ["-42", "5"]);
     assert_eq!(eval_multi("return string.unpack('>i2', string.pack('>i2', -2))"), ["-2", "3"]);
     assert_eq!(eval_multi("return string.unpack('J', string.pack('J', -1))"), ["-1", "9"]);
@@ -272,8 +283,15 @@ fn string_pack_errors() {
     assert!(run_err("return string.unpack('z', 'abc')").contains("unfinished string"));
     assert!(run_err("return string.unpack('i4', 'abcd', 9)")
         .contains("initial position out of string"));
-    assert!(run_err("return string.unpack('i4', 'abcd', math.mininteger)")
+    assert!(run_err("return string.unpack('i4', 'abcd', math.maxinteger)")
         .contains("initial position out of string"));
+    // PUC's posrelatI clips positions below -len to the start rather than erroring
+    assert_eq!(
+        eval_multi("return string.unpack('i4', 'abcd', math.mininteger)"),
+        ["1684234849", "5"]
+    );
+    // position len+1 is the one-past-the-end sentinel and unpacks zero fields
+    assert_eq!(eval_multi("return string.unpack('c0', 'abcd', 5)"), ["", "5"]);
     assert!(run_err("return string.packsize('i0')").contains("integral size (0) out of limits"));
     assert!(run_err("return string.packsize('Q')").contains("invalid format option 'Q'"));
     assert!(run_err("return string.packsize('c')").contains("missing size for format option 'c'"));

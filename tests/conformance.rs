@@ -56,6 +56,7 @@ const CASES: &[Case] = &[
     Case { file: "calls.lua", shims: "" },
     Case { file: "events.lua", shims: SHIM_GC },
     Case { file: "bitwise.lua", shims: "" },
+    Case { file: "tpack.lua", shims: "" },
     Case { file: "literals.lua", shims: "" },
     Case { file: "attrib.lua", shims: "" },
     Case { file: "coroutine.lua", shims: SHIM_GC },
