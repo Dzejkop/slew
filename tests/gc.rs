@@ -267,7 +267,8 @@ fn collectgarbage_options() {
          local cnt = collectgarbage('count')
          local col = collectgarbage('collect')
          local st = collectgarbage('step')
-         return a, b, c, d, e, f, type(cnt) == 'number' and cnt > 0, col, st",
+         local st0 = collectgarbage('step', 0)
+         return a, b, c, d, e, f, type(cnt) == 'number' and cnt > 0, col, st, st0",
     );
     assert_eq!(vals[0], Value::Bool(true));
     assert_eq!(vals[1], Value::Bool(false));
@@ -277,7 +278,76 @@ fn collectgarbage_options() {
     assert_eq!(vals[5], Value::Int(100));
     assert_eq!(vals[6], Value::Bool(true));
     assert_eq!(vals[7], Value::Int(0));
-    assert_eq!(vals[8], Value::Bool(false));
+    // A step always finishes a collection cycle (stop-the-world collector),
+    // so `step` reports true; PUC returns true once a cycle completed.
+    assert_eq!(vals[8], Value::Bool(true));
+    assert_eq!(vals[9], Value::Bool(true));
+}
+
+#[test]
+fn collectgarbage_step_terminates_cycle_loops() {
+    let mut lua = Lua::new();
+    // Mirrors gc.lua's `dosteps`: the loop must terminate because a step
+    // reports a completed collection cycle.
+    let vals = run(
+        &mut lua,
+        "local function dosteps(siz)
+           collectgarbage()
+           local i = 0
+           repeat i = i + 1 until collectgarbage('step', siz)
+           return i
+         end
+         collectgarbage('stop')
+         local small = dosteps(2)
+         local big = dosteps(20000)
+         return small, big, collectgarbage('step', 20000)",
+    );
+    assert_eq!(vals[0], Value::Int(1));
+    assert_eq!(vals[1], Value::Int(1));
+    assert_eq!(vals[2], Value::Bool(true));
+}
+
+#[test]
+fn collectgarbage_number_option_is_invalid_option() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local ok, err = pcall(collectgarbage, 5)
+         local ok2, err2 = pcall(collectgarbage, {})
+         return ok, err, ok2, err2",
+    );
+    assert_eq!(vals[0], Value::Bool(false));
+    assert!(lua.display_value(vals[1]).contains("invalid option '5'"));
+    assert_eq!(vals[2], Value::Bool(false));
+    assert!(
+        lua.display_value(vals[3])
+            .contains("string expected, got table")
+    );
+}
+
+#[test]
+fn coroutine_close_argument_errors_match_puc() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local ok, err = pcall(coroutine.close)
+         local ok2, err2 = pcall(coroutine.close, 5)
+         return ok, err, ok2, err2",
+    );
+    assert_eq!(vals[0], Value::Bool(false));
+    assert!(
+        lua.display_value(vals[1])
+            .contains("bad argument #1 to 'coroutine.close' (thread expected, got no value)"),
+        "got: {}",
+        lua.display_value(vals[1])
+    );
+    assert_eq!(vals[2], Value::Bool(false));
+    assert!(
+        lua.display_value(vals[3])
+            .contains("bad argument #1 to 'coroutine.close' (thread expected, got number)"),
+        "got: {}",
+        lua.display_value(vals[3])
+    );
 }
 
 #[test]

@@ -2,6 +2,7 @@
 # status: ok | line:N | timeout | panic
 vararg.lua	ok
 closure.lua	ok
+gc.lua	line:298
 nextvar.lua	line:364
 pm.lua	line:436
 utf8.lua	ok

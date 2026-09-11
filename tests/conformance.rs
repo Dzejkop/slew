@@ -47,6 +47,10 @@ const CASES: &[Case] = &[
         shims: "",
     },
     Case {
+        file: "gc.lua",
+        shims: "",
+    },
+    Case {
         file: "nextvar.lua",
         shims: "",
     },

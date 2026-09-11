@@ -2504,13 +2504,16 @@ impl Lua {
                 Ok(())
             }
             Intrinsic::CoroutineClose => {
-                let co = arg(th, 0);
-                let Value::Thread(co) = co else {
+                let co = arg_opt(th, 0);
+                let Value::Thread(co) = co.unwrap_or(Value::Nil) else {
+                    let got = match co {
+                        Some(v) => v.type_name().to_string(),
+                        None => "no value".to_string(),
+                    };
                     return Err(self.rt_err(
                         th,
                         format!(
-                            "bad argument #1 to 'close' (coroutine expected, got {})",
-                            co.type_name()
+                            "bad argument #1 to 'coroutine.close' (thread expected, got {got})"
                         ),
                     ));
                 };
@@ -3734,6 +3737,10 @@ impl Lua {
         let opt = match opt {
             Value::Str(s) => self.strings.get(s).to_vec(),
             Value::Nil => b"collect".to_vec(),
+            // PUC's `luaL_checkoption` coerces numbers to strings before
+            // matching, so `collectgarbage(5)` reports an invalid option
+            // rather than a type error.
+            Value::Int(_) | Value::Float(_) => self.display_value(opt).into_bytes(),
             v => {
                 return Err(format!(
                     "bad argument #1 to 'collectgarbage' (string expected, got {})",
@@ -3760,8 +3767,15 @@ impl Lua {
                 Ok(vec![Value::Int(0)])
             }
             "step" => {
+                // The collector is a stop-the-world mark-sweep with no
+                // resumable phases, so one "step" is a bounded full
+                // collection: a cycle always completes, and PUC's contract
+                // ("true if the step finished a collection cycle") is
+                // therefore always satisfied. `n` is validated like PUC but
+                // cannot select a partial amount of work; see DESIGN.md.
+                let _ = int_arg(arg1)?;
                 collect_now(self);
-                Ok(vec![Value::Bool(false)])
+                Ok(vec![Value::Bool(true)])
             }
             "stop" => {
                 self.gc_running = false;

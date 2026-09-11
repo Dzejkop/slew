@@ -138,6 +138,15 @@ through a capability the embedder installs explicitly.
 - Weak tables (`__mode` = `k`/`v`/`kv`), ephemeron semantics, and `__gc`
   finalizers (run once, may resurrect, LIFO) are implemented in the mark-sweep
   collector, as is `collectgarbage([opt[, arg]])` and `coroutine.close`.
+- `collectgarbage("step", n)`: the collector has no resumable incremental
+  phases, so one `step` runs a full (bounded) mark-sweep collection and
+  returns `true`, matching PUC incremental mode's contract that the call
+  reports a finished collection cycle (`false` only while a cycle is still
+  in progress, which never happens here). `n` is type-checked like PUC but
+  cannot select a partial amount of work. This keeps the upstream
+  `repeat ... until collectgarbage("step", siz)` loops terminating.
+  `collectgarbage` option #1 coerces numbers to strings (so
+  `collectgarbage(5)` reports `invalid option '5'`), as PUC does.
 - **Root precision caveat**: the collector scans each thread's whole stack,
   including slots of popped frames and dead temporaries, because the VM does
   not track a precise dynamic stack top. Values can therefore survive a
