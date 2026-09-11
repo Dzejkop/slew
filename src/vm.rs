@@ -574,6 +574,7 @@ impl Lua {
                 nparams: 0,
                 is_vararg: false,
                 max_regs: 0,
+                reg_extent: Vec::new(),
                 name: String::new(),
                 linedefined: 0,
                 lastlinedefined: 0,
@@ -2687,7 +2688,12 @@ impl Lua {
                 // An intrinsic so the running thread (taken out of the arena
                 // during dispatch) can be passed as a GC root.
                 let r = self
-                    .gc_command(th, arg(th, 0), (argc > 1).then(|| arg(th, 1)))
+                    .gc_command(
+                        th,
+                        arg(th, 0),
+                        (argc > 1).then(|| arg(th, 1)),
+                        func_abs + 1 + argc,
+                    )
                     .map_err(|m| self.rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &r);
                 Ok(())
@@ -3966,7 +3972,7 @@ impl Lua {
             && (self.allocs_since_gc >= self.gc_alloc_threshold
                 || self.strings.bytes() > self.str_bytes_at_gc + (8 << 20));
         if due {
-            self.collect(Some((tid, th)));
+            self.collect(Some((tid, th, 0)));
         }
         if let Some(limit) = self.memory_limit {
             // only re-measured at collection points; cheap proxy otherwise
@@ -3986,6 +3992,7 @@ impl Lua {
         th: &Thread,
         opt: Value,
         arg1: Option<Value>,
+        call_top: usize,
     ) -> Result<Vec<Value>, String> {
         let opt = match opt {
             Value::Str(s) => self.strings.get(s).to_vec(),
@@ -4001,6 +4008,12 @@ impl Lua {
                 ));
             }
         };
+        // PUC marks its GC state "running a collection" for the whole cycle,
+        // including `__gc` handlers, and `lua_gc` reports every option as
+        // invalid (-1) there; `luaB_collectgarbage` then returns a single nil
+        // instead of the option's result. Option #1 was already validated
+        // above; option #2 for the numeric options is coerced before `lua_gc`
+        // sees the reentrancy, so mirror that too.
         let opt = String::from_utf8_lossy(&opt).into_owned();
         let int_arg = |v: Option<Value>| -> Result<i64, String> {
             match v {
@@ -4013,7 +4026,13 @@ impl Lua {
                 )),
             }
         };
-        let collect_now = |me: &mut Self| me.collect(Some((me.current_thread, th)));
+        if self.finalizer_depth.is_some() {
+            if matches!(opt.as_str(), "step" | "setpause" | "setstepmul") {
+                let _ = int_arg(arg1)?;
+            }
+            return Ok(vec![Value::Nil]);
+        }
+        let collect_now = |me: &mut Self| me.collect(Some((me.current_thread, th, call_top)));
         match opt.as_str() {
             "collect" => {
                 collect_now(self);
@@ -4076,7 +4095,7 @@ impl Lua {
         }
     }
 
-    fn collect(&mut self, extra: Option<(ThreadId, &Thread)>) {
+    fn collect(&mut self, extra: Option<(ThreadId, &Thread, usize)>) {
         let table_count = self.tables.len();
         let mut m = Marks {
             strings: vec![false; self.strings.len()],
@@ -4122,9 +4141,9 @@ impl Lua {
             work.push(Value::Thread(ThreadId(root)));
             work.push(Value::Thread(ThreadId(cur)));
         }
-        if let Some((etid, eth)) = extra {
+        if let Some((etid, eth, extra_top)) = extra {
             m.threads[etid.0 as usize] = true;
-            Self::trace_thread(eth, &mut m, &mut work, &self.upvals);
+            Self::trace_thread(eth, extra_top, &mut m, &mut work, &self.upvals);
         }
         self.mark_loop(&mut m, &mut work, &weak, &mut ephemerons);
         self.ephemeron_fixpoint(&mut m, &mut work, &weak, &mut ephemerons);
@@ -4279,7 +4298,7 @@ impl Lua {
                     let i = t.0 as usize;
                     if !m.threads[i] {
                         m.threads[i] = true;
-                        Self::trace_thread(&self.threads[i], m, work, &self.upvals);
+                        Self::trace_thread(&self.threads[i], 0, m, work, &self.upvals);
                     }
                 }
                 Value::Userdata(u) => {
@@ -4379,45 +4398,77 @@ impl Lua {
         }
     }
 
-    fn trace_thread(th: &Thread, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
+    fn trace_thread(
+        th: &Thread,
+        extra_top: usize,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        upvals: &[Upval],
+    ) {
+        let stack_len = th.stack.len();
         if th.frames.is_empty() {
             // e.g. a created-but-never-resumed coroutine: the body lives at
-            // stack[0] with no frame to bound the window
-            for &v in &th.stack {
-                work.push(v);
-            }
+            // stack[0] with no frame to bound the window, and a finished
+            // coroutine may leave results behind.
+            let top = th.top.max(extra_top).min(stack_len);
+            work.extend_from_slice(&th.stack[..top]);
         } else {
-            for &v in &th.stack {
-                work.push(v);
-            }
-        }
-        for f in &th.frames {
-            work.push(Value::Closure(f.closure));
-            if let Some(h) = f.handler {
-                work.push(h);
-            }
-            for &v in &f.varargs {
-                work.push(v);
-            }
-            for p in &f.pending {
-                match *p {
-                    Pending::CallClose { v, err } => {
-                        work.push(v);
-                        work.push(err);
-                    }
-                    Pending::DeliverError { err, handler, .. } => {
-                        work.push(err);
-                        if let Some(h) = handler {
-                            work.push(h);
+            // Mark each frame's live register window only. Slots above the
+            // current instruction's extent are dead temporaries, and gaps left
+            // by popped/tail-replaced frames stay unmarked.
+            for f in &th.frames {
+                let end = (f.base + frame_reg_extent(f)).min(stack_len);
+                if f.base < end {
+                    work.extend_from_slice(&th.stack[f.base..end]);
+                }
+                work.push(Value::Closure(f.closure));
+                if let Some(h) = f.handler {
+                    work.push(h);
+                }
+                for &v in &f.varargs {
+                    work.push(v);
+                }
+                for p in &f.pending {
+                    match *p {
+                        Pending::CallClose { v, err } => {
+                            work.push(v);
+                            work.push(err);
                         }
+                        Pending::DeliverError { err, handler, .. } => {
+                            work.push(err);
+                            if let Some(h) = handler {
+                                work.push(h);
+                            }
+                        }
+                        Pending::CloseTbc { err, .. } => work.push(err),
+                        // Return values staged above the register window must
+                        // survive while their `__close` handlers run.
+                        Pending::FinishReturn { start, count } => {
+                            let end = (start + count).min(stack_len);
+                            if start < end {
+                                work.extend_from_slice(&th.stack[start..end]);
+                            }
+                        }
+                        Pending::TailReturn { start } => {
+                            let end = th.top.min(stack_len);
+                            if start < end {
+                                work.extend_from_slice(&th.stack[start..end]);
+                            }
+                        }
+                        Pending::Concat { .. }
+                        | Pending::DeliverErrErr { .. }
+                        | Pending::CloseStep
+                        | Pending::PrintStep => {}
                     }
-                    Pending::CloseTbc { err, .. } => work.push(err),
-                    Pending::Concat { .. }
-                    | Pending::FinishReturn { .. }
-                    | Pending::TailReturn { .. }
-                    | Pending::DeliverErrErr { .. }
-                    | Pending::CloseStep
-                    | Pending::PrintStep => {}
+                }
+            }
+            // A native/intrinsic call that triggered the collection may hold
+            // open multret arguments above the top frame's window.
+            if extra_top > 0 {
+                let start = th.frames.last().map(|f| f.base).unwrap_or(0);
+                let end = extra_top.min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
                 }
             }
         }
@@ -4768,6 +4819,29 @@ fn ensure_len(stack: &mut Vec<Value>, len: usize) {
     if stack.len() < len {
         stack.resize(len, Value::Nil);
     }
+}
+
+/// Live register extent (relative to `f.base`) of the instruction a frame is
+/// currently executing. `pc` points at the *next* instruction, so the live one
+/// is `pc - 1`. Slots at or above the returned extent are dead temporaries and
+/// must not be treated as roots.
+fn frame_reg_extent(f: &Frame) -> usize {
+    if f.pc == 0 {
+        // Frame pushed but not yet executing (or a chunk that has not run
+        // yet): nothing above the declared window can be live.
+        return f.proto.max_regs as usize;
+    }
+    let idx = f.pc - 1;
+    let recorded = f
+        .proto
+        .reg_extent
+        .get(idx)
+        .copied()
+        .unwrap_or(f.proto.max_regs) as usize;
+    // Belt and braces: never drop a register the instruction itself names,
+    // even if a future emit order were to under-report `free_reg`.
+    let named = f.proto.code.get(idx).map_or(0, |i| i.reg_high()) as usize;
+    recorded.max(named)
 }
 
 /// First stack slot safely above all live data of the current frame.

@@ -185,6 +185,58 @@ pub enum Instr {
     },
 }
 
+impl Instr {
+    /// Highest register index (plus one) this instruction can reference
+    /// statically. Multi-value fields encoded as `0` extend to the thread's
+    /// dynamic top at run time and are handled separately by the VM; here they
+    /// contribute only their register base. Used as a conservative lower bound
+    /// on a frame's live extent.
+    pub fn reg_high(self) -> u8 {
+        fn m(a: u8, b: u8) -> u8 {
+            a.max(b)
+        }
+        match self {
+            Instr::LoadK { dst, .. }
+            | Instr::LoadBool { dst, .. }
+            | Instr::GetUpval { dst, .. }
+            | Instr::NewTable { dst }
+            | Instr::Closure { dst, .. } => dst.saturating_add(1),
+            Instr::LoadNil { dst, n } => dst.saturating_add(n),
+            Instr::Move { dst, src } => m(dst, src).saturating_add(1),
+            Instr::SetUpval { src, .. } => src.saturating_add(1),
+            Instr::GetIndex { dst, obj, key } => m(m(dst, obj), key).saturating_add(1),
+            Instr::GetField { dst, obj, .. } => m(dst, obj).saturating_add(1),
+            Instr::SetIndex { obj, key, src } => m(m(obj, key), src).saturating_add(1),
+            Instr::SetField { obj, src, .. } => m(obj, src).saturating_add(1),
+            Instr::SetList { obj, base, n, .. } => {
+                m(obj, base.saturating_add(n.max(1))).saturating_add(1)
+            }
+            Instr::Arith { dst, lhs, rhs, .. } | Instr::Cmp { dst, lhs, rhs, .. } => {
+                m(m(dst, lhs), rhs).saturating_add(1)
+            }
+            Instr::Unary { dst, src, .. } => m(dst, src).saturating_add(1),
+            Instr::Concat { dst, base, n } => m(dst.saturating_add(1), base.saturating_add(n)),
+            Instr::Jump { .. } => 0,
+            Instr::Test { src, .. } => src.saturating_add(1),
+            Instr::Call { base, .. } | Instr::TailCall { base, .. } => base.saturating_add(1),
+            Instr::Return { base, n } => {
+                if n == 0 {
+                    base.saturating_add(1)
+                } else {
+                    base.saturating_add(n - 1).max(base.saturating_add(1))
+                }
+            }
+            Instr::Vararg { dst, .. } => dst.saturating_add(1),
+            // 255 is the unpatched `Close` placeholder.
+            Instr::Close { from: 255 } => 0,
+            Instr::Close { from } => from.saturating_add(1),
+            Instr::Tbc { reg } => reg.saturating_add(1),
+            Instr::ForPrep { base, .. } | Instr::ForLoop { base, .. } => base.saturating_add(4),
+            Instr::TForLoop { base, .. } => base.saturating_add(5),
+        }
+    }
+}
+
 /// How a closure captures each upvalue, relative to the enclosing function.
 #[derive(Clone, Copy, Debug)]
 pub enum UpvalDesc {
@@ -208,6 +260,13 @@ pub struct Proto {
     pub nparams: u8,
     pub is_vararg: bool,
     pub max_regs: u8,
+    /// Live register extent (relative to the frame base) while each
+    /// instruction executes, parallel to `code`. The GC marks only
+    /// `base .. base + reg_extent[pc]` for a frame, so registers that the
+    /// compiler has freed (dead temporaries) and slots of popped frames are
+    /// not roots. Instructions with an open multret field (`0`) extend past
+    /// this at run time; the VM accounts for those at the relevant GC points.
+    pub reg_extent: Vec<u8>,
     /// For error messages.
     pub name: String,
     /// Source line of the `function` keyword (0 for the main chunk).

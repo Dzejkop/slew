@@ -212,6 +212,11 @@ fn write_proto(w: &mut Writer, lua: &Lua, p: &Proto) {
             }
         }
     }
+
+    w.u32(p.reg_extent.len() as u32);
+    for e in &p.reg_extent {
+        w.u8(*e);
+    }
 }
 
 fn write_const(w: &mut Writer, lua: &Lua, v: Value) {
@@ -549,6 +554,12 @@ fn read_proto(r: &mut Reader, lua: &mut Lua) -> Result<Proto, String> {
         }
     }
 
+    let n = r.u32()? as usize;
+    let mut reg_extent = Vec::with_capacity(n);
+    for _ in 0..n {
+        reg_extent.push(r.u8()?);
+    }
+
     Ok(Proto {
         code,
         source: Rc::from(source),
@@ -560,6 +571,7 @@ fn read_proto(r: &mut Reader, lua: &mut Lua) -> Result<Proto, String> {
         nparams,
         is_vararg,
         max_regs,
+        reg_extent,
         name,
         linedefined,
         lastlinedefined,

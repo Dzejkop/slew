@@ -627,3 +627,172 @@ fn reinserting_visited_key_does_not_loop_forever() {
     );
     assert_eq!(vals[0], Value::Int(3));
 }
+
+// ---------------------------------------------------------------------------
+// Precise root collection: only the live register window of each frame is a
+// root, not the whole thread stack.
+// ---------------------------------------------------------------------------
+
+/// Reproduces the upstream `gc.lua` weak-kv probe that used to stall at
+/// `assert(i == 4)`: many collectable keys/values are created in the chunk's
+/// own registers, then dropped. After `collectgarbage` only the four live
+/// entries (three referenced locals plus one string pair) may remain, and
+/// clearing `x,y,z` must leave a single entry.
+#[test]
+fn precise_roots_weak_kv_drops_dead_temporaries() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local lim = 8
+         local a = {}; setmetatable(a, {__mode = 'kv'})
+         local x, y, z = {}, {}, {}
+         a[1], a[2], a[3] = x, y, z
+         a[string.rep('$', 11)] = string.rep('$', 11)
+         for i = 4, lim do a[i] = {} end
+         for i = 1, lim do a[{}] = i end
+         for i = 1, lim do local t = {}; a[t] = t end
+         collectgarbage()
+         local first = 0
+         for _ in pairs(a) do first = first + 1 end
+         x, y, z = nil
+         collectgarbage()
+         return first, next(a) == string.rep('$', 11)",
+    );
+    assert_eq!(vals[0], Value::Int(4), "live entries must not be collected");
+    assert_eq!(vals[1], Value::Bool(true), "dead entries must be reclaimed");
+}
+
+/// Values held only through a weak table are reclaimed, while a value that is
+/// still a live local of the collecting frame survives.
+#[test]
+fn precise_roots_keep_live_locals_and_drop_dead_temporaries() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local w = setmetatable({}, {__mode = 'v'})
+         local live = {}
+         w[1] = live
+         local function two() return {}, {} end
+         w[2], w[3] = two()   -- dead result temporaries linger above the top
+         collectgarbage()
+         local live_kept = w[1] == live
+         live = nil
+         collectgarbage()
+         local n = 0
+         for _ in pairs(w) do n = n + 1 end
+         return live_kept, n",
+    );
+    assert_eq!(vals[0], Value::Bool(true), "live local must survive");
+    assert_eq!(vals[1], Value::Int(0), "dead temps and dropped local gone");
+}
+
+/// A weakly referenced value is rooted by a local of a *suspended coroutine*
+/// frame, and dead temporaries of that frame are not.
+#[test]
+fn suspended_coroutine_roots_only_live_registers() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local w = setmetatable({}, {__mode = 'v'})
+         local co = coroutine.create(function()
+           local live = {}
+           w[1] = live
+           -- two dead result temporaries; only the first is clobbered by the
+           -- `yield()` call slot, so the second one would be over-retained by a
+           -- whole-stack scan.
+           w[2], w[3] = (function() return {}, {} end)()
+           coroutine.yield()
+           return live ~= nil
+         end)
+         coroutine.resume(co)
+         collectgarbage()
+         local live_kept = w[1] ~= nil
+         local dead_dropped = w[2] == nil and w[3] == nil
+         local ok, kept_after = coroutine.resume(co)
+         return live_kept, dead_dropped, kept_after",
+    );
+    assert_eq!(
+        vals[0],
+        Value::Bool(true),
+        "suspended frame local must survive"
+    );
+    assert_eq!(vals[1], Value::Bool(true), "dead temps must be reclaimed");
+    assert_eq!(
+        vals[2],
+        Value::Bool(true),
+        "coroutine must resume correctly"
+    );
+}
+
+/// A value passed through a proper tail call must stay rooted while the
+/// tail-called frame runs and collects.
+#[test]
+fn live_values_survive_under_tail_calls() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local w = setmetatable({}, {__mode = 'v'})
+         local function g(x)
+           collectgarbage()
+           return x
+         end
+         local function f()
+           local v = {}
+           w[1] = v
+           return g(v)       -- proper tail call replaces f's frame
+         end
+         local r = f()
+         return r ~= nil, w[1] ~= nil",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(
+        vals[1],
+        Value::Bool(true),
+        "tail-call value must stay rooted"
+    );
+}
+
+/// To-be-closed unwinding stages return values outside the register window;
+/// a `collectgarbage` from the `__close` handler must not lose them.
+#[test]
+fn return_values_survive_close_handler_collection() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local saved
+         local function f()
+           local x <close> = setmetatable({}, {
+             __close = function(_, err)
+               collectgarbage()
+               saved = {err}
+             end})
+           return 'payload'
+         end
+         local r = f()
+         return r, type(saved)",
+    );
+    assert_eq!(lua.display_value(vals[0]), "payload");
+    assert_eq!(lua.display_value(vals[1]), "table");
+}
+
+/// PUC treats `collectgarbage` as invalid while a collection cycle (including
+/// `__gc` handlers) is running and returns a single `nil`; the upstream
+/// `gc.lua` reentrancy check asserts this.
+#[test]
+fn collectgarbage_in_finalizer_returns_nil() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local res = true
+         local kind = 'unset'
+         setmetatable({}, {__gc = function()
+           local r = collectgarbage()
+           res = r
+           kind = type(r)
+         end})
+         collectgarbage()
+         return res == nil, kind",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(lua.display_value(vals[1]), "nil");
+}

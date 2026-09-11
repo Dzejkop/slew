@@ -109,6 +109,9 @@ struct FuncState {
     upval_attribs: Vec<Attrib>,
     /// Debug call names, parallel to `code` (see `Proto::call_names`).
     call_names: Vec<Option<(&'static str, Box<str>)>>,
+    /// Live register extent per instruction, parallel to `code` (see
+    /// `Proto::reg_extent`).
+    reg_extent: Vec<u8>,
     locals: Vec<LocalVar>,
     loops: Vec<LoopCtx>,
     gotos: Vec<PendingGoto>,
@@ -144,6 +147,7 @@ impl FuncState {
             upval_names: Vec::new(),
             upval_attribs: Vec::new(),
             call_names: Vec::new(),
+            reg_extent: Vec::new(),
             locals: Vec::new(),
             loops: Vec::new(),
             gotos: Vec::new(),
@@ -180,6 +184,7 @@ impl FuncState {
             nparams: self.nparams,
             is_vararg: self.is_vararg,
             max_regs: self.max_regs,
+            reg_extent: self.reg_extent,
             name: self.name,
             linedefined: self.linedefined,
             lastlinedefined,
@@ -243,6 +248,10 @@ impl<'h> Compiler<'h> {
         fs.code.push(i);
         fs.lines.push(fs.cur_line);
         fs.call_names.push(None);
+        // `free_reg` is the current allocation high-water: every operand the
+        // instruction can touch is already allocated, so this is a safe (and
+        // tight) live extent for the collector.
+        fs.reg_extent.push(fs.free_reg);
         fs.code.len() - 1
     }
 

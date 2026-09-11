@@ -158,12 +158,19 @@ through a capability the embedder installs explicitly.
   cannot select a partial amount of work. This keeps the upstream
   `repeat ... until collectgarbage("step", siz)` loops terminating.
   `collectgarbage` option #1 coerces numbers to strings (so
-  `collectgarbage(5)` reports `invalid option '5'`), as PUC does.
-- **Root precision caveat**: the collector scans each thread's whole stack,
-  including slots of popped frames and dead temporaries, because the VM does
-  not track a precise dynamic stack top. Values can therefore survive a
-  collection that PUC would have reclaimed (visible only through weak tables
-  or `__gc`); it is over-retention, never premature collection.
+  `collectgarbage(5)` reports `invalid option '5'`), as PUC does. Calling
+  `collectgarbage` from inside a `__gc` handler reports every option as
+  invalid and yields a single `nil` (PUC's "collection running" state), so a
+  reentrant call is a no-op.
+- **Root precision**: the compiler records, per instruction, the live register
+  extent at that point (`Proto::reg_extent`). The collector roots only
+  `frame.base .. base + reg_extent[pc]` for each frame — not the whole thread
+  stack — so slots of popped/tail-replaced frames and dead temporaries above
+  the current top are not roots. Open multret arguments of an intrinsic call
+  and return values staged while `__close` handlers run are rooted explicitly.
+  Suspended coroutines keep their live registers rooted across resume/yield.
+  This matches PUC's weak-table reclamation (upstream `gc.lua` passes) without
+  premature collection.
 - Binary chunks carry PUC 5.4's header and `LUAC_INT`/`LUAC_NUM` sentinels,
   but the proto body after them is slew-specific (see `src/stdlib/dump.rs`),
   so dumps round-trip through slew's `load` and are not portable to PUC's
