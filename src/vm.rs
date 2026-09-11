@@ -11,11 +11,11 @@
 //! protection boundary and error unwinding walks the frame vec.
 
 use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
-use crate::compiler::{compile, CompileError};
-use crate::parser::{parse, ParseError};
+use crate::compiler::{CompileError, compile};
+use crate::parser::{ParseError, parse};
 use crate::value::{
-    fmt_number, float_to_exact_int, ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId,
-    UpvalId, Value,
+    ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId, UpvalId, Value, float_to_exact_int,
+    fmt_number,
 };
 use std::fmt;
 use std::rc::Rc;
@@ -113,6 +113,16 @@ pub(crate) enum Intrinsic {
     WrapResume(ThreadId),
     IsYieldable,
     Running,
+    DebugGetinfo,
+    DebugTraceback,
+    DebugGetupvalue,
+    DebugSetupvalue,
+    DebugUpvalueid,
+    DebugUpvaluejoin,
+    DebugGetmetatable,
+    DebugSetmetatable,
+    DebugGetregistry,
+    DebugGethook,
 }
 
 pub(crate) enum NativeKind {
@@ -164,7 +174,12 @@ enum Pending {
     CallClose { v: Value, err: Value },
     /// Final step of error recovery: deliver `false, err` (or run the
     /// xpcall handler) at the protected call's result slots.
-    DeliverError { ret_to: usize, nres: u8, err: Value, handler: Option<Value> },
+    DeliverError {
+        ret_to: usize,
+        nres: u8,
+        err: Value,
+        handler: Option<Value>,
+    },
     /// Final step of a return that had to run `__close` handlers first.
     FinishReturn { start: usize, count: usize },
     /// Final step of a tail call into a native/intrinsic: the callee's
@@ -191,6 +206,8 @@ struct Frame {
     /// Registers holding active to-be-closed variables (ascending).
     tbc: Vec<u8>,
     varargs: Vec<Value>,
+    /// True if this frame was entered via a proper tail call.
+    tailcall: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -361,6 +378,10 @@ pub struct Lua {
     /// Thread being dispatched right now (its `Thread` is temporarily
     /// moved out of the arena).
     pub(crate) current_thread: ThreadId,
+    /// Per-type metatables set through `debug.setmetatable` for values that
+    /// cannot carry a per-value metatable: nil, boolean, number, function,
+    /// thread (in that slot order). Tables and strings use their own storage.
+    pub(crate) type_metas: [Option<TableId>; 5],
     /// Set by resume/yield intrinsics; the dispatch loop performs the
     /// actual thread switch.
     switch_to: Option<ThreadId>,
@@ -406,7 +427,10 @@ impl Default for Lua {
 impl Lua {
     pub fn new() -> Self {
         let mut strings = Strings::default();
-        let mm_names = MM_NAMES.iter().map(|n| strings.intern_fixed(n.as_bytes())).collect();
+        let mm_names = MM_NAMES
+            .iter()
+            .map(|n| strings.intern_fixed(n.as_bytes()))
+            .collect();
         let mut lua = Lua {
             strings,
             tables: vec![Table::default()],
@@ -418,6 +442,7 @@ impl Lua {
             string_meta: None,
             mm_names,
             current_thread: ThreadId(u32::MAX),
+            type_metas: [None; 5],
             switch_to: None,
             rng: [0; 4],
             tables_live: vec![true],
@@ -439,10 +464,14 @@ impl Lua {
                 consts: Vec::new(),
                 protos: Vec::new(),
                 upvals: Vec::new(),
+                upval_names: Vec::new(),
                 nparams: 0,
                 is_vararg: false,
                 max_regs: 0,
                 name: String::new(),
+                linedefined: 0,
+                lastlinedefined: 0,
+                call_names: Vec::new(),
             }),
             allocs_since_gc: 0,
             str_bytes_at_gc: 0,
@@ -497,7 +526,10 @@ impl Lua {
     /// [`Execution::step`] is called.
     pub fn execute(&mut self, chunk: &Chunk) -> Execution {
         let env = self.new_upval(Upval::Closed(Value::Table(self.globals)));
-        let cid = self.alloc_closure(LuaClosure { proto: chunk.proto.clone(), upvals: vec![env] });
+        let cid = self.alloc_closure(LuaClosure {
+            proto: chunk.proto.clone(),
+            upvals: vec![env],
+        });
         let mut th = Thread::default();
         th.stack.resize(chunk.proto.max_regs as usize, Value::Nil);
         th.frames.push(Frame {
@@ -513,11 +545,17 @@ impl Lua {
             pending: Vec::new(),
             tbc: Vec::new(),
             varargs: Vec::new(),
+            tailcall: false,
         });
         let tid = self.alloc_thread(th);
         // GC root for as long as the execution is live
         self.exec_roots.insert(tid.0, tid.0);
-        Execution { thread: tid, current: tid, debt: 0, finished: false }
+        Execution {
+            thread: tid,
+            current: tid,
+            debt: 0,
+            finished: false,
+        }
     }
 
     /// Instantiates a compiled chunk as a function value whose `_ENV` is
@@ -572,7 +610,10 @@ impl Lua {
 
     pub(crate) fn add_native_kind(&mut self, name: &str, kind: NativeKind) -> Value {
         self.allocs_since_gc += 1;
-        let n = Native { name: name.into(), kind };
+        let n = Native {
+            name: name.into(),
+            kind,
+        };
         let id = match self.natives_free.pop() {
             Some(i) => {
                 self.natives[i as usize] = n;
@@ -751,8 +792,397 @@ impl Lua {
         match v {
             Value::Table(t) => self.tables[t.0 as usize].metatable,
             Value::Str(_) => self.string_meta,
-            _ => None,
+            Value::Nil => self.type_metas[0],
+            Value::Bool(_) => self.type_metas[1],
+            Value::Int(_) | Value::Float(_) => self.type_metas[2],
+            Value::Closure(_) | Value::Native(_) => self.type_metas[3],
+            Value::Thread(_) => self.type_metas[4],
         }
+    }
+
+    /// Raw metatable assignment (no `__metatable` guard), used by
+    /// `debug.setmetatable`. Tables and strings have per-value storage; all
+    /// other types share a per-type metatable.
+    pub(crate) fn set_raw_metatable(&mut self, v: Value, mt: Option<TableId>) {
+        match v {
+            Value::Table(t) => self.tables[t.0 as usize].metatable = mt,
+            Value::Str(_) => self.string_meta = mt,
+            Value::Nil => self.type_metas[0] = mt,
+            Value::Bool(_) => self.type_metas[1] = mt,
+            Value::Int(_) | Value::Float(_) => self.type_metas[2] = mt,
+            Value::Closure(_) | Value::Native(_) => self.type_metas[3] = mt,
+            Value::Thread(_) => self.type_metas[4] = mt,
+        }
+    }
+
+    // ---- debug library (intrinsics) ----
+
+    /// `debug.getinfo([thread,] f [, what])`.
+    fn debug_getinfo(
+        &mut self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        f: Value,
+        what: Value,
+    ) -> Result<Value, String> {
+        let what: Vec<u8> = match what {
+            Value::Nil => b"flnStu".to_vec(),
+            Value::Str(s) => self.strings.get(s).to_vec(),
+            _ => return Err("bad argument to 'getinfo' (string expected)".into()),
+        };
+        for &c in &what {
+            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L') {
+                return Err("bad argument 'what' to 'getinfo' (invalid option)".into());
+            }
+        }
+        let t = self.new_table();
+        let Value::Table(tid) = t else { unreachable!() };
+        match f {
+            Value::Closure(cid) => {
+                let proto = self.closures[cid.0 as usize].proto.clone();
+                self.fill_lua_info(tid, &proto, Value::Closure(cid), -1, false, None, &what);
+            }
+            Value::Native(_) => self.fill_native_info(tid, f, &what),
+            Value::Int(level) => {
+                if !self.fill_level_info(tid, th, target, level, &what)? {
+                    return Ok(Value::Nil);
+                }
+            }
+            Value::Float(level) => {
+                if !self.fill_level_info(tid, th, target, level as i64, &what)? {
+                    return Ok(Value::Nil);
+                }
+            }
+            _ => return Err("bad argument to 'getinfo' (function or level expected)".into()),
+        }
+        Ok(t)
+    }
+
+    fn fill_level_info(
+        &mut self,
+        tid: TableId,
+        th: &Thread,
+        target: Option<ThreadId>,
+        level: i64,
+        what: &[u8],
+    ) -> Result<bool, String> {
+        let snap = self.debug_level_snapshot(th, target, level);
+        let Some(snap) = snap else {
+            return Ok(false);
+        };
+        match snap {
+            LevelFrame::Native => {
+                let func = self.debug_getinfo_fn();
+                self.fill_native_info(tid, func, what);
+            }
+            LevelFrame::Lua {
+                proto,
+                pc,
+                closure,
+                tailcall,
+                name,
+            } => {
+                let cur = proto.lines.get(pc.wrapping_sub(1)).copied().unwrap_or(0) as i64;
+                self.fill_lua_info(
+                    tid,
+                    &proto,
+                    Value::Closure(closure),
+                    cur,
+                    tailcall,
+                    name,
+                    what,
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Frame at `level` in `target` (or the running thread), or the C
+    /// function `getinfo` at current level 0. `None` when out of range.
+    fn debug_level_snapshot(
+        &self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        level: i64,
+    ) -> Option<LevelFrame> {
+        let current = target.is_none() || target == Some(self.current_thread);
+        if level < 0 {
+            return None;
+        }
+        let frames: &[Frame] = match target {
+            Some(t) if t != self.current_thread => {
+                self.threads.get(t.0 as usize).map(|x| &x.frames[..])
+            }
+            _ => Some(&th.frames[..]),
+        }?;
+        let level = level as usize;
+        let idx = if current {
+            if level == 0 {
+                return Some(LevelFrame::Native);
+            }
+            if level > frames.len() {
+                return None;
+            }
+            frames.len() - level
+        } else {
+            if level >= frames.len() {
+                return None;
+            }
+            frames.len() - 1 - level
+        };
+        let fr = frames.get(idx)?;
+        let name = if idx > 0 {
+            let caller = &frames[idx - 1];
+            caller
+                .proto
+                .call_names
+                .get(caller.pc.wrapping_sub(1))
+                .cloned()
+                .flatten()
+        } else {
+            None
+        };
+        Some(LevelFrame::Lua {
+            proto: fr.proto.clone(),
+            pc: fr.pc,
+            closure: fr.closure,
+            tailcall: fr.tailcall,
+            name,
+        })
+    }
+
+    fn info_set(&mut self, tid: TableId, name: &str, v: Value) {
+        let k = self.new_string(name.as_bytes());
+        self.tables[tid.0 as usize].set(k, v).unwrap();
+    }
+
+    fn fill_native_info(&mut self, tid: TableId, func: Value, what: &[u8]) {
+        if what.contains(&b'S') {
+            let src = self.new_string(b"=[C]");
+            self.info_set(tid, "source", src);
+            let ss = self.new_string(b"[C]");
+            self.info_set(tid, "short_src", ss);
+            self.info_set(tid, "linedefined", Value::Int(-1));
+            self.info_set(tid, "lastlinedefined", Value::Int(-1));
+            let w = self.new_string(b"C");
+            self.info_set(tid, "what", w);
+        }
+        if what.contains(&b'l') {
+            self.info_set(tid, "currentline", Value::Int(-1));
+        }
+        if what.contains(&b'u') {
+            self.info_set(tid, "nups", Value::Int(0));
+            self.info_set(tid, "nparams", Value::Int(0));
+            self.info_set(tid, "isvararg", Value::Bool(true));
+        }
+        if what.contains(&b't') {
+            self.info_set(tid, "istailcall", Value::Bool(false));
+        }
+        if what.contains(&b'n') {
+            self.info_set(tid, "name", Value::Nil);
+            let nw = self.new_string(b"");
+            self.info_set(tid, "namewhat", nw);
+        }
+        if what.contains(&b'f') {
+            self.info_set(tid, "func", func);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_lua_info(
+        &mut self,
+        tid: TableId,
+        proto: &Proto,
+        func: Value,
+        currentline: i64,
+        istailcall: bool,
+        name: Option<(&'static str, Box<str>)>,
+        what: &[u8],
+    ) {
+        if what.contains(&b'S') {
+            let src = self.new_string(proto.source.as_bytes());
+            self.info_set(tid, "source", src);
+            let ss = self.new_string(short_source(&proto.source).as_bytes());
+            self.info_set(tid, "short_src", ss);
+            self.info_set(tid, "linedefined", Value::Int(proto.linedefined as i64));
+            self.info_set(
+                tid,
+                "lastlinedefined",
+                Value::Int(proto.lastlinedefined as i64),
+            );
+            let w = if proto.linedefined == 0 {
+                "main"
+            } else {
+                "Lua"
+            };
+            let wv = self.new_string(w.as_bytes());
+            self.info_set(tid, "what", wv);
+        }
+        if what.contains(&b'l') {
+            self.info_set(tid, "currentline", Value::Int(currentline));
+        }
+        if what.contains(&b'u') {
+            self.info_set(tid, "nups", Value::Int(proto.upvals.len() as i64));
+            self.info_set(tid, "nparams", Value::Int(proto.nparams as i64));
+            self.info_set(tid, "isvararg", Value::Bool(proto.is_vararg));
+        }
+        if what.contains(&b't') {
+            self.info_set(tid, "istailcall", Value::Bool(istailcall));
+        }
+        if what.contains(&b'n') {
+            let namev = match &name {
+                Some((_, nm)) => self.new_string(nm.as_bytes()),
+                None => Value::Nil,
+            };
+            self.info_set(tid, "name", namev);
+            let nw = self.new_string(name.map_or("", |(nw, _)| nw).as_bytes());
+            self.info_set(tid, "namewhat", nw);
+        }
+        if what.contains(&b'f') {
+            self.info_set(tid, "func", func);
+        }
+        if what.contains(&b'L') {
+            let t = self.new_table();
+            let Value::Table(at) = t else { unreachable!() };
+            for &line in &proto.lines {
+                self.tables[at.0 as usize]
+                    .set(Value::Int(line as i64), Value::Bool(true))
+                    .ok();
+            }
+            self.info_set(tid, "activelines", t);
+        }
+    }
+
+    fn debug_getinfo_fn(&mut self) -> Value {
+        let d = self.get_global("debug");
+        let k = self.new_string(b"getinfo");
+        self.table_get(d, k)
+    }
+
+    /// `debug.traceback([thread,] [message [, level]])`.
+    fn debug_traceback(
+        &mut self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        message: Value,
+        level: i64,
+    ) -> Value {
+        let (msg, has_msg) = match message {
+            Value::Nil => (String::new(), false),
+            Value::Str(s) => (self.strings.get_str_lossy(s).into_owned(), true),
+            other => return other,
+        };
+        let current = target.is_none() || target == Some(self.current_thread);
+        let frames: &[Frame] = match target {
+            Some(t) if t != self.current_thread => match self.threads.get(t.0 as usize) {
+                Some(x) => &x.frames,
+                None => &[],
+            },
+            _ => &th.frames,
+        };
+        let mut out = String::new();
+        if has_msg {
+            out.push_str(&msg);
+            out.push('\n');
+        }
+        out.push_str("stack traceback:");
+        let first = if current {
+            frames.len().saturating_sub(level.max(1) as usize)
+        } else {
+            frames.len().saturating_sub(1 + level.max(0) as usize)
+        };
+        if frames.is_empty() {
+            return self.new_string(out.as_bytes());
+        }
+        for idx in (0..=first).rev() {
+            let fr = &frames[idx];
+            let line = fr
+                .proto
+                .lines
+                .get(fr.pc.wrapping_sub(1))
+                .copied()
+                .unwrap_or(0);
+            let src = short_source(&fr.proto.source);
+            out.push_str(&format!("\n\t{src}:{line}: in "));
+            let name = if idx > 0 {
+                let caller = &frames[idx - 1];
+                caller
+                    .proto
+                    .call_names
+                    .get(caller.pc.wrapping_sub(1))
+                    .cloned()
+                    .flatten()
+            } else {
+                None
+            };
+            match name {
+                Some((nw, nm)) => out.push_str(&format!("function '{nm}' ({nw})")),
+                None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
+                None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
+            }
+        }
+        self.new_string(out.as_bytes())
+    }
+
+    fn debug_getupvalue(&mut self, th: &Thread, f: Value, n: i64) -> Option<(String, Value)> {
+        let Value::Closure(cid) = f else { return None };
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return None;
+        }
+        let name = c
+            .proto
+            .upval_names
+            .get(n as usize - 1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(...)".to_string());
+        let uid = c.upvals[n as usize - 1];
+        let val = self.read_upval(self.current_thread, th, uid);
+        Some((name, val))
+    }
+
+    fn debug_setupvalue(&mut self, th: &mut Thread, f: Value, n: i64, v: Value) -> Option<String> {
+        let Value::Closure(cid) = f else { return None };
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return None;
+        }
+        let name = c
+            .proto
+            .upval_names
+            .get(n as usize - 1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(...)".to_string());
+        let uid = c.upvals[n as usize - 1];
+        let tid = self.current_thread;
+        self.write_upval(tid, th, uid, v);
+        Some(name)
+    }
+
+    fn debug_upvalueid(&self, f: Value, n: i64) -> Value {
+        let Value::Closure(cid) = f else {
+            return Value::Nil;
+        };
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return Value::Nil;
+        }
+        Value::Int(c.upvals[n as usize - 1].0 as i64)
+    }
+
+    fn debug_upvaluejoin(&mut self, f1: Value, n1: i64, f2: Value, n2: i64) -> Result<(), String> {
+        let (Value::Closure(c1), Value::Closure(c2)) = (f1, f2) else {
+            return Err("bad argument to 'upvaluejoin' (function expected)".into());
+        };
+        if n1 < 1 || n1 as usize > self.closures[c1.0 as usize].upvals.len() {
+            return Err("bad argument #2 to 'upvaluejoin' (invalid upvalue index)".into());
+        }
+        if n2 < 1 || n2 as usize > self.closures[c2.0 as usize].upvals.len() {
+            return Err("bad argument #4 to 'upvaluejoin' (invalid upvalue index)".into());
+        }
+        let uid = self.closures[c2.0 as usize].upvals[n2 as usize - 1];
+        self.closures[c1.0 as usize].upvals[n1 as usize - 1] = uid;
+        Ok(())
     }
 
     /// Metatable field lookup by name (for natives like setmetatable).
@@ -768,9 +1198,7 @@ impl Lua {
 
     pub(crate) fn metamethod(&self, v: Value, mm: Mm) -> Value {
         match self.get_metatable(v) {
-            Some(mt) => {
-                self.tables[mt.0 as usize].get(Value::Str(self.mm_names[mm as usize]))
-            }
+            Some(mt) => self.tables[mt.0 as usize].get(Value::Str(self.mm_names[mm as usize])),
             None => Value::Nil,
         }
     }
@@ -829,9 +1257,8 @@ impl Lua {
                         // errors the frames are already gone and the
                         // dispatcher's `root_line` stands)
                         if root_line.is_none() && th.parent.is_none() {
-                            root_line = Some(
-                                th.frames.first().map(frame_line).unwrap_or(e.root_line),
-                            );
+                            root_line =
+                                Some(th.frames.first().map(frame_line).unwrap_or(e.root_line));
                         }
                         // error escaped this thread entirely; close its open
                         // upvalues (closures may outlive the thread) and kill it
@@ -870,7 +1297,7 @@ impl Lua {
                             }
                         }
                     }
-                },
+                }
             }
         }
     }
@@ -992,7 +1419,12 @@ impl Lua {
                         self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel)?;
                     }
                 }
-                Pending::DeliverError { ret_to, nres, err, handler } => match handler {
+                Pending::DeliverError {
+                    ret_to,
+                    nres,
+                    err,
+                    handler,
+                } => match handler {
                     None => {
                         place_results(th, ret_to, nres, &[Value::Bool(false), err]);
                     }
@@ -1087,13 +1519,22 @@ impl Lua {
                 th.stack[base + dst as usize] = self.new_table();
                 self.maybe_gc(tid, th)?;
             }
-            Instr::SetList { obj, base: b, n, start } => {
+            Instr::SetList {
+                obj,
+                base: b,
+                n,
+                start,
+            } => {
                 let t = match th.stack[base + obj as usize] {
                     Value::Table(t) => t,
                     _ => unreachable!("SetList on non-table"),
                 };
                 let first = base + b as usize;
-                let count = if n == 0 { th.top.saturating_sub(first) } else { n as usize };
+                let count = if n == 0 {
+                    th.top.saturating_sub(first)
+                } else {
+                    n as usize
+                };
                 *fuel -= count as i64;
                 for i in 0..count {
                     let v = th.stack[first + i];
@@ -1110,6 +1551,41 @@ impl Lua {
                     Err(msg) => {
                         let mm = self.binary_mm(a, b, mm_of_arith(op));
                         if mm == Value::Nil {
+                            let msg = if msg == "number has no integer representation"
+                                && matches!(
+                                    op,
+                                    ArithOp::BAnd
+                                        | ArithOp::BOr
+                                        | ArithOp::BXor
+                                        | ArithOp::Shl
+                                        | ArithOp::Shr
+                                ) {
+                                // PUC-style varinfo: name the offending operand
+                                // when it was loaded from a constant field.
+                                let reg = if matches!(a, Value::Float(_)) {
+                                    Some(lhs)
+                                } else if matches!(b, Value::Float(_)) {
+                                    Some(rhs)
+                                } else {
+                                    None
+                                };
+                                let f = th.frames.last().unwrap();
+                                match reg.and_then(|r| {
+                                    name_for_register(
+                                        &self.strings,
+                                        &f.proto,
+                                        f.pc.wrapping_sub(1),
+                                        r,
+                                    )
+                                }) {
+                                    Some(v) => {
+                                        format!("number ({v}) has no integer representation")
+                                    }
+                                    None => msg,
+                                }
+                            } else {
+                                msg
+                            };
                             return Err(self.rt_err(th, msg));
                         }
                         self.call_value(
@@ -1145,7 +1621,11 @@ impl Lua {
                     jump(th, off);
                 }
             }
-            Instr::Call { base: b, nargs, nres } => {
+            Instr::Call {
+                base: b,
+                nargs,
+                nres,
+            } => {
                 let func_abs = base + b as usize;
                 let argc = if nargs == 0 {
                     th.top.saturating_sub(func_abs + 1)
@@ -1212,18 +1692,27 @@ impl Lua {
                     // snapshot the value window now (closes may clobber top)
                     let fb = th.frames.last().unwrap().base;
                     let start = fb + b as usize;
-                    let count =
-                        if n == 0 { th.top.saturating_sub(start) } else { (n - 1) as usize };
+                    let count = if n == 0 {
+                        th.top.saturating_sub(start)
+                    } else {
+                        (n - 1) as usize
+                    };
                     let f = th.frames.last_mut().unwrap();
                     f.pending.push(Pending::FinishReturn { start, count });
-                    f.pending.push(Pending::CloseTbc { from: 0, err: Value::Nil });
+                    f.pending.push(Pending::CloseTbc {
+                        from: 0,
+                        err: Value::Nil,
+                    });
                     return Ok(Flow::Continue);
                 }
                 let frame = th.frames.pop().unwrap();
                 self.close_upvals(th, frame.base);
                 let start = frame.base + b as usize;
-                let count =
-                    if n == 0 { th.top.saturating_sub(start) } else { (n - 1) as usize };
+                let count = if n == 0 {
+                    th.top.saturating_sub(start)
+                } else {
+                    (n - 1) as usize
+                };
                 if th.frames.is_empty() {
                     let vals = th.stack[start..start + count].to_vec();
                     th.stack.clear();
@@ -1286,7 +1775,7 @@ impl Lua {
                                 "variable of a <close> declaration got a non-closable {} value",
                                 v.type_name()
                             ),
-                        ))
+                        ));
                     }
                 }
             }
@@ -1364,8 +1853,16 @@ impl Lua {
 
     fn do_call(&mut self, th: &mut Thread, fuel: &mut i64, spec: CallSpec) -> Result<(), VmError> {
         *fuel -= 2;
-        let CallSpec { mut func_abs, mut argc, ret_to, nres, shape, protected, handler, native_caller } =
-            spec;
+        let CallSpec {
+            mut func_abs,
+            mut argc,
+            ret_to,
+            nres,
+            shape,
+            protected,
+            handler,
+            native_caller,
+        } = spec;
         for _ in 0..MAX_META_CHAIN {
             match th.stack[func_abs] {
                 Value::Closure(cid) => {
@@ -1398,6 +1895,7 @@ impl Lua {
                         pending: Vec::new(),
                         tbc: Vec::new(),
                         varargs,
+                        tailcall: false,
                     });
                     return Ok(());
                 }
@@ -1418,10 +1916,8 @@ impl Lua {
                     // __call: f(args...) becomes mm(f, args...)
                     let mm = self.metamethod(other, Mm::Call);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to call a {} value", other.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
                     }
                     let wb = scratch_base(th).max(func_abs + 1 + argc);
                     ensure_len(&mut th.stack, wb + 2 + argc);
@@ -1451,10 +1947,8 @@ impl Lua {
                     // __call: f(args...) becomes mm(f, args...)
                     let mm = self.metamethod(other, Mm::Call);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to call a {} value", other.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
                     }
                     let wb = scratch_base(th).max(func_abs + 1 + argc);
                     ensure_len(&mut th.stack, wb + 2 + argc);
@@ -1523,6 +2017,7 @@ impl Lua {
             pending: Vec::new(),
             tbc: Vec::new(),
             varargs,
+            tailcall: true,
         });
         Ok(())
     }
@@ -1580,7 +2075,11 @@ impl Lua {
         native_caller: bool,
     ) -> Result<(), VmError> {
         let arg = |th: &Thread, i: usize| -> Value {
-            if i < argc { th.stack[func_abs + 1 + i] } else { Value::Nil }
+            if i < argc {
+                th.stack[func_abs + 1 + i]
+            } else {
+                Value::Nil
+            }
         };
         match i {
             Intrinsic::Error => {
@@ -1598,7 +2097,11 @@ impl Lua {
                         let fidx = th.frames.len().saturating_sub(level as usize);
                         let (line, src) = match th.frames.get(fidx) {
                             Some(f) => (
-                                f.proto.lines.get(f.pc.wrapping_sub(1)).copied().unwrap_or(0),
+                                f.proto
+                                    .lines
+                                    .get(f.pc.wrapping_sub(1))
+                                    .copied()
+                                    .unwrap_or(0),
                                 f.proto.source.clone(),
                             ),
                             None => (line_of(th), th.frames.last().unwrap().proto.source.clone()),
@@ -1608,11 +2111,18 @@ impl Lua {
                     }
                     _ => v,
                 };
-                Err(VmError { val: ErrVal::Val(val), line: line_of(th), root_line: 0, source: None })
+                Err(VmError {
+                    val: ErrVal::Val(val),
+                    line: line_of(th),
+                    root_line: 0,
+                    source: None,
+                })
             }
             Intrinsic::Assert => {
                 if argc == 0 {
-                    return Err(self.rt_err(th, "bad argument #1 to 'assert' (value expected)".into()));
+                    return Err(
+                        self.rt_err(th, "bad argument #1 to 'assert' (value expected)".into())
+                    );
                 }
                 if arg(th, 0).truthy() {
                     let res = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
@@ -1665,10 +2175,9 @@ impl Lua {
             }
             Intrinsic::Xpcall => {
                 if argc < 2 {
-                    return Err(self.rt_err(
-                        th,
-                        "bad argument #2 to 'xpcall' (value expected)".into(),
-                    ));
+                    return Err(
+                        self.rt_err(th, "bad argument #2 to 'xpcall' (value expected)".into())
+                    );
                 }
                 let handler = arg(th, 1);
                 // rebuild a contiguous window: [f, args...] (handler sits
@@ -1678,7 +2187,8 @@ impl Lua {
                 let n_args = argc - 2;
                 ensure_len(&mut th.stack, wb + 1 + n_args);
                 th.stack[wb] = f;
-                th.stack.copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
+                th.stack
+                    .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
                 self.protected_call(th, fuel, wb, n_args, ret_to, nres, Some(handler))
             }
             Intrinsic::Resume => {
@@ -1701,9 +2211,7 @@ impl Lua {
             }
             Intrinsic::Yield => {
                 let Some(parent) = th.parent else {
-                    return Err(
-                        self.rt_err(th, "attempt to yield from outside a coroutine".into())
-                    );
+                    return Err(self.rt_err(th, "attempt to yield from outside a coroutine".into()));
                 };
                 *fuel -= 3;
                 let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
@@ -1726,6 +2234,121 @@ impl Lua {
                 let cur = Value::Thread(self.current_thread);
                 let is_main = Value::Bool(th.parent.is_none());
                 place_shaped(th, ret_to, nres, shape, &[cur, is_main]);
+                Ok(())
+            }
+            Intrinsic::DebugGetinfo => {
+                let a0 = arg(th, 0);
+                let (target, base) = match a0 {
+                    Value::Thread(t) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let f = arg(th, base);
+                let what = arg(th, base + 1);
+                let r = self
+                    .debug_getinfo(th, target, f, what)
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugTraceback => {
+                let a0 = arg(th, 0);
+                let (target, base) = match a0 {
+                    Value::Thread(t) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let message = arg(th, base);
+                let level = match arg(th, base + 1) {
+                    Value::Int(l) => l,
+                    Value::Float(f) => f as i64,
+                    _ => {
+                        if target.is_some() {
+                            0
+                        } else {
+                            1
+                        }
+                    }
+                };
+                let r = self.debug_traceback(th, target, message, level);
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugGetupvalue => {
+                let f = arg(th, 0);
+                let n = debug_index(arg(th, 1));
+                match self.debug_getupvalue(th, f, n) {
+                    Some((name, val)) => {
+                        let nv = self.new_string(name.as_bytes());
+                        place_shaped(th, ret_to, nres, shape, &[nv, val]);
+                    }
+                    None => place_shaped(th, ret_to, nres, shape, &[Value::Nil]),
+                }
+                Ok(())
+            }
+            Intrinsic::DebugSetupvalue => {
+                let f = arg(th, 0);
+                let n = debug_index(arg(th, 1));
+                let v = arg(th, 2);
+                match self.debug_setupvalue(th, f, n, v) {
+                    Some(name) => {
+                        let nv = self.new_string(name.as_bytes());
+                        place_shaped(th, ret_to, nres, shape, &[nv]);
+                    }
+                    None => place_shaped(th, ret_to, nres, shape, &[Value::Nil]),
+                }
+                Ok(())
+            }
+            Intrinsic::DebugUpvalueid => {
+                let f = arg(th, 0);
+                let n = debug_index(arg(th, 1));
+                let r = self.debug_upvalueid(f, n);
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugUpvaluejoin => {
+                let f1 = arg(th, 0);
+                let n1 = debug_index(arg(th, 1));
+                let f2 = arg(th, 2);
+                let n2 = debug_index(arg(th, 3));
+                self.debug_upvaluejoin(f1, n1, f2, n2)
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &[]);
+                Ok(())
+            }
+            Intrinsic::DebugGetmetatable => {
+                let v = arg(th, 0);
+                let r = match self.get_metatable(v) {
+                    Some(mt) => Value::Table(mt),
+                    None => Value::Nil,
+                };
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugSetmetatable => {
+                let v = arg(th, 0);
+                let mt = match arg(th, 1) {
+                    Value::Nil => None,
+                    Value::Table(t) => Some(t),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                self.set_raw_metatable(v, mt);
+                place_shaped(th, ret_to, nres, shape, &[v]);
+                Ok(())
+            }
+            Intrinsic::DebugGetregistry => {
+                place_shaped(th, ret_to, nres, shape, &[Value::Table(self.globals)]);
+                Ok(())
+            }
+            Intrinsic::DebugGethook => {
+                // No hooks are supported (tier c); report "no hook".
+                place_shaped(th, ret_to, nres, shape, &[Value::Nil]);
                 Ok(())
             }
         }
@@ -1764,7 +2387,13 @@ impl Lua {
             }
             CoStatus::Start | CoStatus::Suspended => {
                 *fuel -= 3;
-                let rr = ResumeRet { ret_to, nres, shape, status_bool: !wrap, wrap };
+                let rr = ResumeRet {
+                    ret_to,
+                    nres,
+                    shape,
+                    status_bool: !wrap,
+                    wrap,
+                };
                 {
                     let co_th = &mut self.threads[co.0 as usize];
                     co_th.resume_ret = Some(rr);
@@ -1805,6 +2434,7 @@ impl Lua {
                                 pending: Vec::new(),
                                 tbc: Vec::new(),
                                 varargs,
+                                tailcall: false,
                             });
                         }
                         Value::Native(nid) => {
@@ -1841,8 +2471,10 @@ impl Lua {
                     // deliver resume args as the pending yield's results
                     let co_th = &mut self.threads[co.0 as usize];
                     co_th.status = CoStatus::Running;
-                    let (yret, ynres, yshape) =
-                        co_th.yield_ret.take().expect("suspended thread has yield_ret");
+                    let (yret, ynres, yshape) = co_th
+                        .yield_ret
+                        .take()
+                        .expect("suspended thread has yield_ret");
                     place_shaped(co_th, yret, ynres, yshape, args);
                 }
                 th.status = CoStatus::Normal;
@@ -1942,10 +2574,8 @@ impl Lua {
                 _ => {
                     let mm = self.metamethod(cur, Mm::Index);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to index a {} value", cur.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
                     }
                     mm
                 }
@@ -1992,10 +2622,8 @@ impl Lua {
                 _ => {
                     let mm = self.metamethod(cur, Mm::NewIndex);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to index a {} value", cur.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
                     }
                     mm
                 }
@@ -2024,7 +2652,11 @@ impl Lua {
     ) -> Result<(), VmError> {
         match op {
             CmpOp::Eq | CmpOp::Ne => {
-                let shape = if op == CmpOp::Eq { RetShape::ToBool } else { RetShape::ToNotBool };
+                let shape = if op == CmpOp::Eq {
+                    RetShape::ToBool
+                } else {
+                    RetShape::ToNotBool
+                };
                 if values_equal(a, b) {
                     th.stack[dst_abs] = Value::Bool(op == CmpOp::Eq);
                     return Ok(());
@@ -2047,8 +2679,7 @@ impl Lua {
                         Ok(())
                     }
                     None => {
-                        let mm =
-                            self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
+                        let mm = self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
                         if mm == Value::Nil {
                             return Err(self.rt_err(
                                 th,
@@ -2086,7 +2717,11 @@ impl Lua {
                     if mm == Value::Nil {
                         continue; // metatable changed since Tbc; skip
                     }
-                    th.frames.last_mut().unwrap().pending.push(Pending::CloseTbc { from, err });
+                    th.frames
+                        .last_mut()
+                        .unwrap()
+                        .pending
+                        .push(Pending::CloseTbc { from, err });
                     let scratch = scratch_base(th);
                     return self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel);
                 }
@@ -2147,7 +2782,14 @@ impl Lua {
             let (ret_abs, pending) = if n - 1 == 1 {
                 (base + dst as usize, None)
             } else {
-                (first + n - 2, Some(Pending::Concat { dst, base: b, n: (n - 1) as u8 }))
+                (
+                    first + n - 2,
+                    Some(Pending::Concat {
+                        dst,
+                        base: b,
+                        n: (n - 1) as u8,
+                    }),
+                )
             };
             if let Some(p) = pending {
                 th.frames.last_mut().unwrap().pending.push(p);
@@ -2240,22 +2882,34 @@ impl Lua {
                 Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
                     Some(Value::Int(i)) => (Some(Value::Int(i.wrapping_neg())), None),
                     Some(Value::Float(f)) => (Some(Value::Float(-f)), None),
-                    _ => (None, Some((Mm::Unm, format!(
-                        "attempt to perform arithmetic on a {} value",
-                        v.type_name()
-                    )))),
+                    _ => (
+                        None,
+                        Some((
+                            Mm::Unm,
+                            format!("attempt to perform arithmetic on a {} value", v.type_name()),
+                        )),
+                    ),
                 },
-                _ => (None, Some((Mm::Unm, format!(
-                    "attempt to perform arithmetic on a {} value",
-                    v.type_name()
-                )))),
+                _ => (
+                    None,
+                    Some((
+                        Mm::Unm,
+                        format!("attempt to perform arithmetic on a {} value", v.type_name()),
+                    )),
+                ),
             },
             UnaryOp::BNot => match to_int(v) {
                 Some(i) => (Some(Value::Int(!i)), None),
-                None => (None, Some((Mm::BNot, format!(
-                    "attempt to perform bitwise operation on a {} value",
-                    v.type_name()
-                )))),
+                None => (
+                    None,
+                    Some((
+                        Mm::BNot,
+                        format!(
+                            "attempt to perform bitwise operation on a {} value",
+                            v.type_name()
+                        ),
+                    )),
+                ),
             },
             UnaryOp::Len => match v {
                 Value::Str(s) => (Some(Value::Int(self.strings.get(s).len() as i64)), None),
@@ -2271,10 +2925,13 @@ impl Lua {
                         return Ok(());
                     }
                 }
-                _ => (None, Some((Mm::Len, format!(
-                    "attempt to get length of a {} value",
-                    v.type_name()
-                )))),
+                _ => (
+                    None,
+                    Some((
+                        Mm::Len,
+                        format!("attempt to get length of a {} value", v.type_name()),
+                    )),
+                ),
             },
         };
         if let Some(r) = result {
@@ -2296,15 +2953,21 @@ impl Lua {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Some(if or_equal { x <= y } else { x < y }),
             (Value::Float(x), Value::Float(y)) => Some(if or_equal { x <= y } else { x < y }),
-            (Value::Int(x), Value::Float(y)) => {
-                Some(if or_equal { int_le_float(x, y) } else { int_lt_float(x, y) })
-            }
+            (Value::Int(x), Value::Float(y)) => Some(if or_equal {
+                int_le_float(x, y)
+            } else {
+                int_lt_float(x, y)
+            }),
             (Value::Float(x), Value::Int(y)) => {
                 if x.is_nan() {
                     return Some(false);
                 }
                 // x < y  <=>  not (y <= x);  x <= y  <=>  not (y < x)
-                Some(if or_equal { !int_lt_float(y, x) } else { !int_le_float(y, x) })
+                Some(if or_equal {
+                    !int_lt_float(y, x)
+                } else {
+                    !int_le_float(y, x)
+                })
             }
             (Value::Str(x), Value::Str(y)) => {
                 let (xs, ys) = (self.strings.get(x), self.strings.get(y));
@@ -2368,7 +3031,12 @@ impl Lua {
 
     fn rt_err(&self, th: &Thread, message: String) -> VmError {
         let source = th.frames.last().map(|f| f.proto.source.clone());
-        VmError { val: ErrVal::Msg(message), line: line_of(th), root_line: 0, source }
+        VmError {
+            val: ErrVal::Msg(message),
+            line: line_of(th),
+            root_line: 0,
+            source,
+        }
     }
 
     // ---- garbage collection ----
@@ -2407,7 +3075,10 @@ impl Lua {
                 total += 128
                     + th.stack.capacity() * 16
                     + th.frames.len() * 192
-                    + th.frames.iter().map(|f| f.varargs.len() * 16).sum::<usize>();
+                    + th.frames
+                        .iter()
+                        .map(|f| f.varargs.len() * 16)
+                        .sum::<usize>();
             }
         }
         for (i, c) in self.closures.iter().enumerate() {
@@ -2453,6 +3124,9 @@ impl Lua {
         work.push(Value::Table(self.globals));
         if let Some(sm) = self.string_meta {
             work.push(Value::Table(sm));
+        }
+        for mt in self.type_metas.iter().flatten() {
+            work.push(Value::Table(*mt));
         }
         work.extend_from_slice(&self.anchors);
         for (&root, &cur) in &self.exec_roots {
@@ -2560,7 +3234,11 @@ impl Lua {
             let ou = std::mem::take(&mut self.threads[i].open_upvals);
             for (idx, uid) in ou {
                 if m.upvals[uid.0 as usize] {
-                    let v = self.threads[i].stack.get(idx).copied().unwrap_or(Value::Nil);
+                    let v = self.threads[i]
+                        .stack
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(Value::Nil);
                     self.upvals[uid.0 as usize] = Upval::Closed(v);
                 }
             }
@@ -2576,8 +3254,10 @@ impl Lua {
             if !m.closures[i] && self.closures_live[i] {
                 self.closures_live[i] = false;
                 self.closures_free.push(i as u32);
-                self.closures[i] =
-                    LuaClosure { proto: self.empty_proto.clone(), upvals: Vec::new() };
+                self.closures[i] = LuaClosure {
+                    proto: self.empty_proto.clone(),
+                    upvals: Vec::new(),
+                };
             }
         }
         for i in 0..self.upvals.len() {
@@ -2598,7 +3278,10 @@ impl Lua {
             if !m.natives[i] && self.natives_live[i] {
                 self.natives_live[i] = false;
                 self.natives_free.push(i as u32);
-                self.natives[i] = Native { name: String::new(), kind: NativeKind::Plain(n_dead) };
+                self.natives[i] = Native {
+                    name: String::new(),
+                    kind: NativeKind::Plain(n_dead),
+                };
             }
         }
         self.strings.sweep(&m.strings);
@@ -2736,6 +3419,114 @@ impl Execution {
 
 // ---- free helpers ----
 
+/// A resolved `debug.getinfo` level: either the running C function (current
+/// thread level 0) or a Lua frame's snapshot.
+enum LevelFrame {
+    Native,
+    Lua {
+        proto: Rc<Proto>,
+        pc: usize,
+        closure: ClosId,
+        tailcall: bool,
+        name: Option<(&'static str, Box<str>)>,
+    },
+}
+
+/// `debug.getupvalue`/`setupvalue`/`upvalueid`/`upvaluejoin` coerce their
+/// index argument to an integer (`nil`/others become 0, which is invalid).
+fn debug_index(v: Value) -> i64 {
+    match v {
+        Value::Int(n) => n,
+        Value::Float(f) => f as i64,
+        _ => 0,
+    }
+}
+
+/// PUC's `luaO_chunkid`-style short source name, used by `debug.getinfo` and
+/// `debug.traceback`. `LUA_IDSIZE` is 60.
+fn short_source(src: &str) -> String {
+    const MAX_ID: usize = 60;
+    if let Some(rest) = src.strip_prefix('=') {
+        rest.chars().take(MAX_ID - 1).collect()
+    } else if let Some(rest) = src.strip_prefix('@') {
+        let n = rest.chars().count();
+        if n < MAX_ID {
+            rest.to_string()
+        } else {
+            let tail: String = rest.chars().skip(n - (MAX_ID - 4)).collect();
+            format!("...{tail}")
+        }
+    } else {
+        let first = src.lines().next().unwrap_or("");
+        let max = MAX_ID.saturating_sub(15);
+        let truncated: String = first.chars().take(max).collect();
+        format!("[string \"{truncated}\"]")
+    }
+}
+
+/// Primary destination register of an instruction, if it writes one. Used by
+/// the best-effort `varinfo` naming for "number has no integer
+/// representation" errors.
+fn instr_dst(i: &Instr) -> Option<u8> {
+    match *i {
+        Instr::LoadK { dst, .. }
+        | Instr::LoadNil { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::GetUpval { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetField { dst, .. }
+        | Instr::NewTable { dst }
+        | Instr::Arith { dst, .. }
+        | Instr::Unary { dst, .. }
+        | Instr::Cmp { dst, .. }
+        | Instr::Concat { dst, .. }
+        | Instr::Vararg { dst, .. }
+        | Instr::Closure { dst, .. } => Some(dst),
+        Instr::Call { base, .. } | Instr::TailCall { base, .. } => Some(base),
+        Instr::ForLoop { base, .. } | Instr::TForLoop { base, .. } => Some(base + 3),
+        _ => None,
+    }
+}
+
+/// Best-effort PUC `varinfo`: name the register `reg` as it was last written
+/// before `before_pc`, returning e.g. `field 'huge'`. Only constant-key
+/// fields, upvalues, and constants are recognized; locals and dynamic keys
+/// yield `None` (in which case callers keep the plain message).
+fn name_for_register(
+    strings: &Strings,
+    proto: &Proto,
+    before_pc: usize,
+    reg: u8,
+) -> Option<String> {
+    let mut pc = before_pc.min(proto.code.len());
+    while pc > 0 {
+        pc -= 1;
+        let instr = proto.code[pc];
+        match instr {
+            Instr::GetField { dst, k, .. } if dst == reg => {
+                return match proto.consts.get(k as usize) {
+                    Some(Value::Str(s)) => Some(format!("field '{}'", strings.get_str_lossy(*s))),
+                    _ => None,
+                };
+            }
+            Instr::GetUpval { dst, up } if dst == reg => {
+                return proto
+                    .upval_names
+                    .get(up as usize)
+                    .map(|n| format!("upvalue '{n}'"));
+            }
+            Instr::LoadK { dst, .. } if dst == reg => return Some("constant".to_string()),
+            _ => {
+                if instr_dst(&instr) == Some(reg) {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
 fn kval(th: &Thread, k: u16) -> Value {
     th.frames.last().unwrap().proto.consts[k as usize]
 }
@@ -2752,7 +3543,11 @@ fn line_of(th: &Thread) -> u32 {
 
 /// Source line the frame's next instruction belongs to.
 fn frame_line(f: &Frame) -> u32 {
-    f.proto.lines.get(f.pc.wrapping_sub(1)).copied().unwrap_or(0)
+    f.proto
+        .lines
+        .get(f.pc.wrapping_sub(1))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn ensure_len(stack: &mut Vec<Value>, len: usize) {
@@ -2825,14 +3620,25 @@ fn deliver_return(th: &mut Thread, frame: &Frame, start: usize, count: usize) {
                 let want = (frame.nres - 1) as usize;
                 ensure_len(&mut th.stack, ret_to + want);
                 for i in 0..want {
-                    th.stack[ret_to + i] =
-                        if i < count { th.stack[start + i] } else { Value::Nil };
+                    th.stack[ret_to + i] = if i < count {
+                        th.stack[start + i]
+                    } else {
+                        Value::Nil
+                    };
                 }
             }
         }
         RetShape::ToBool | RetShape::ToNotBool => {
-            let v = if count > 0 { th.stack[start] } else { Value::Nil };
-            let b = if frame.shape == RetShape::ToBool { v.truthy() } else { !v.truthy() };
+            let v = if count > 0 {
+                th.stack[start]
+            } else {
+                Value::Nil
+            };
+            let b = if frame.shape == RetShape::ToBool {
+                v.truthy()
+            } else {
+                !v.truthy()
+            };
             place_results(th, ret_to, frame.nres, &[Value::Bool(b)]);
         }
         RetShape::PrependTrue | RetShape::PrependFalse => {
@@ -2953,12 +3759,13 @@ fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
 
 fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
     use ArithOp::*;
-    let num_err = |v: Value| {
-        format!("attempt to perform arithmetic on a {} value", v.type_name())
-    };
+    let num_err = |v: Value| format!("attempt to perform arithmetic on a {} value", v.type_name());
     let int_err = |v: Value| match v {
         Value::Float(_) => "number has no integer representation".to_string(),
-        _ => format!("attempt to perform bitwise operation on a {} value", v.type_name()),
+        _ => format!(
+            "attempt to perform bitwise operation on a {} value",
+            v.type_name()
+        ),
     };
     let na = to_arith_number(strings, a);
     let nb = to_arith_number(strings, b);
@@ -3000,7 +3807,11 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     return Err("attempt to divide by zero".into());
                 }
                 let q = x.wrapping_div(y);
-                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) { q - 1 } else { q };
+                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) {
+                    q - 1
+                } else {
+                    q
+                };
                 Ok(Value::Int(q))
             }
             _ => {
@@ -3015,13 +3826,21 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     return Err("attempt to perform 'n%0'".into());
                 }
                 let r = x.wrapping_rem(y);
-                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
+                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) {
+                    r + y
+                } else {
+                    r
+                }))
             }
             _ => {
                 let x = as_float(na, a)?;
                 let y = as_float(nb, b)?;
                 let r = x % y;
-                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }))
+                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                    r + y
+                } else {
+                    r
+                }))
             }
         },
         BAnd | BOr | BXor => {
@@ -3039,7 +3858,11 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
             let y = to_int(b).ok_or_else(|| int_err(b))?;
             // Lua shifts are logical; a negative count shifts the other way,
             // and counts >= 64 produce zero
-            let n = if op == Shr { y.checked_neg().unwrap_or(i64::MAX) } else { y };
+            let n = if op == Shr {
+                y.checked_neg().unwrap_or(i64::MAX)
+            } else {
+                y
+            };
             Ok(Value::Int(shift_left_logical(x, n)))
         }
     }

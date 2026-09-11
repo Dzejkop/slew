@@ -4,7 +4,9 @@
 use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..10_000 {
         match exec.step(lua, 1_000_000) {
@@ -31,7 +33,9 @@ fn eval_multi(src: &str) -> Vec<String> {
 
 fn run_err(src: &str) -> String {
     let mut lua = Lua::new();
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     loop {
         match exec.step(&mut lua, 1_000_000) {
@@ -50,13 +54,19 @@ fn string_basics() {
     assert_eq!(eval("return string.sub('hello world', 1, 5)"), "hello");
     assert_eq!(eval("return string.sub('hello', -3)"), "llo");
     assert_eq!(eval("return string.sub('hello', 2, -2)"), "ell");
-    assert_eq!(eval("return string.upper('mixed Case 42')"), "MIXED CASE 42");
+    assert_eq!(
+        eval("return string.upper('mixed Case 42')"),
+        "MIXED CASE 42"
+    );
     assert_eq!(eval("return string.lower('MIXED Case')"), "mixed case");
     assert_eq!(eval("return string.rep('ab', 3)"), "ababab");
     assert_eq!(eval("return string.rep('x', 3, '-')"), "x-x-x");
     assert_eq!(eval("return string.reverse('abc')"), "cba");
     assert_eq!(eval("return string.byte('A')"), "65");
-    assert_eq!(eval_multi("return string.byte('ABC', 1, 3)"), ["65", "66", "67"]);
+    assert_eq!(
+        eval_multi("return string.byte('ABC', 1, 3)"),
+        ["65", "66", "67"]
+    );
     assert_eq!(eval("return string.char(104, 105)"), "hi");
 }
 
@@ -64,20 +74,29 @@ fn string_basics() {
 fn string_method_syntax() {
     // strings share a metatable with __index = string
     assert_eq!(eval("return ('hello'):upper()"), "HELLO");
-    assert_eq!(eval("local s = 'a,b,c' return s:sub(1, 1) .. s:len()"), "a5");
+    assert_eq!(
+        eval("local s = 'a,b,c' return s:sub(1, 1) .. s:len()"),
+        "a5"
+    );
     assert_eq!(eval("return ('%d!'):format(42)"), "42!");
 }
 
 #[test]
 fn string_find_and_match() {
-    assert_eq!(eval_multi("return string.find('hello world', 'world')"), ["7", "11"]);
+    assert_eq!(
+        eval_multi("return string.find('hello world', 'world')"),
+        ["7", "11"]
+    );
     assert_eq!(eval("return (string.find('abc', 'x'))"), "nil");
     assert_eq!(
         eval_multi("return string.find('key=val', '(%w+)=(%w+)')"),
         ["1", "7", "key", "val"]
     );
     // plain find ignores pattern chars
-    assert_eq!(eval_multi("return string.find('a.b', '.', 1, true)"), ["2", "2"]);
+    assert_eq!(
+        eval_multi("return string.find('a.b', '.', 1, true)"),
+        ["2", "2"]
+    );
     assert_eq!(eval("return string.match('hello 42 world', '%d+')"), "42");
     assert_eq!(
         eval_multi("return string.match('2026-06-10', '(%d+)-(%d+)-(%d+)')"),
@@ -149,7 +168,10 @@ fn string_gsub() {
     // anchored pattern replaces only at the start
     assert_eq!(eval_multi("return ('aaa'):gsub('^a', 'b')"), ["baa", "1"]);
     // empty matches advance correctly
-    assert_eq!(eval_multi("return ('abc'):gsub('x*', '-')"), ["-a-b-c-", "4"]);
+    assert_eq!(
+        eval_multi("return ('abc'):gsub('x*', '-')"),
+        ["-a-b-c-", "4"]
+    );
 }
 
 #[test]
@@ -159,7 +181,10 @@ fn string_format() {
     assert_eq!(eval("return string.format('%-5d|', 42)"), "42   |");
     assert_eq!(eval("return string.format('%05d', 42)"), "00042");
     assert_eq!(eval("return string.format('%+d %+d', 5, -5)"), "+5 -5");
-    assert_eq!(eval("return string.format('%x %X %o', 255, 255, 8)"), "ff FF 10");
+    assert_eq!(
+        eval("return string.format('%x %X %o', 255, 255, 8)"),
+        "ff FF 10"
+    );
     assert_eq!(eval("return string.format('%#x', 255)"), "0xff");
     assert_eq!(eval("return string.format('%c%c', 104, 105)"), "hi");
     assert_eq!(eval("return string.format('%.2f', 3.14159)"), "3.14");
@@ -170,8 +195,10 @@ fn string_format() {
     assert_eq!(eval("return string.format('%s=%s', 'a', 1)"), "a=1");
     assert_eq!(eval("return string.format('%.3s', 'hello')"), "hel");
     assert_eq!(eval("return string.format('%10s|', 'hi')"), "        hi|");
-    assert_eq!(eval("return string.format('%q', 'he said \"hi\"\\n')"),
-               "\"he said \\\"hi\\\"\\n\"");
+    assert_eq!(
+        eval("return string.format('%q', 'he said \"hi\"\\n')"),
+        "\"he said \\\"hi\\\"\\n\""
+    );
     assert_eq!(eval("return string.format('%%')"), "%");
 }
 
@@ -185,9 +212,18 @@ fn string_format_hex_float() {
     assert_eq!(eval("return string.format('%+.2A', 12)"), "+0X1.80P+3");
     assert_eq!(eval("return string.format('%.4A', -12)"), "-0X1.8000P+3");
     // full precision round-trips
-    assert_eq!(eval("return tonumber(string.format('%a', 0.1)) == 0.1"), "true");
-    assert_eq!(eval("return tonumber(string.format('%a', 1e30)) == 1e30"), "true");
-    assert_eq!(eval("return tonumber(string.format('%a', 1/3)) == 1/3"), "true");
+    assert_eq!(
+        eval("return tonumber(string.format('%a', 0.1)) == 0.1"),
+        "true"
+    );
+    assert_eq!(
+        eval("return tonumber(string.format('%a', 1e30)) == 1e30"),
+        "true"
+    );
+    assert_eq!(
+        eval("return tonumber(string.format('%a', 1/3)) == 1/3"),
+        "true"
+    );
     assert_eq!(eval("return string.format('%a', 1/0)"), "inf");
     assert_eq!(eval("return string.format('%A', -1/0)"), "-INF");
 }
@@ -244,11 +280,26 @@ fn string_pack_round_trips() {
         eval_multi("return string.byte(string.pack('<i1i2', 2, 3), 1, 3)"),
         ["2", "3", "0"]
     );
-    assert_eq!(eval_multi("return string.unpack('i4', string.pack('i4', -42))"), ["-42", "5"]);
-    assert_eq!(eval_multi("return string.unpack('>i2', string.pack('>i2', -2))"), ["-2", "3"]);
-    assert_eq!(eval_multi("return string.unpack('J', string.pack('J', -1))"), ["-1", "9"]);
-    assert_eq!(eval("return string.unpack('z', string.pack('z', 'abc'))"), "abc");
-    assert_eq!(eval_multi("return string.unpack('z', string.pack('z', 'abc'))"), ["abc", "5"]);
+    assert_eq!(
+        eval_multi("return string.unpack('i4', string.pack('i4', -42))"),
+        ["-42", "5"]
+    );
+    assert_eq!(
+        eval_multi("return string.unpack('>i2', string.pack('>i2', -2))"),
+        ["-2", "3"]
+    );
+    assert_eq!(
+        eval_multi("return string.unpack('J', string.pack('J', -1))"),
+        ["-1", "9"]
+    );
+    assert_eq!(
+        eval("return string.unpack('z', string.pack('z', 'abc'))"),
+        "abc"
+    );
+    assert_eq!(
+        eval_multi("return string.unpack('z', string.pack('z', 'abc'))"),
+        ["abc", "5"]
+    );
     assert_eq!(
         eval_multi("return string.unpack('s1', string.pack('s1', 'hey'))"),
         ["hey", "5"]
@@ -257,8 +308,14 @@ fn string_pack_round_trips() {
         eval_multi("return string.unpack('i4i4', string.pack('i4i4', 7, 9), 1)"),
         ["7", "9", "9"]
     );
-    assert_eq!(eval("return math.type(string.unpack('i4', string.pack('i4', 7)))"), "integer");
-    assert_eq!(eval("return math.type(string.unpack('d', string.pack('d', 7)))"), "float");
+    assert_eq!(
+        eval("return math.type(string.unpack('i4', string.pack('i4', 7)))"),
+        "integer"
+    );
+    assert_eq!(
+        eval("return math.type(string.unpack('d', string.pack('d', 7)))"),
+        "float"
+    );
     assert_eq!(
         eval("return string.unpack('d', string.pack('d', 1.5)) == 1.5"),
         "true"
@@ -277,21 +334,29 @@ fn string_pack_errors() {
     assert!(run_err("return string.pack('B', -1)").contains("unsigned overflow"));
     assert!(run_err("return string.pack('c2', 'abc')").contains("string longer than given size"));
     assert!(run_err("return string.pack('z', 'a\\0b')").contains("string contains zeros"));
-    assert!(run_err("return string.pack('s1', string.rep('a', 300))")
-        .contains("string length does not fit in given size"));
+    assert!(
+        run_err("return string.pack('s1', string.rep('a', 300))")
+            .contains("string length does not fit in given size")
+    );
     assert!(run_err("return string.unpack('i4', 'ab')").contains("data string too short"));
     assert!(run_err("return string.unpack('z', 'abc')").contains("unfinished string"));
-    assert!(run_err("return string.unpack('i4', 'abcd', 9)")
-        .contains("initial position out of string"));
-    assert!(run_err("return string.unpack('i4', 'abcd', math.maxinteger)")
-        .contains("initial position out of string"));
+    assert!(
+        run_err("return string.unpack('i4', 'abcd', 9)").contains("initial position out of string")
+    );
+    assert!(
+        run_err("return string.unpack('i4', 'abcd', math.maxinteger)")
+            .contains("initial position out of string")
+    );
     // PUC's posrelatI clips positions below -len to the start rather than erroring
     assert_eq!(
         eval_multi("return string.unpack('i4', 'abcd', math.mininteger)"),
         ["1684234849", "5"]
     );
     // position len+1 is the one-past-the-end sentinel and unpacks zero fields
-    assert_eq!(eval_multi("return string.unpack('c0', 'abcd', 5)"), ["", "5"]);
+    assert_eq!(
+        eval_multi("return string.unpack('c0', 'abcd', 5)"),
+        ["", "5"]
+    );
     assert!(run_err("return string.packsize('i0')").contains("integral size (0) out of limits"));
     assert!(run_err("return string.packsize('Q')").contains("invalid format option 'Q'"));
     assert!(run_err("return string.packsize('c')").contains("missing size for format option 'c'"));
@@ -311,11 +376,15 @@ fn table_insert_remove() {
         "1,2,3"
     );
     assert_eq!(
-        eval("local t = {1, 2, 3} local v = table.remove(t) return v .. ':' .. table.concat(t, ',')"),
+        eval(
+            "local t = {1, 2, 3} local v = table.remove(t) return v .. ':' .. table.concat(t, ',')"
+        ),
         "3:1,2"
     );
     assert_eq!(
-        eval("local t = {1, 2, 3} local v = table.remove(t, 1) return v .. ':' .. table.concat(t, ',')"),
+        eval(
+            "local t = {1, 2, 3} local v = table.remove(t, 1) return v .. ':' .. table.concat(t, ',')"
+        ),
         "1:2,3"
     );
     assert_eq!(eval("return tostring(table.remove({}))"), "nil");
@@ -330,8 +399,14 @@ fn table_concat_pack_unpack() {
         eval("local t = table.pack(10, 20, 30) return t.n .. ':' .. t[1] .. t[2] .. t[3]"),
         "3:102030"
     );
-    assert_eq!(eval_multi("return table.unpack({1, 2, 3})"), ["1", "2", "3"]);
-    assert_eq!(eval_multi("return table.unpack({1, 2, 3, 4}, 2, 3)"), ["2", "3"]);
+    assert_eq!(
+        eval_multi("return table.unpack({1, 2, 3})"),
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        eval_multi("return table.unpack({1, 2, 3, 4}, 2, 3)"),
+        ["2", "3"]
+    );
     assert_eq!(
         eval("local function f(...) return select('#', ...) end return f(table.unpack({1,2,3}))"),
         "3"
@@ -534,7 +609,10 @@ fn table_remove_concat_unpack_respect_metamethods() {
     assert_eq!(eval("return tostring(table.remove({}))"), "nil");
     assert!(run_err("table.remove({1, 2}, 0)").contains("position out of bounds"));
     // border-0 element is returned and cleared, as in PUC
-    assert_eq!(eval("local a = {[0] = 'ban'} return table.remove(a)"), "ban");
+    assert_eq!(
+        eval("local a = {[0] = 'ban'} return table.remove(a)"),
+        "ban"
+    );
     assert_eq!(
         eval("local a = {[0] = 'ban'} table.remove(a) return tostring(a[0])"),
         "nil"
@@ -557,15 +635,24 @@ fn math_basics() {
     assert_eq!(eval_multi("return math.modf(3.7)"), ["3", "0.7"]);
     assert_eq!(eval("return math.tointeger(42.0)"), "42");
     assert_eq!(eval("return tostring(math.tointeger(42.5))"), "nil");
-    assert_eq!(eval("return math.type(1) .. '/' .. math.type(1.0)"), "integer/float");
+    assert_eq!(
+        eval("return math.type(1) .. '/' .. math.type(1.0)"),
+        "integer/float"
+    );
     assert_eq!(eval("return tostring(math.type('x'))"), "nil");
     assert_eq!(eval("return math.huge > 1e308"), "true");
     assert_eq!(eval("return math.maxinteger"), i64::MAX.to_string());
     assert_eq!(eval("return math.ult(-1, 0)"), "false"); // -1 as unsigned is huge
     assert_eq!(eval("return math.log(8, 2)"), "3.0");
     assert!(eval("return math.sin(0)") == "0.0");
-    assert_eq!(eval("return math.abs(math.deg(math.pi) - 180) < 1e-9"), "true");
-    assert_eq!(eval("return math.abs(math.rad(180) - math.pi) < 1e-9"), "true");
+    assert_eq!(
+        eval("return math.abs(math.deg(math.pi) - 180) < 1e-9"),
+        "true"
+    );
+    assert_eq!(
+        eval("return math.abs(math.rad(180) - math.pi) < 1e-9"),
+        "true"
+    );
     assert_eq!(eval("return math.deg(0)"), "0.0");
     assert_eq!(eval("return math.rad(0)"), "0.0");
 }
@@ -576,11 +663,12 @@ fn integer_representation_errors() {
     // math.lua's `checkcompt` helper which pcalls the loaded function.
     assert_eq!(eval("return type(load('return 2 // 0'))"), "function");
     assert!(run_err("return (load('return 2 // 0'))()").contains("attempt to divide by zero"));
-    assert!(run_err("return 2.3 >> 0").contains("number has no integer representation"));
-    assert!(run_err("return 2.3 ~ 0.0").contains("number has no integer representation"));
-    assert!(run_err("return 1 | 2.0^63").contains("number has no integer representation"));
-    assert!(run_err("return math.huge << 1").contains("number has no integer representation"));
-    assert!(run_err("return math.huge | math.huge").contains("number has no integer representation"));
+    assert!(run_err("return 2.3 >> 0").contains("has no integer representation"));
+    assert!(run_err("return 2.3 ~ 0.0").contains("has no integer representation"));
+    assert!(run_err("return 1 | 2.0^63").contains("has no integer representation"));
+    // PUC names the offending operand's provenance (varinfo).
+    assert!(run_err("return math.huge << 1").contains("field 'huge'"));
+    assert!(run_err("return math.huge | math.huge").contains("field 'huge'"));
 }
 
 #[test]

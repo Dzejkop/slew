@@ -14,7 +14,7 @@ mod string_pack;
 mod table;
 mod utf8;
 
-use crate::value::{fmt_number, to_key, Value};
+use crate::value::{Value, fmt_number, to_key};
 use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind, Step};
 
 pub fn install(lua: &mut Lua) {
@@ -48,12 +48,40 @@ pub fn install(lua: &mut Lua) {
     table::install(lua);
     math::install(lua);
     utf8::install(lua);
+    install_debug(lua);
     // dynamic loading: `load` is pure; `loadfile` goes through the host
     // reader installed with `Lua::set_file_reader` (none by default)
     lua.register_native("load", n_load);
     lua.register_native("loadfile", n_loadfile);
     install_package(lua);
     run_prelude(lua);
+}
+
+/// The introspective `debug` library. These are intrinsics (not plain
+/// natives) because they inspect call frames, and the running thread is
+/// `mem::take`n out of the arena during dispatch: only intrinsics receive
+/// the live `&mut Thread`.
+fn install_debug(lua: &mut Lua) {
+    let debug = lua.new_table();
+    lua.set_global("debug", debug);
+    let entries: [(&str, Intrinsic); 10] = [
+        ("getinfo", Intrinsic::DebugGetinfo),
+        ("traceback", Intrinsic::DebugTraceback),
+        ("getupvalue", Intrinsic::DebugGetupvalue),
+        ("setupvalue", Intrinsic::DebugSetupvalue),
+        ("upvalueid", Intrinsic::DebugUpvalueid),
+        ("upvaluejoin", Intrinsic::DebugUpvaluejoin),
+        ("getmetatable", Intrinsic::DebugGetmetatable),
+        ("setmetatable", Intrinsic::DebugSetmetatable),
+        ("getregistry", Intrinsic::DebugGetregistry),
+        // `gethook`/`sethook` are not implemented (tier c); `gethook`
+        // returns nil so "no hook" probes succeed.
+        ("gethook", Intrinsic::DebugGethook),
+    ];
+    for (name, i) in entries {
+        let f = lua.add_native_kind(name, NativeKind::Intrinsic(i));
+        set_field(lua, debug, name, f);
+    }
 }
 
 fn run_prelude(lua: &mut Lua) {
@@ -118,15 +146,18 @@ fn install_package(lua: &mut Lua) {
     let globals = Value::Table(lua.globals);
     lua.set_global("_G", globals);
     set_field(lua, loaded, "_G", globals);
-    for name in ["string", "table", "math", "utf8", "coroutine", "package"] {
+    for name in [
+        "string",
+        "table",
+        "math",
+        "utf8",
+        "coroutine",
+        "package",
+        "debug",
+    ] {
         let v = lua.get_global(name);
         set_field(lua, loaded, name, v);
     }
-    // `debug` is not implemented yet (Phase 7); an empty stand-in keeps
-    // dependent test files past their initial `require "debug"`.
-    let debug = lua.new_table();
-    lua.set_global("debug", debug);
-    set_field(lua, loaded, "debug", debug);
 }
 
 /// Compiles `src` the way `load`/`loadfile` do: the function on success,
@@ -194,7 +225,11 @@ pub(super) fn check_bytes(
 }
 
 fn opt_bytes(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Option<Vec<u8>>, String> {
-    if arg(args, i) == Value::Nil { Ok(None) } else { check_bytes(lua, args, i, who).map(Some) }
+    if arg(args, i) == Value::Nil {
+        Ok(None)
+    } else {
+        check_bytes(lua, args, i, who).map(Some)
+    }
 }
 
 fn replace_all(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
@@ -263,7 +298,11 @@ fn n_searchpath(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = check_bytes(lua, args, 1, "searchpath")?;
     let sep = opt_bytes(lua, args, 2, "searchpath")?.unwrap_or_else(|| b".".to_vec());
     let rep = opt_bytes(lua, args, 3, "searchpath")?.unwrap_or_else(|| b"/".to_vec());
-    let name = if sep.is_empty() { name } else { replace_all(&name, &sep, &rep) };
+    let name = if sep.is_empty() {
+        name
+    } else {
+        replace_all(&name, &sep, &rep)
+    };
     let expanded = replace_all(&path, b"?", &name);
     for tmpl in expanded.split(|&b| b == b';') {
         if tmpl.is_empty() {
@@ -310,7 +349,9 @@ fn n_co_status(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 fn n_co_wrap(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         f @ (Value::Closure(_) | Value::Native(_)) => {
-            let Value::Thread(tid) = lua.create_coroutine(f) else { unreachable!() };
+            let Value::Thread(tid) = lua.create_coroutine(f) else {
+                unreachable!()
+            };
             let wrapper = lua.add_native_kind(
                 "(coroutine wrapper)",
                 NativeKind::Intrinsic(Intrinsic::WrapResume(tid)),
@@ -330,9 +371,7 @@ fn n_setmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let mt = match arg(args, 1) {
         Value::Nil => None,
         Value::Table(m) => Some(m),
-        _ => {
-            return Err("bad argument #2 to 'setmetatable' (nil or table expected)".into())
-        }
+        _ => return Err("bad argument #2 to 'setmetatable' (nil or table expected)".into()),
     };
     if lua.metamethod_pub(t, "__metatable") != Value::Nil {
         return Err("cannot change a protected metatable".into());
@@ -369,7 +408,12 @@ pub(super) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::Nil)
 }
 
-pub(super) fn check_table(_lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Value, String> {
+pub(super) fn check_table(
+    _lua: &Lua,
+    args: &[Value],
+    i: usize,
+    who: &str,
+) -> Result<Value, String> {
     match arg(args, i) {
         v @ Value::Table(_) => Ok(v),
         v => Err(format!(
@@ -531,5 +575,3 @@ fn n_next(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         Err(_) => Err("invalid key to 'next'".into()),
     }
 }
-
-
