@@ -83,7 +83,9 @@ Everything implemented follows 5.4 rules from the start, in particular:
 - **M4**: stdlib — `string` with a full Lua-pattern engine, `table`, `math`
   (deterministically seeded PRNG). Callback-using functions (`table.sort`,
   `gsub`, `gmatch`) are written in a Lua prelude compiled at startup, so
-  they are suspendable like all Lua code. `os`/`io` deliberately absent.
+  they are suspendable like all Lua code. `io`/`os` exist only when an
+  embedder installs a capability host (see below); without one they are
+  absent.
 - **M5**: mark-sweep GC over the handle arenas (free-list slot reuse) with
   roots from globals, live executions, and host anchors; `lua.gc()`,
   `memory_used()`, auto-collection by allocation threshold, and
@@ -110,6 +112,16 @@ through a capability the embedder installs explicitly.
 - `load` (string or reader-function chunks) is pure. Only `loadfile`,
   `dofile`, and `package.searchpath`'s existence probes cross the host seam,
   so the filesystem surface stays a single function.
+- `Lua::set_host` installs the `io`/`os` capability host (`src/host.rs`).
+  While no host is installed, `io`/`os` do not exist (globals unset,
+  `require` fails) and the core never opens a file, reads the environment, or
+  spawns a process. `Lua::has_host`/`clear_host` detect and remove it. `os.exit`
+  is surfaced as a request (`Lua::take_exit_request`) plus a controlled error;
+  the host process is never terminated. `os.execute` is absent (process
+  authority is a non-goal). A std-backed `StdHost` (root-confined filesystem,
+  captured std streams, UTC calendar) ships for tests and simple embedders.
+  File handles are userdata whose host resources are released on `close`, on
+  `__gc`, and on sweep of an unreachable handle.
 
 ## Execution profile knobs
 

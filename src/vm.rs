@@ -12,10 +12,11 @@
 
 use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
 use crate::compiler::{CompileError, compile};
+use crate::host::{Host, HostObject, Userdata};
 use crate::parser::{ParseError, parse};
 use crate::value::{
-    ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId, UpvalId, Value, float_to_exact_int,
-    fmt_number,
+    ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId, UpvalId, UserdataId, Value,
+    float_to_exact_int, fmt_number,
 };
 use std::fmt;
 use std::rc::Rc;
@@ -391,6 +392,8 @@ pub struct Lua {
     pub(crate) natives: Vec<Native>,
     pub(crate) upvals: Vec<Upval>,
     pub(crate) threads: Vec<Thread>,
+    /// Userdata arena: host objects with optional metatables.
+    pub(crate) userdata: Vec<Userdata>,
     pub(crate) globals: TableId,
     pub(crate) string_meta: Option<TableId>,
     mm_names: Vec<StrId>,
@@ -416,6 +419,8 @@ pub struct Lua {
     upvals_free: Vec<u32>,
     threads_live: Vec<bool>,
     threads_free: Vec<u32>,
+    userdata_live: Vec<bool>,
+    userdata_free: Vec<u32>,
     natives_live: Vec<bool>,
     natives_free: Vec<u32>,
     /// Root + current thread per live (unfinished) execution.
@@ -453,6 +458,16 @@ pub struct Lua {
     close_job: Option<CloseJob>,
     /// In-progress `print` driver (see [`PrintJob`]).
     print_job: Option<PrintJob>,
+    /// Embedder-installed capability host. `None` means `io`/`os` are absent.
+    pub(crate) host: Option<Box<dyn Host>>,
+    /// The file userdata metatable (set when a host is installed).
+    pub(crate) file_meta: Option<TableId>,
+    /// Default `io.input()` / `io.output()` handles (GC roots).
+    pub(crate) io_input: Option<UserdataId>,
+    pub(crate) io_output: Option<UserdataId>,
+    /// Set by `os.exit`: the requested exit code, for the embedder to observe.
+    /// Never terminates the process here.
+    pub(crate) exit_request: Option<i64>,
 }
 
 /// State for the incremental `coroutine.close` driver: `__close` handlers are
@@ -523,6 +538,7 @@ impl Lua {
             natives: Vec::new(),
             upvals: Vec::new(),
             threads: Vec::new(),
+            userdata: Vec::new(),
             globals: TableId(0),
             string_meta: None,
             mm_names,
@@ -538,6 +554,8 @@ impl Lua {
             upvals_free: Vec::new(),
             threads_live: Vec::new(),
             threads_free: Vec::new(),
+            userdata_live: Vec::new(),
+            userdata_free: Vec::new(),
             natives_live: Vec::new(),
             natives_free: Vec::new(),
             exec_roots: std::collections::HashMap::new(),
@@ -571,6 +589,11 @@ impl Lua {
             finalizer_depth: None,
             close_job: None,
             print_job: None,
+            host: None,
+            file_meta: None,
+            io_input: None,
+            io_output: None,
+            exit_request: None,
         };
         lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
@@ -755,6 +778,63 @@ impl Lua {
         Value::Table(id)
     }
 
+    /// Allocates a userdata slot. The payload/metatable are supplied by the
+    /// caller; GC liveness is tracked like any other arena object.
+    pub(crate) fn alloc_userdata(&mut self, u: Userdata) -> UserdataId {
+        self.allocs_since_gc += 1;
+        match self.userdata_free.pop() {
+            Some(i) => {
+                self.userdata[i as usize] = u;
+                self.userdata_live[i as usize] = true;
+                UserdataId(i)
+            }
+            None => {
+                self.userdata.push(u);
+                self.userdata_live.push(true);
+                UserdataId(self.userdata.len() as u32 - 1)
+            }
+        }
+    }
+
+    /// True when a capability host has been installed (`io`/`os` exist).
+    pub fn has_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Installs the embedder's capability host and registers `io`/`os`.
+    /// Without a host those globals are absent, so the core has no authority.
+    pub fn set_host(&mut self, host: impl Host + 'static) {
+        if self.host.is_some() {
+            self.clear_host();
+        }
+        self.host = Some(Box::new(host));
+        crate::stdlib::install_host_libs(self);
+    }
+
+    /// Removes the host and unsets `io`/`os` (globals and `package.loaded`).
+    pub fn clear_host(&mut self) {
+        self.host = None;
+        self.file_meta = None;
+        self.io_input = None;
+        self.io_output = None;
+        self.set_global("io", Value::Nil);
+        self.set_global("os", Value::Nil);
+        let loaded_key = self.new_string(b"loaded");
+        let pkg = self.get_global("package");
+        let loaded = self.table_get(pkg, loaded_key);
+        if let Value::Table(id) = loaded {
+            let k = self.new_string(b"io");
+            let _ = self.tables[id.0 as usize].set(k, Value::Nil);
+            let k = self.new_string(b"os");
+            let _ = self.tables[id.0 as usize].set(k, Value::Nil);
+        }
+    }
+
+    /// Takes (and clears) an `os.exit` request, if the script asked to exit.
+    pub fn take_exit_request(&mut self) -> Option<i64> {
+        self.exit_request.take()
+    }
+
     pub(crate) fn alloc_closure(&mut self, c: LuaClosure) -> ClosId {
         self.allocs_since_gc += 1;
         match self.closures_free.pop() {
@@ -846,12 +926,14 @@ impl Lua {
     /// output is used when there is no `__name`.
     pub(crate) fn tostring_default(&mut self, v: Value) -> String {
         let custom = match v {
-            Value::Table(_) | Value::Closure(_) | Value::Native(_) | Value::Thread(_) => {
-                match self.metamethod_pub(v, "__name") {
-                    Value::Str(id) => Some(self.strings.get_str_lossy(id).into_owned()),
-                    _ => None,
-                }
-            }
+            Value::Table(_)
+            | Value::Closure(_)
+            | Value::Native(_)
+            | Value::Thread(_)
+            | Value::Userdata(_) => match self.metamethod_pub(v, "__name") {
+                Value::Str(id) => Some(self.strings.get_str_lossy(id).into_owned()),
+                _ => None,
+            },
             _ => None,
         };
         match custom {
@@ -861,6 +943,7 @@ impl Lua {
                     Value::Closure(c) => c.0,
                     Value::Thread(t) => t.0,
                     Value::Native(n) => n.0,
+                    Value::Userdata(u) => u.0,
                     _ => unreachable!(),
                 };
                 format!("{name}: 0x{ptr:08x}")
@@ -881,6 +964,7 @@ impl Lua {
             Value::Closure(c) => format!("function: 0x{:08x}", c.0),
             Value::Native(n) => format!("function: builtin: {}", self.natives[n.0 as usize].name),
             Value::Thread(t) => format!("thread: 0x{:08x}", t.0),
+            Value::Userdata(u) => format!("userdata: 0x{:08x}", u.0),
         }
     }
 
@@ -895,6 +979,7 @@ impl Lua {
             Value::Int(_) | Value::Float(_) => self.type_metas[2],
             Value::Closure(_) | Value::Native(_) => self.type_metas[3],
             Value::Thread(_) => self.type_metas[4],
+            Value::Userdata(u) => self.userdata[u.0 as usize].metatable,
         }
     }
 
@@ -910,6 +995,7 @@ impl Lua {
             Value::Int(_) | Value::Float(_) => self.type_metas[2] = mt,
             Value::Closure(_) | Value::Native(_) => self.type_metas[3] = mt,
             Value::Thread(_) => self.type_metas[4] = mt,
+            Value::Userdata(u) => self.userdata[u.0 as usize].metatable = mt,
         }
     }
 
@@ -3293,8 +3379,12 @@ impl Lua {
                     th.stack[dst_abs] = Value::Bool(op == CmpOp::Eq);
                     return Ok(());
                 }
-                // __eq fires only for table/table (or userdata) raw-unequal pairs
-                if let (Value::Table(_), Value::Table(_)) = (a, b) {
+                // __eq fires only for table/table or userdata/userdata
+                // raw-unequal pairs.
+                if matches!(
+                    (a, b),
+                    (Value::Table(_), Value::Table(_)) | (Value::Userdata(_), Value::Userdata(_))
+                ) {
                     let mm = self.binary_mm(a, b, Mm::Eq);
                     if mm != Value::Nil {
                         return self.call_value(th, mm, &[a, b], dst_abs, 2, shape, fuel);
@@ -3759,6 +3849,11 @@ impl Lua {
         }
         total += self.upvals.len() * 24;
         total += self.natives.len() * 56;
+        for (i, u) in self.userdata.iter().enumerate() {
+            if self.userdata_live.get(i).copied().unwrap_or(true) {
+                total += 64 + u.read_buf.capacity();
+            }
+        }
         total
     }
 
@@ -3890,6 +3985,7 @@ impl Lua {
             natives: vec![false; self.natives.len()],
             upvals: vec![false; self.upvals.len()],
             threads: vec![false; self.threads.len()],
+            userdata: vec![false; self.userdata.len()],
         };
         let weak = self.weak_kinds(table_count);
         let gc_name = self.strings.lookup(b"__gc");
@@ -3902,6 +3998,15 @@ impl Lua {
         }
         for mt in self.type_metas.iter().flatten() {
             work.push(Value::Table(*mt));
+        }
+        if let Some(mt) = self.file_meta {
+            work.push(Value::Table(mt));
+        }
+        if let Some(u) = self.io_input {
+            work.push(Value::Userdata(u));
+        }
+        if let Some(u) = self.io_output {
+            work.push(Value::Userdata(u));
         }
         work.extend_from_slice(&self.anchors);
         work.extend_from_slice(&self.pending_finalizers);
@@ -3947,6 +4052,25 @@ impl Lua {
                         work.push(Value::Table(TableId(i as u32)));
                         self.pending_finalizers
                             .push(Value::Table(TableId(i as u32)));
+                        found = true;
+                    }
+                }
+                // Userdata carrying `__gc` finalize the same way.
+                for i in 0..self.userdata.len() {
+                    if !self.userdata_live[i] || m.userdata[i] || self.userdata[i].finalized {
+                        continue;
+                    }
+                    let has_gc = match self.userdata[i].metatable {
+                        Some(mt) => {
+                            self.tables[mt.0 as usize].get(Value::Str(gc_name)) != Value::Nil
+                        }
+                        None => false,
+                    };
+                    if has_gc {
+                        self.userdata[i].finalized = true;
+                        let v = Value::Userdata(UserdataId(i as u32));
+                        work.push(v);
+                        self.pending_finalizers.push(v);
                         found = true;
                     }
                 }
@@ -4058,6 +4182,15 @@ impl Lua {
                         Self::trace_thread(&self.threads[i], m, work, &self.upvals);
                     }
                 }
+                Value::Userdata(u) => {
+                    let i = u.0 as usize;
+                    if !m.userdata[i] {
+                        m.userdata[i] = true;
+                        if let Some(mt) = self.userdata[i].metatable {
+                            work.push(Value::Table(mt));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -4105,13 +4238,18 @@ impl Lua {
             Value::Closure(c) => m.closures[c.0 as usize],
             Value::Native(n) => m.natives[n.0 as usize],
             Value::Thread(t) => m.threads[t.0 as usize],
+            Value::Userdata(u) => m.userdata[u.0 as usize],
         }
     }
 
     fn weak_dead(&self, m: &Marks, v: Value) -> bool {
         matches!(
             v,
-            Value::Table(_) | Value::Closure(_) | Value::Native(_) | Value::Thread(_)
+            Value::Table(_)
+                | Value::Closure(_)
+                | Value::Native(_)
+                | Value::Thread(_)
+                | Value::Userdata(_)
         ) && !self.value_marked(m, v)
     }
 
@@ -4254,6 +4392,20 @@ impl Lua {
                 };
             }
         }
+        // Dead userdata: release any host resource it still owns.
+        for i in 0..self.userdata.len() {
+            if !m.userdata[i] && self.userdata_live[i] {
+                let ud = std::mem::take(&mut self.userdata[i]);
+                self.userdata_live[i] = false;
+                self.userdata_free.push(i as u32);
+                if !ud.closed
+                    && let HostObject::File(h) = ud.object
+                    && let Some(host) = self.host.as_mut()
+                {
+                    let _ = host.close(h);
+                }
+            }
+        }
         self.strings.sweep(&m.strings);
     }
 }
@@ -4269,6 +4421,7 @@ struct Marks {
     natives: Vec<bool>,
     upvals: Vec<bool>,
     threads: Vec<bool>,
+    userdata: Vec<bool>,
 }
 
 fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {

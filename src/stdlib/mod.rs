@@ -8,7 +8,9 @@
 //! reentrancy. `os` and `io` are deliberately absent: they are
 //! nondeterministic ambient authority; embedders can register their own.
 
+mod io;
 mod math;
+mod os;
 mod string;
 mod string_pack;
 mod table;
@@ -56,6 +58,28 @@ pub fn install(lua: &mut Lua) {
     lua.register_native("loadfile", n_loadfile);
     install_package(lua);
     run_prelude(lua);
+}
+
+/// Registers the `io`/`os` libraries once an embedder has installed a host.
+/// Building the file metatable first lets userdata reference it; the small Lua
+/// prelude then adds the `lines` iterators. This is never called without a
+/// host, so `io`/`os` are simply absent and the core keeps no authority.
+pub(crate) fn install_host_libs(lua: &mut Lua) {
+    let file_meta = io::build_file_metatable(lua);
+    lua.file_meta = Some(file_meta);
+    io::install(lua);
+    os::install(lua);
+
+    let io_v = lua.get_global("io");
+    let os_v = lua.get_global("os");
+    let loaded_key = lua.new_string(b"loaded");
+    let pkg = lua.get_global("package");
+    let loaded = lua.table_get(pkg, loaded_key);
+    if let Value::Table(id) = loaded {
+        set_field(lua, Value::Table(id), "io", io_v);
+        set_field(lua, Value::Table(id), "os", os_v);
+    }
+    io::run_prelude(lua);
 }
 
 /// The introspective `debug` library. These are intrinsics (not plain

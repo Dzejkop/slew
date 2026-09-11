@@ -19,6 +19,10 @@ pub struct NativeId(pub u32);
 pub struct UpvalId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ThreadId(pub u32);
+/// Handle into the userdata arena. Userdata carries an optional metatable and
+/// a host-object payload (see [`crate::host::Userdata`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct UserdataId(pub u32);
 
 /// A Lua value. `PartialEq` is *raw* identity/bit equality (NaN ~= NaN, and
 /// `Int(1) != Float(1.0)`); Lua `==` semantics live in the VM (`Lua::values_equal`).
@@ -33,6 +37,7 @@ pub enum Value {
     Closure(ClosId),
     Native(NativeId),
     Thread(ThreadId),
+    Userdata(UserdataId),
 }
 
 impl Value {
@@ -49,6 +54,7 @@ impl Value {
             Value::Table(_) => "table",
             Value::Closure(_) | Value::Native(_) => "function",
             Value::Thread(_) => "thread",
+            Value::Userdata(_) => "userdata",
         }
     }
 }
@@ -167,6 +173,7 @@ pub enum HKey {
     Closure(ClosId),
     Native(NativeId),
     Thread(ThreadId),
+    Userdata(UserdataId),
 }
 
 /// Converts a value to a table key per Lua 5.4 rules.
@@ -189,6 +196,7 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
         Value::Closure(c) => HKey::Closure(c),
         Value::Native(n) => HKey::Native(n),
         Value::Thread(t) => HKey::Thread(t),
+        Value::Userdata(u) => HKey::Userdata(u),
     })
 }
 
@@ -370,6 +378,7 @@ pub fn key_to_value(k: HKey) -> Value {
         HKey::Closure(c) => Value::Closure(c),
         HKey::Native(n) => Value::Native(n),
         HKey::Thread(t) => Value::Thread(t),
+        HKey::Userdata(u) => Value::Userdata(u),
     }
 }
 

@@ -512,6 +512,7 @@ fn pointer_text(v: Value) -> String {
         Value::Native(id) => 0x3000_0000u64 + id.0 as u64,
         Value::Closure(id) => 0x4000_0000u64 + id.0 as u64,
         Value::Thread(id) => 0x5000_0000u64 + id.0 as u64,
+        Value::Userdata(id) => 0x6000_0000u64 + id.0 as u64,
         _ => return "(null)".to_string(),
     };
     format!("0x{tag:x}")

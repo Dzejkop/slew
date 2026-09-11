@@ -15,7 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use slew::{Error, Lua, Step};
+use slew::{Error, Lua, StdHost, Step};
 
 /// Mirrors the environment `all.lua` sets up for `lua -e"_U=true" all.lua`:
 /// the globals the standalone files expect, with the soft/portable switches
@@ -280,7 +280,10 @@ fn run_case(dir: &Path, case: &Case) -> Status {
 
 /// Module files are resolved under the suite root. The `fs` feature supplies
 /// the sandboxed adapter; without it, tests still get a reader (test code may
-/// touch the filesystem even when the library does not).
+/// touch the filesystem even when the library does not). A std-backed
+/// capability host is installed too, so `io`/`os` exist for the cases that
+/// exercise them (rooted at the suite dir, so `attrib.lua`'s temporary files
+/// stay contained).
 fn install_suite_reader(lua: &mut Lua, dir: &Path) {
     #[cfg(feature = "fs")]
     {
@@ -295,6 +298,7 @@ fn install_suite_reader(lua: &mut Lua, dir: &Path) {
             Err(e) => Err(e.to_string()),
         });
     }
+    lua.set_host(StdHost::new(dir));
 }
 
 fn run_source(dir: &Path, path: &Path, src: &[u8], shims: &str) -> Status {
