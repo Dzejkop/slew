@@ -3,7 +3,9 @@
 use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..1000 {
         match exec.step(lua, 100_000) {
@@ -30,7 +32,9 @@ fn eval_multi(src: &str) -> Vec<String> {
 
 fn run_err(src: &str) -> String {
     let mut lua = Lua::new();
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     loop {
         match exec.step(&mut lua, 100_000) {
@@ -50,9 +54,14 @@ fn set_get_metatable() {
         "true"
     );
     assert_eq!(eval("return getmetatable({})"), "nil");
-    assert_eq!(eval("local t = setmetatable({}, {__metatable = 'locked'}) return getmetatable(t)"), "locked");
-    assert!(run_err("local t = setmetatable({}, {__metatable = 1}) setmetatable(t, {})")
-        .contains("protected metatable"));
+    assert_eq!(
+        eval("local t = setmetatable({}, {__metatable = 'locked'}) return getmetatable(t)"),
+        "locked"
+    );
+    assert!(
+        run_err("local t = setmetatable({}, {__metatable = 1}) setmetatable(t, {})")
+            .contains("protected metatable")
+    );
     assert!(run_err("setmetatable({}, 5)").contains("nil or table expected"));
 }
 
@@ -160,8 +169,10 @@ fn compare_metamethods() {
     assert_eq!(eval(&format!("{src} return c > a")), "true"); // swaps to __lt
     // __eq result is coerced to boolean
     assert_eq!(
-        eval("local t = setmetatable({}, {__eq = function() return 'truthy string' end}) \
-              return t == setmetatable({}, getmetatable(t))"),
+        eval(
+            "local t = setmetatable({}, {__eq = function() return 'truthy string' end}) \
+              return t == setmetatable({}, getmetatable(t))"
+        ),
         "true"
     );
     // __eq not called when raw-equal
@@ -208,8 +219,10 @@ fn concat_len_call_metamethods() {
 #[test]
 fn tostring_metamethod() {
     assert_eq!(
-        eval("local t = setmetatable({}, {__tostring = function() return 'custom!' end}) \
-              return tostring(t)"),
+        eval(
+            "local t = setmetatable({}, {__tostring = function() return 'custom!' end}) \
+              return tostring(t)"
+        ),
         "custom!"
     );
 }
@@ -218,21 +231,27 @@ fn tostring_metamethod() {
 fn tostring_name_fallback() {
     // `__name` replaces the type tag in the default rendering.
     assert_eq!(
-        eval("local t = setmetatable({}, {__name = 'My Type'}) \
-              return tostring(t):match('^My Type: 0x') ~= nil"),
+        eval(
+            "local t = setmetatable({}, {__name = 'My Type'}) \
+              return tostring(t):match('^My Type: 0x') ~= nil"
+        ),
         "true"
     );
     // `__tostring` takes precedence over `__name`.
     assert_eq!(
-        eval("local t = setmetatable({}, {__name = 'N', \
+        eval(
+            "local t = setmetatable({}, {__name = 'N', \
                                           __tostring = function() return 'T' end}) \
-              return tostring(t)"),
+              return tostring(t)"
+        ),
         "T"
     );
     // threads render as `thread: 0x...`.
     assert_eq!(
-        eval("local co = coroutine.create(function() end) \
-              return tostring(co):match('^thread: 0x') ~= nil"),
+        eval(
+            "local co = coroutine.create(function() end) \
+              return tostring(co):match('^thread: 0x') ~= nil"
+        ),
         "true"
     );
 }
@@ -241,18 +260,22 @@ fn tostring_name_fallback() {
 fn print_honors_tostring() {
     // `print` must route each argument through `tostring` (luaL_tolstring).
     assert_eq!(
-        eval("local seen = 0 \
+        eval(
+            "local seen = 0 \
               local t = setmetatable({}, {__tostring = function() \
                   seen = seen + 1 return 'X' end}) \
               print(t) \
-              return seen"),
+              return seen"
+        ),
         "1"
     );
     // An error raised by `__tostring` propagates out of `print`.
     assert!(
-        run_err("local t = setmetatable({}, {__tostring = function() error('boom') end}) \
-                 print(t)")
-            .contains("boom")
+        run_err(
+            "local t = setmetatable({}, {__tostring = function() error('boom') end}) \
+                 print(t)"
+        )
+        .contains("boom")
     );
 }
 
@@ -260,32 +283,40 @@ fn print_honors_tostring() {
 fn pairs_metamethod() {
     // No metamethod: `next, t, nil`, and the iterator is the shared `next`.
     assert_eq!(
-        eval("local f, s, c = pairs({}) \
-              return f == next and type(s) == 'table' and c == nil"),
+        eval(
+            "local f, s, c = pairs({}) \
+              return f == next and type(s) == 'table' and c == nil"
+        ),
         "true"
     );
     // `__pairs` supplies its own iteration protocol.
     assert_eq!(
-        eval("local a = {} \
+        eval(
+            "local a = {} \
               setmetatable(a, {__pairs = function(x) return function(_, i) \
                   if i < 3 then return i + 1, (i + 1) * 10 end end, x, 0 end}) \
               local out = {} \
               for k, v in pairs(a) do out[#out + 1] = k .. '=' .. v end \
-              return table.concat(out, ',')"),
+              return table.concat(out, ',')"
+        ),
         "1=10,2=20,3=30"
     );
     // PUC returns exactly the three values read from the metamethod.
     assert_eq!(
-        eval("return select('#', pairs(setmetatable({}, {__pairs = function() \
-                 return function() end, 1, 2, 3, 4 end})))"),
+        eval(
+            "return select('#', pairs(setmetatable({}, {__pairs = function() \
+                 return function() end, 1, 2, 3, 4 end})))"
+        ),
         "3"
     );
     // A `__metatable` guard must not hide `__pairs`.
     assert_eq!(
-        eval("local a = setmetatable({}, {__metatable = 'locked', \
+        eval(
+            "local a = setmetatable({}, {__metatable = 'locked', \
                  __pairs = function(x) return function() end, 'st', 0 end}) \
               local f, s, c = pairs(a) \
-              return s == 'st' and c == 0 and type(f) == 'function'"),
+              return s == 'st' and c == 0 and type(f) == 'function'"
+        ),
         "true"
     );
     assert!(run_err("pairs()").contains("bad argument"));
@@ -295,12 +326,14 @@ fn pairs_metamethod() {
 fn ipairs_metamethod() {
     // `__index` drives the iteration (PUC 5.4 uses `lua_geti`).
     assert_eq!(
-        eval("local a = {n = 3} \
+        eval(
+            "local a = {n = 3} \
               setmetatable(a, {__index = function(t, k) \
                   if k <= t.n then return k * 10 end end}) \
               local out = {} \
               for k, v in ipairs(a) do out[#out + 1] = k .. '=' .. v end \
-              return table.concat(out, ',')"),
+              return table.concat(out, ',')"
+        ),
         "1=10,2=20,3=30"
     );
     // Iterator identity is stable across calls (nextvar.lua asserts this).
@@ -310,9 +343,11 @@ fn ipairs_metamethod() {
     );
     // The index wraps around like PUC's `luaL_intop(+, i, 1)`.
     assert_eq!(
-        eval("local f = ipairs{} \
+        eval(
+            "local f = ipairs{} \
               local k, v = f({[math.mininteger] = 10}, math.maxinteger) \
-              return k == math.mininteger and v == 10"),
+              return k == math.mininteger and v == 10"
+        ),
         "true"
     );
     assert!(run_err("ipairs()").contains("bad argument"));
@@ -323,11 +358,13 @@ fn len_metamethod_gets_operand_twice() {
     // PUC invokes unary metamethods with the operand duplicated; events.lua
     // observes `__len`'s argument list.
     assert_eq!(
-        eval("local t = setmetatable({}, {__len = function(...) \
+        eval(
+            "local t = setmetatable({}, {__len = function(...) \
                   local n = select('#', ...) \
                   local a, b = ... \
                   return tostring(n) .. ':' .. tostring(a == b) end}) \
-              return #t"),
+              return #t"
+        ),
         "2:true"
     );
 }
@@ -336,12 +373,18 @@ fn len_metamethod_gets_operand_twice() {
 
 #[test]
 fn pcall_basics() {
-    assert_eq!(eval_multi("return pcall(function() return 1, 2 end)"), ["true", "1", "2"]);
+    assert_eq!(
+        eval_multi("return pcall(function() return 1, 2 end)"),
+        ["true", "1", "2"]
+    );
     assert_eq!(
         eval_multi("return pcall(function() error('boom') end)"),
         ["false", "chunk:1: boom"]
     );
-    assert_eq!(eval_multi("return pcall(function(a, b) return a + b end, 1, 2)"), ["true", "3"]);
+    assert_eq!(
+        eval_multi("return pcall(function(a, b) return a + b end, 1, 2)"),
+        ["true", "3"]
+    );
     // runtime errors are caught
     assert_eq!(
         eval("local ok, err = pcall(function() return nil + 1 end) return ok"),
@@ -382,7 +425,10 @@ fn error_values_roundtrip() {
         "chunk:1: assertion failed!"
     );
     // assert passes values through on success
-    assert_eq!(eval_multi("return assert(1, 'unused', 3)"), ["1", "unused", "3"]);
+    assert_eq!(
+        eval_multi("return assert(1, 'unused', 3)"),
+        ["1", "unused", "3"]
+    );
 }
 
 #[test]
@@ -425,6 +471,25 @@ fn xpcall_handler() {
 }
 
 #[test]
+fn xpcall_handler_error_reports_error_in_error_handling() {
+    // Reentrant overflow: `loop` is both the protected call and the message
+    // handler, so the handler itself overflows. PUC reports this as
+    // `false, "error in error handling"` rather than escaping the xpcall.
+    assert_eq!(
+        eval_multi(
+            "local function loop() assert(pcall(loop)) end \
+             return xpcall(loop, loop)"
+        ),
+        ["false", "error in error handling"]
+    );
+    // A handler that errors directly also gets the sentinel message.
+    assert_eq!(
+        eval_multi("return xpcall(function() error('boom') end, function() error('handler') end)"),
+        ["false", "error in error handling"]
+    );
+}
+
+#[test]
 fn pcall_catches_metamethod_errors() {
     assert_eq!(
         eval(
@@ -459,10 +524,7 @@ fn uncaught_error_value_reaches_host() {
 #[test]
 fn goto_basics() {
     // forward jump skipping code
-    assert_eq!(
-        eval("local x = 1 goto done x = 2 ::done:: return x"),
-        "1"
-    );
+    assert_eq!(eval("local x = 1 goto done x = 2 ::done:: return x"), "1");
     // backward jump: loop via goto
     assert_eq!(
         eval(
@@ -505,29 +567,33 @@ fn goto_basics() {
 fn goto_scope_errors() {
     let mut lua = Lua::new();
     // jumping into the scope of a local
-    assert!(lua
-        .load("goto skip local x = 1 ::skip:: return x")
-        .unwrap_err()
-        .to_string()
-        .contains("jumps into the scope"));
+    assert!(
+        lua.load("goto skip local x = 1 ::skip:: return x")
+            .unwrap_err()
+            .to_string()
+            .contains("jumps into the scope")
+    );
     // unmatched label
-    assert!(lua
-        .load("goto nowhere")
-        .unwrap_err()
-        .to_string()
-        .contains("no visible label"));
+    assert!(
+        lua.load("goto nowhere")
+            .unwrap_err()
+            .to_string()
+            .contains("no visible label")
+    );
     // label in another function is not visible
-    assert!(lua
-        .load("local function f() ::inner:: end goto inner")
-        .unwrap_err()
-        .to_string()
-        .contains("no visible label"));
+    assert!(
+        lua.load("local function f() ::inner:: end goto inner")
+            .unwrap_err()
+            .to_string()
+            .contains("no visible label")
+    );
     // duplicate label in same block
-    assert!(lua
-        .load("::l:: ::l::")
-        .unwrap_err()
-        .to_string()
-        .contains("already defined"));
+    assert!(
+        lua.load("::l:: ::l::")
+            .unwrap_err()
+            .to_string()
+            .contains("already defined")
+    );
 }
 
 #[test]

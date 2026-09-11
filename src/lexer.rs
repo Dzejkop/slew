@@ -772,6 +772,18 @@ mod tests {
         }
     }
 
+    /// Lexes `src` expecting a failure and returns the error message.
+    fn lex_err(src: &str) -> String {
+        let mut l = Lexer::new(src.as_bytes());
+        loop {
+            match l.next_token() {
+                Ok((Token::Eof, _)) => panic!("expected lex error: {src:?}"),
+                Ok(_) => continue,
+                Err(e) => return e.message,
+            }
+        }
+    }
+
     #[test]
     fn names_keywords_symbols() {
         assert_eq!(
@@ -897,5 +909,54 @@ mod tests {
         assert!(l.next_token().is_err());
         let mut l = Lexer::new(b"3a");
         assert!(l.next_token().is_err());
+    }
+
+    #[test]
+    fn malformed_escapes_report_puc_near_text() {
+        // PUC appends `near '<source text>'` naming the malformed token.
+        assert_eq!(
+            lex_err(r#""\x""#),
+            r#"hexadecimal digit expected near '"\x"'"#
+        );
+        assert_eq!(
+            lex_err(r#""\xG""#),
+            r#"hexadecimal digit expected near '"\xG'"#
+        );
+        // \u{...} diagnostics
+        assert_eq!(lex_err(r#""\u""#), r#"missing '{' near '"\u"'"#);
+        assert_eq!(
+            lex_err(r#""\u{}""#),
+            r#"hexadecimal digit expected near '"\u{}'"#
+        );
+        assert_eq!(lex_err(r#""\u{48""#), r#"missing '}' near '"\u{48"'"#);
+        assert_eq!(
+            lex_err(r#""\u{110000000}""#),
+            r#"UTF-8 value too large near '"\u{110000000'"#
+        );
+        // oversized decimal escapes
+        assert_eq!(
+            lex_err(r#""\256""#),
+            r#"decimal escape too large near '"\256"'"#
+        );
+        assert_eq!(
+            lex_err(r#""\999""#),
+            r#"decimal escape too large near '"\999"'"#
+        );
+        // an unknown escape names the offending character
+        assert_eq!(lex_err(r#""\q""#), r#"invalid escape sequence near '"\q'"#);
+    }
+
+    #[test]
+    fn unfinished_strings_report_near_text_or_eof() {
+        // Hitting a newline reports the text consumed so far.
+        assert_eq!(lex_err("\"a\nb\""), "unfinished string near '\"a'");
+        assert_eq!(lex_err("'x\rY'"), "unfinished string near ''x'");
+        // Running off the end of input reports `<eof>`.
+        assert_eq!(lex_err("\"abc"), "unfinished string near <eof>");
+        assert_eq!(lex_err("\"abc\\"), "unfinished string near <eof>");
+        assert_eq!(
+            lex_err("[[abc"),
+            "unfinished long string/comment near <eof>"
+        );
     }
 }

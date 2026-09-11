@@ -3,7 +3,9 @@ use slew::{Lua, Step, Value};
 /// Runs a script to completion with a generous fuel budget; panics if it
 /// doesn't finish. Returns the script's return values.
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..1000 {
         match exec.step(lua, 100_000) {
@@ -31,7 +33,9 @@ fn eval_multi(src: &str) -> Vec<String> {
 
 fn run_err(src: &str) -> String {
     let mut lua = Lua::new();
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     loop {
         match exec.step(&mut lua, 100_000) {
@@ -55,7 +59,10 @@ fn numbers_54_semantics() {
     assert_eq!(eval("return 7.0 // 2"), "3.0"); // float floor div stays float
     assert_eq!(eval("return 2 ^ 10"), "1024.0"); // ^ is always float
     assert_eq!(eval("return 1 + 0.5"), "1.5");
-    assert_eq!(eval("return 9223372036854775807 + 1"), "-9223372036854775808"); // wraps
+    assert_eq!(
+        eval("return 9223372036854775807 + 1"),
+        "-9223372036854775808"
+    ); // wraps
     assert_eq!(eval("return 1 == 1.0"), "true");
     assert_eq!(eval("return 1 < 1.5"), "true");
     assert_eq!(eval("return 0.0 == -0.0"), "true");
@@ -111,7 +118,10 @@ fn numeric_string_arithmetic_coercion() {
 fn next_rejects_invalid_keys() {
     assert!(run_err("return next({10, 20}, 3)").contains("invalid key"));
     assert!(run_err("return next({}, 0/0)").contains("invalid key"));
-    assert_eq!(eval("local t = {10, 20} local k, v = next(t) return k .. ':' .. v"), "1:10");
+    assert_eq!(
+        eval("local t = {10, 20} local k, v = next(t) return k .. ':' .. v"),
+        "1:10"
+    );
 }
 
 #[test]
@@ -186,7 +196,45 @@ fn tostring_conversions() {
     assert_eq!(eval("return tonumber('3.5e2')"), "350.0");
     assert_eq!(eval("return tonumber('zz', 36)"), "1295");
     assert_eq!(eval("return tonumber('hello')"), "nil");
-    assert_eq!(eval("return type(3) .. type('') .. type(nil)"), "numberstringnil");
+    assert_eq!(
+        eval("return type(3) .. type('') .. type(nil)"),
+        "numberstringnil"
+    );
+}
+
+#[test]
+fn tonumber_signed_integer_boundaries() {
+    // The sign is parsed together with the digits, so the exact signed
+    // minimum stays an integer (matching PUC's `luaO_str2num`).
+    assert_eq!(
+        eval("return math.type(tonumber('-9223372036854775808'))"),
+        "integer"
+    );
+    assert_eq!(
+        eval("return tonumber('-9223372036854775808') == math.mininteger"),
+        "true"
+    );
+    // One past the signed minimum is a genuine float numeral, positive side too.
+    assert_eq!(
+        eval("return math.type(tonumber('-9223372036854775809'))"),
+        "float"
+    );
+    assert_eq!(
+        eval("return math.type(tonumber('9223372036854775809'))"),
+        "float"
+    );
+    assert_eq!(
+        eval("return tonumber('-9223372036854775809') == -9223372036854775809"),
+        "true"
+    );
+    assert_eq!(
+        eval("return tonumber('9223372036854775809') == 9223372036854775809"),
+        "true"
+    );
+    // No whitespace is allowed between a sign and its digits.
+    assert_eq!(eval("return tonumber('+ 0.01')"), "nil");
+    assert_eq!(eval("return tonumber('- 0.01')"), "nil");
+    assert_eq!(eval("return tonumber('+0.01')"), "0.01");
 }
 
 // ---- control flow ----
@@ -201,7 +249,10 @@ fn control_flow() {
         eval("local s = 0 for i = 10, 1, -2 do s = s + i end return s"),
         "30"
     );
-    assert_eq!(eval("local s = 0 for i = 1, 0 do s = s + 1 end return s"), "0");
+    assert_eq!(
+        eval("local s = 0 for i = 1, 0 do s = s + 1 end return s"),
+        "0"
+    );
     assert_eq!(
         eval("local s = 0.0 for i = 1.0, 2.0, 0.5 do s = s + i end return s"),
         "4.5"
@@ -237,11 +288,16 @@ fn control_flow() {
 fn numeric_for_edge_cases() {
     // loop var is local to the loop and reset each run; loop to i64::MAX must terminate
     assert_eq!(
-        eval("local n = 0 for i = 9223372036854775805, 9223372036854775807 do n = n + 1 end return n"),
+        eval(
+            "local n = 0 for i = 9223372036854775805, 9223372036854775807 do n = n + 1 end return n"
+        ),
         "3"
     );
     // float limit on an integer loop
-    assert_eq!(eval("local n = 0 for i = 1, 3.5 do n = n + 1 end return n"), "3");
+    assert_eq!(
+        eval("local n = 0 for i = 1, 3.5 do n = n + 1 end return n"),
+        "3"
+    );
     assert!(run_err("for i = 1, 10, 0 do end").contains("step is zero"));
     assert!(run_err("for i = 1, 'x' do end").contains("must be a number"));
 }
@@ -251,7 +307,9 @@ fn numeric_for_edge_cases() {
 #[test]
 fn functions_and_recursion() {
     assert_eq!(
-        eval("local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end return fib(20)"),
+        eval(
+            "local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end return fib(20)"
+        ),
         "6765"
     );
     assert_eq!(
@@ -259,8 +317,14 @@ fn functions_and_recursion() {
         "21"
     );
     // multiple returns adjust
-    assert_eq!(eval_multi("local function f() return 1, 2, 3 end return f()"), ["1", "2", "3"]);
-    assert_eq!(eval("local function f() return 1, 2, 3 end return (f())"), "1"); // parens truncate
+    assert_eq!(
+        eval_multi("local function f() return 1, 2, 3 end return f()"),
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        eval("local function f() return 1, 2, 3 end return (f())"),
+        "1"
+    ); // parens truncate
     assert_eq!(
         eval_multi("local function f() return 1, 2 end return f(), 10"),
         ["1", "10"] // non-tail call truncates to one value
@@ -270,8 +334,14 @@ fn functions_and_recursion() {
         ["10", "1", "2"] // tail position expands
     );
     // missing args become nil, extras dropped
-    assert_eq!(eval("local function f(a, b) return tostring(b) end return f(1)"), "nil");
-    assert_eq!(eval("local function f(a) return a end return f(1, 2, 3)"), "1");
+    assert_eq!(
+        eval("local function f(a, b) return tostring(b) end return f(1)"),
+        "nil"
+    );
+    assert_eq!(
+        eval("local function f(a) return a end return f(1, 2, 3)"),
+        "1"
+    );
 }
 
 #[test]
@@ -327,7 +397,10 @@ fn varargs() {
         eval("local function f(a, ...) return a + select('#', ...) end return f(10, 1, 1, 1)"),
         "13"
     );
-    assert_eq!(eval("local function f(...) local t = {...} return #t end return f(1, 2, 3)"), "3");
+    assert_eq!(
+        eval("local function f(...) local t = {...} return #t end return f(1, 2, 3)"),
+        "3"
+    );
 }
 
 // ---- tables ----
@@ -336,11 +409,16 @@ fn varargs() {
 fn tables() {
     assert_eq!(eval("local t = {1, 2, 3} return #t"), "3");
     assert_eq!(eval("local t = {a = 1, b = 2} return t.a + t.b"), "3");
-    assert_eq!(eval("local t = {[2] = 'two', 'one'} return t[1] .. t[2]"), "onetwo");
+    assert_eq!(
+        eval("local t = {[2] = 'two', 'one'} return t[1] .. t[2]"),
+        "onetwo"
+    );
     assert_eq!(eval("local t = {} t[1.0] = 'x' return t[1]"), "x"); // key normalization
     assert_eq!(eval("local t = {} t.x = 10 t.x = t.x + 1 return t.x"), "11");
     assert_eq!(
-        eval("local t = {10, 20, 30} local s = 0 for i, v in ipairs(t) do s = s + i * v end return s"),
+        eval(
+            "local t = {10, 20, 30} local s = 0 for i, v in ipairs(t) do s = s + i * v end return s"
+        ),
         "140"
     );
     assert_eq!(
@@ -375,7 +453,10 @@ fn big_table_constructor_flushes() {
     // more than one SetList batch (50 per flush)
     let src = format!(
         "local t = {{{}}} return #t + t[60]",
-        (1..=120).map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+        (1..=120)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     assert_eq!(eval(&src), "180");
 }
@@ -416,7 +497,9 @@ fn infinite_loop_suspends() {
         assert_eq!(exec.step(&mut lua, 1_000).unwrap(), Step::Pending);
     }
     // the script made real progress while staying interruptible
-    let Value::Int(n) = lua.get_global("n") else { panic!() };
+    let Value::Int(n) = lua.get_global("n") else {
+        panic!()
+    };
     assert!(n > 100, "loop should have progressed, n = {n}");
     assert!(!exec.is_finished());
 }
@@ -426,7 +509,9 @@ fn fuel_is_deterministic() {
     // identical fuel schedules suspend at exactly the same point
     let observe = |budgets: &[u64]| -> i64 {
         let mut lua = Lua::new();
-        let chunk = lua.load("n = 0 for i = 1, 1000000 do n = n + 1 end").unwrap();
+        let chunk = lua
+            .load("n = 0 for i = 1, 1000000 do n = n + 1 end")
+            .unwrap();
         let mut exec = lua.execute(&chunk);
         for &b in budgets {
             let _ = exec.step(&mut lua, b).unwrap();
@@ -460,7 +545,10 @@ fn fuel_proportional_progress() {
     let p2 = progress(20_000);
     // double fuel ≈ double progress (same per-iteration cost)
     let ratio = p2 as f64 / p1 as f64;
-    assert!((1.9..=2.1).contains(&ratio), "ratio {ratio}, p1 {p1}, p2 {p2}");
+    assert!(
+        (1.9..=2.1).contains(&ratio),
+        "ratio {ratio}, p1 {p1}, p2 {p2}"
+    );
 }
 
 #[test]
@@ -490,7 +578,10 @@ fn suspension_mid_call_resumes_correctly() {
             }
         }
     }
-    assert!(steps > 1000, "should have taken many single-instruction steps");
+    assert!(
+        steps > 1000,
+        "should have taken many single-instruction steps"
+    );
 }
 
 #[test]
@@ -507,7 +598,10 @@ fn step_after_done_errors() {
     let mut lua = Lua::new();
     let chunk = lua.load("return 1").unwrap();
     let mut exec = lua.execute(&chunk);
-    assert_eq!(exec.step(&mut lua, 100).unwrap(), Step::Done(vec![Value::Int(1)]));
+    assert_eq!(
+        exec.step(&mut lua, 100).unwrap(),
+        Step::Done(vec![Value::Int(1)])
+    );
     assert!(exec.step(&mut lua, 100).is_err());
 }
 
@@ -531,7 +625,9 @@ fn execution_location_tracks_current_line() {
 #[test]
 fn two_executions_share_globals_but_not_control() {
     let mut lua = Lua::new();
-    let writer = lua.load("i = (i or 0) while true do i = i + 1 end").unwrap();
+    let writer = lua
+        .load("i = (i or 0) while true do i = i + 1 end")
+        .unwrap();
     let reader = lua.load("return i").unwrap();
     let mut w = lua.execute(&writer);
     let _ = w.step(&mut lua, 5_000).unwrap();

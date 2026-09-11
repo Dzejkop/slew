@@ -405,6 +405,11 @@ function table.sort(t, cmp)
       if cmp(t[mid], t[lo]) then t[lo], t[mid] = t[mid], t[lo] end
       if cmp(t[hi], t[lo]) then t[lo], t[hi] = t[hi], t[lo] end
       if cmp(t[hi], t[mid]) then t[mid], t[hi] = t[hi], t[mid] end
+      -- Ranges of two or three elements are fully ordered by the median step
+      -- above, so there is nothing left to partition. PUC's auxsort returns
+      -- at the same points (`up - lo == 1` / `up - lo == 2`), which is why its
+      -- invalid-order guard only fires for four or more elements.
+      if hi - lo <= 2 then return end
       local p = t[mid]
       local i, j = lo, hi
       while true do

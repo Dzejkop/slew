@@ -500,6 +500,43 @@ fn table_sort() {
 }
 
 #[test]
+fn table_sort_length_rules() {
+    // PUC skips the sort entirely when the length is at most 1, so a
+    // comparator that would blow up is never called.
+    assert_eq!(
+        eval(
+            "local a = setmetatable({}, {__len = function() return -1 end}) \
+             table.sort(a, error) return 'ok'"
+        ),
+        "ok"
+    );
+    // An oversized length is rejected up front, before any comparison.
+    let e = run_err(
+        "local a = setmetatable({}, {__len = function() return math.maxinteger end}) \
+         table.sort(a, function() error('compared') end)",
+    );
+    assert!(e.contains("too big"), "unexpected error: {e}");
+}
+
+#[test]
+fn table_sort_invalid_order_guard_small_arrays() {
+    // PUC's small-range fast paths stop after sorting two or three elements,
+    // so an always-true comparator is only detected from four elements up.
+    let always = "function(a, b) assert(a and b); return true end";
+    for n in 1..=3 {
+        let src = format!(
+            "local t = {{}} for i = 1, {n} do t[i] = i end table.sort(t, {always}) return 'ok'"
+        );
+        assert_eq!(eval(&src), "ok", "n={n} must not raise");
+    }
+    for n in 4..=6 {
+        let src = format!("local t = {{}} for i = 1, {n} do t[i] = i end table.sort(t, {always})");
+        let e = run_err(&src);
+        assert!(e.contains("invalid order function"), "n={n} produced: {e}");
+    }
+}
+
+#[test]
 fn table_move() {
     // forward, overlapping, backward, and explicit-destination forms
     assert_eq!(
