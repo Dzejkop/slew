@@ -8,27 +8,15 @@ local unpack, concat = table.unpack, table.concat
 local raw_remove = table.remove
 local getmetatable = getmetatable
 local next, select, tostring, rawget = next, select, tostring, rawget
-local raw_print = print
 -- Raw metatable (bypasses the `__metatable` guard); the native is a private
 -- seed global, removed from the environment once captured.
 local raw_metatable = __slew_getmetatable
 __slew_getmetatable = nil
 
 -- ---- base functions that must call back into Lua -----------------------
--- Natives cannot invoke metamethods, so `print` (via `tostring`), `pairs`
--- (`__pairs`) and `ipairs` (`__index`) live here and run through the VM.
-
--- PUC's `print` applies `luaL_tolstring` to each argument, i.e. it honors
--- `__tostring`/`__name`. `tostring` is captured above, so redefining the
--- global later does not change `print`, matching PUC.
-function print(...)
-  local n = select('#', ...)
-  local out = {}
-  for i = 1, n do
-    out[i] = tostring((select(i, ...)))
-  end
-  raw_print(unpack(out, 1, n))
-end
+-- Natives cannot invoke metamethods, so `pairs` (`__pairs`) and `ipairs`
+-- (`__index`) live here and run through the VM. `print` is a native-backed
+-- intrinsic (so it has no upvalues) that drives `__tostring` per argument.
 
 function pairs(...)
   if select('#', ...) == 0 then

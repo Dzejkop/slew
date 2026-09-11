@@ -3,7 +3,9 @@
 use slew::{Error, Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..100_000 {
         match exec.step(lua, 1_000_000) {
@@ -35,7 +37,10 @@ fn collects_garbage_tables_and_strings() {
         "GC should reclaim most garbage: before {before}, after {after}"
     );
     // within ~2x of the fresh baseline (kept data + slack survives)
-    assert!(after < baseline * 3 + 200_000, "after {after}, baseline {baseline}");
+    assert!(
+        after < baseline * 3 + 200_000,
+        "after {after}, baseline {baseline}"
+    );
     // survivors intact
     let vals = run(&mut lua, "return #kept, kept[1][3]");
     assert_eq!(vals[0], Value::Int(10));
@@ -166,7 +171,10 @@ fn aborted_execution_releases_roots() {
         let _ = exec.step(&mut lua, 100_000).unwrap();
     }
     let with_live = lua.gc();
-    assert!(with_live > baseline + 1_000_000, "table should be live: {with_live}");
+    assert!(
+        with_live > baseline + 1_000_000,
+        "table should be live: {with_live}"
+    );
     exec.abort(&mut lua);
     let after_abort = lua.gc();
     assert!(
@@ -199,7 +207,11 @@ fn memory_limit_enforced() {
             Err(e) => panic!("unexpected: {e}"),
         }
     };
-    assert!(err.message.contains("not enough memory"), "got: {}", err.message);
+    assert!(
+        err.message.contains("not enough memory"),
+        "got: {}",
+        err.message
+    );
 }
 
 #[test]
@@ -209,7 +221,10 @@ fn gc_disabled_when_threshold_zero() {
     run(&mut lua, "for i = 1, 10000 do local _ = {tostring(i)} end");
     let before = lua.memory_used();
     let after = lua.gc(); // manual collection still works
-    assert!(after < before, "manual gc should reclaim: {after} vs {before}");
+    assert!(
+        after < before,
+        "manual gc should reclaim: {after} vs {before}"
+    );
 }
 
 #[test]
@@ -233,4 +248,238 @@ fn determinism_unaffected_by_gc_pressure() {
         }
     };
     assert_eq!(observe(500), observe(1_000_000));
+}
+
+// ---- Phase 6: weak tables, finalizers, collectgarbage, coroutine.close ----
+
+#[test]
+fn collectgarbage_options() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local a = collectgarbage('isrunning')
+         collectgarbage('stop')
+         local b = collectgarbage('isrunning')
+         local c = collectgarbage('restart')
+         local d = collectgarbage('isrunning')
+         local e = collectgarbage('setpause', 123)
+         local f = collectgarbage('setstepmul', 45)
+         local cnt = collectgarbage('count')
+         local col = collectgarbage('collect')
+         local st = collectgarbage('step')
+         return a, b, c, d, e, f, type(cnt) == 'number' and cnt > 0, col, st",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(vals[1], Value::Bool(false));
+    assert_eq!(vals[2], Value::Int(0));
+    assert_eq!(vals[3], Value::Bool(true));
+    assert_eq!(vals[4], Value::Int(200));
+    assert_eq!(vals[5], Value::Int(100));
+    assert_eq!(vals[6], Value::Bool(true));
+    assert_eq!(vals[7], Value::Int(0));
+    assert_eq!(vals[8], Value::Bool(false));
+}
+
+#[test]
+fn collectgarbage_mode_switch_and_errors() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local a = collectgarbage('incremental')  -- previous is generational
+         local b = collectgarbage('generational') -- previous is incremental
+         local ok = pcall(collectgarbage, 'bogus')
+         return a, b, ok",
+    );
+    assert_eq!(lua.display_value(vals[0]), "generational");
+    assert_eq!(lua.display_value(vals[1]), "incremental");
+    assert_eq!(vals[2], Value::Bool(false));
+}
+
+#[test]
+fn weak_values_are_cleared_and_strings_kept() {
+    let mut lua = Lua::new();
+    // The collector scans the whole thread stack, so a value can survive in a
+    // dead temporary slot (see DESIGN.md "root precision"); creating many in
+    // a loop reuses those slots, so all but a few are reclaimed.
+    let vals = run(
+        &mut lua,
+        "local t = setmetatable({}, {__mode = 'v'})
+         for i = 1, 20 do
+           local v = {}
+           t[i] = v
+           v = nil
+         end
+         t.str = 'kept'
+         collectgarbage()
+         local n = 0
+         for _ in pairs(t) do n = n + 1 end
+         return n <= 2, t.str",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(lua.display_value(vals[1]), "kept");
+}
+
+#[test]
+fn weak_keys_and_ephemerons() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local t = setmetatable({}, {__mode = 'k'})
+         local k = {}
+         t[k] = 'value'
+         collectgarbage()
+         local alive = t[k] ~= nil   -- key still referenced
+         k = nil
+         collectgarbage()
+         local n = 0
+         for _ in pairs(t) do n = n + 1 end
+         return alive, n",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(vals[1], Value::Int(0));
+}
+
+#[test]
+fn weak_kv_with_numeric_key_clears_value() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local x = {[1] = {}}
+         setmetatable(x, {__mode = 'kv'})
+         collectgarbage()
+         return rawget(x, 1) == nil, getmetatable(x).__mode",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(lua.display_value(vals[1]), "kv");
+}
+
+#[test]
+fn gc_finalizer_runs_and_resurrects() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local saved
+         local o = setmetatable({}, {__gc = function(self) saved = self end})
+         o = nil
+         collectgarbage()
+         local resurrected = saved ~= nil
+         saved = nil
+         collectgarbage()   -- the resurrected object is now collected
+         return resurrected",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+}
+
+#[test]
+fn gc_finalizer_is_one_shot() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local n = 0
+         local o = setmetatable({}, {__gc = function() n = n + 1 end})
+         o = nil
+         collectgarbage()
+         collectgarbage()
+         collectgarbage()
+         return n",
+    );
+    assert_eq!(vals[0], Value::Int(1));
+}
+
+#[test]
+fn gc_finalizer_order_is_lifo() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local order = {}
+         local a = setmetatable({}, {__gc = function() order[#order+1] = 'a' end})
+         local b = setmetatable({}, {__gc = function() order[#order+1] = 'b' end})
+         a = nil; b = nil
+         collectgarbage()
+         return order[1], order[2]",
+    );
+    assert_eq!(lua.display_value(vals[0]), "b");
+    assert_eq!(lua.display_value(vals[1]), "a");
+}
+
+#[test]
+fn coroutine_is_yieldable_and_tostring() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local main = coroutine.running()
+         local co = coroutine.create(function() coroutine.yield() end)
+         local r = {coroutine.isyieldable(main), coroutine.isyieldable(co),
+                    string.find(tostring(co), 'thread') ~= nil}
+         local ok = pcall(coroutine.isyieldable, 5)
+         return r[1], r[2], r[3], ok",
+    );
+    assert_eq!(vals[0], Value::Bool(false));
+    assert_eq!(vals[1], Value::Bool(true));
+    assert_eq!(vals[2], Value::Bool(true));
+    assert_eq!(vals[3], Value::Bool(false));
+}
+
+#[test]
+fn coroutine_close_runs_tbc_and_returns() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local log = {}
+         local co = coroutine.create(function()
+           local x <close> = setmetatable({}, {__close = function(_, err) log[#log+1] = err == nil and 'nil' or err end})
+           coroutine.yield('y')
+         end)
+         local ok, v = coroutine.resume(co)
+         local st = coroutine.close(co)
+         local st2 = coroutine.close(co)
+         local running = pcall(coroutine.close, coroutine.running())
+         return ok, v, st, st2, #log, log[1], coroutine.status(co), running",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(lua.display_value(vals[1]), "y");
+    assert_eq!(vals[2], Value::Bool(true));
+    assert_eq!(vals[3], Value::Bool(true));
+    assert_eq!(vals[4], Value::Int(1));
+    assert_eq!(lua.display_value(vals[5]), "nil");
+    assert_eq!(lua.display_value(vals[6]), "dead");
+    assert_eq!(vals[7], Value::Bool(false));
+}
+
+#[test]
+fn coroutine_close_reports_close_error() {
+    let mut lua = Lua::new();
+    let vals = run(
+        &mut lua,
+        "local co = coroutine.create(function()
+           local z <close> = setmetatable({}, {__close = function() error('boom') end})
+           coroutine.yield()
+         end)
+         coroutine.resume(co)
+         local st, msg = coroutine.close(co)
+         return st, msg",
+    );
+    assert_eq!(vals[0], Value::Bool(false));
+    assert!(lua.display_value(vals[1]).contains("boom"));
+}
+
+#[test]
+fn next_skips_collected_weak_entries() {
+    let mut lua = Lua::new();
+    // The result mirrors a test pattern: a weak-keyed table whose only key
+    // dies; `next`/`pairs` must not report the collected entry.
+    let vals = run(
+        &mut lua,
+        "local t = setmetatable({}, {__mode = 'k'})
+         local k = {}
+         t[k] = true
+         k = nil
+         collectgarbage()
+         local first = next(t)
+         local n = 0
+         for _ in pairs(t) do n = n + 1 end
+         return first == nil, n",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(vals[1], Value::Int(0));
 }

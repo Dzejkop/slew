@@ -132,18 +132,27 @@ through a capability the embedder installs explicitly.
 - An error raised by a `__close` handler during unwinding supersedes the
   original error and skips remaining closes up to the next handler.
 - `tostring`/`print` honor `__tostring` and fall back to `__name`; `pairs`
-  honors `__pairs` and `ipairs` honors `__index` (PUC 5.4 semantics).
-- No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
-  rarely needs them; resources should be host-managed.
+  honors `__pairs` and `ipairs` honors `__index` (PUC 5.4 semantics). `print`
+  and `collectgarbage` are intrinsics (not prelude Lua closures) so they are
+  C-like functions with no upvalues.
+- Weak tables (`__mode` = `k`/`v`/`kv`), ephemeron semantics, and `__gc`
+  finalizers (run once, may resurrect, LIFO) are implemented in the mark-sweep
+  collector, as is `collectgarbage([opt[, arg]])` and `coroutine.close`.
+- **Root precision caveat**: the collector scans each thread's whole stack,
+  including slots of popped frames and dead temporaries, because the VM does
+  not track a precise dynamic stack top. Values can therefore survive a
+  collection that PUC would have reclaimed (visible only through weak tables
+  or `__gc`); it is over-retention, never premature collection.
 - Binary chunks are rejected: `string.dump` is absent and `load` refuses the
   `\x1bLua` signature.
 - `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
   supported.
 - `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the
   upvalue API, and the metatable bypass). Two deviations follow from the
-  architecture: prelude stdlib functions are Lua closures carrying an `_ENV`
-  upvalue, so `debug.getinfo` reports `what == "Lua"` for e.g. `print`
-  instead of `"C"` and `debug.upvaluejoin` treats them like any closure; and
+  architecture: prelude stdlib functions (e.g. `pairs`, `ipairs`,
+  `table.sort`) are Lua closures carrying an `_ENV` upvalue, so
+  `debug.getinfo` reports `what == "Lua"` for them instead of `"C"` and
+  `debug.upvaluejoin` treats them like any closure; and
   there is no C-frame model for `pcall`/`coroutine.yield`, so traceback's C
   frames, level 0 on a suspended coroutine, and `getinfo` level 0 differ
   from PUC.

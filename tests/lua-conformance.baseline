@@ -1,7 +1,7 @@
 # First failure per official Lua 5.4.9 test file.
 # status: ok | line:N | timeout | panic
 vararg.lua	ok
-closure.lua	timeout
+closure.lua	ok
 nextvar.lua	line:364
 pm.lua	line:436
 utf8.lua	ok
@@ -18,4 +18,4 @@ bitwise.lua	ok
 tpack.lua	ok
 literals.lua	line:86
 attrib.lua	line:9
-coroutine.lua	line:50
+coroutine.lua	line:238

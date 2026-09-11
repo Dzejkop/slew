@@ -11,7 +11,7 @@
 //! always a regression. Refresh the baseline after intentional progress with
 //! `SLEW_BLESS=1 cargo test --test conformance -- --ignored --nocapture`.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -32,34 +32,88 @@ T = nil
 package.path = "?.lua;libs/?.lua"
 "#;
 
-/// Test-only stand-in for the absent GC controls.
-const SHIM_GC: &str = "collectgarbage = function(...) return 0 end\n";
-
 struct Case {
     file: &'static str,
     shims: &'static str,
 }
 
 const CASES: &[Case] = &[
-    Case { file: "vararg.lua", shims: "" },
-    Case { file: "closure.lua", shims: SHIM_GC },
-    Case { file: "nextvar.lua", shims: SHIM_GC },
-    Case { file: "pm.lua", shims: "" },
-    Case { file: "utf8.lua", shims: "" },
-    Case { file: "sort.lua", shims: "" },
-    Case { file: "strings.lua", shims: "" },
-    Case { file: "math.lua", shims: SHIM_GC },
-    Case { file: "verybig.lua", shims: "" },
-    Case { file: "constructs.lua", shims: SHIM_GC },
-    Case { file: "locals.lua", shims: SHIM_GC },
-    Case { file: "goto.lua", shims: SHIM_GC },
-    Case { file: "calls.lua", shims: "" },
-    Case { file: "events.lua", shims: SHIM_GC },
-    Case { file: "bitwise.lua", shims: "" },
-    Case { file: "tpack.lua", shims: "" },
-    Case { file: "literals.lua", shims: "" },
-    Case { file: "attrib.lua", shims: "" },
-    Case { file: "coroutine.lua", shims: SHIM_GC },
+    Case {
+        file: "vararg.lua",
+        shims: "",
+    },
+    Case {
+        file: "closure.lua",
+        shims: "",
+    },
+    Case {
+        file: "nextvar.lua",
+        shims: "",
+    },
+    Case {
+        file: "pm.lua",
+        shims: "",
+    },
+    Case {
+        file: "utf8.lua",
+        shims: "",
+    },
+    Case {
+        file: "sort.lua",
+        shims: "",
+    },
+    Case {
+        file: "strings.lua",
+        shims: "",
+    },
+    Case {
+        file: "math.lua",
+        shims: "",
+    },
+    Case {
+        file: "verybig.lua",
+        shims: "",
+    },
+    Case {
+        file: "constructs.lua",
+        shims: "",
+    },
+    Case {
+        file: "locals.lua",
+        shims: "",
+    },
+    Case {
+        file: "goto.lua",
+        shims: "",
+    },
+    Case {
+        file: "calls.lua",
+        shims: "",
+    },
+    Case {
+        file: "events.lua",
+        shims: "",
+    },
+    Case {
+        file: "bitwise.lua",
+        shims: "",
+    },
+    Case {
+        file: "tpack.lua",
+        shims: "",
+    },
+    Case {
+        file: "literals.lua",
+        shims: "",
+    },
+    Case {
+        file: "attrib.lua",
+        shims: "",
+    },
+    Case {
+        file: "coroutine.lua",
+        shims: "",
+    },
 ];
 
 /// Fuel granted per `step`; execution is bounded by wall clock, not fuel.
@@ -110,10 +164,7 @@ impl Status {
 fn suite_dir() -> Option<PathBuf> {
     let candidates = [
         std::env::var_os("SLEW_LUA_TESTS_DIR").map(PathBuf::from),
-        Some(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target/lua-tests/lua-5.4.9-tests"),
-        ),
+        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/lua-tests/lua-5.4.9-tests")),
     ];
     candidates
         .into_iter()
@@ -147,13 +198,17 @@ fn official_lua_suite() {
             "{:>8}  {}{}",
             status.label(),
             case.file,
-            if case.shims.is_empty() { "" } else { "  (+shims)" }
+            if case.shims.is_empty() {
+                ""
+            } else {
+                "  (+shims)"
+            }
         );
         results.push((case.file, status));
     }
 
-    let baseline_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/lua-conformance.baseline");
+    let baseline_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/lua-conformance.baseline");
     if std::env::var_os("SLEW_BLESS").is_some() {
         let mut lines = vec![
             "# First failure per official Lua 5.4.9 test file.".to_string(),
@@ -162,8 +217,7 @@ fn official_lua_suite() {
         for (file, status) in &results {
             lines.push(format!("{file}\t{}", status.label()));
         }
-        std::fs::write(&baseline_path, lines.join("\n") + "\n")
-            .expect("write baseline");
+        std::fs::write(&baseline_path, lines.join("\n") + "\n").expect("write baseline");
         eprintln!("baseline written to {}", baseline_path.display());
     }
 
@@ -214,7 +268,9 @@ fn run_case(dir: &Path, case: &Case) -> Status {
     let Ok(src) = std::fs::read(&path) else {
         return Status::Line(0);
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| run_source(dir, &path, &src, case.shims)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        run_source(dir, &path, &src, case.shims)
+    }));
     outcome.unwrap_or(Status::Panic)
 }
 

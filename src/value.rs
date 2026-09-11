@@ -142,7 +142,9 @@ impl Strings {
             if self.fixed[i] || marked.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let Some(rc) = self.vec[i].take() else { continue };
+            let Some(rc) = self.vec[i].take() else {
+                continue;
+            };
             self.bytes -= rc.len();
             self.map.remove(&rc);
             self.free.push(i as u32);
@@ -210,19 +212,26 @@ pub struct Table {
     array: Vec<Value>,
     hash: HashMap<HKey, Value>,
     pub metatable: Option<TableId>,
+    /// Set once the collector has selected this table for a `__gc` run, so a
+    /// resurrected object is never finalized twice.
+    pub finalized: bool,
 }
 
 impl Table {
     pub fn get(&self, key: Value) -> Value {
-        let Ok(k) = to_key(key) else { return Value::Nil };
+        let Ok(k) = to_key(key) else {
+            return Value::Nil;
+        };
         self.get_key(k)
     }
 
     fn get_key(&self, k: HKey) -> Value {
         if let HKey::Int(i) = k
-            && i >= 1 && (i as usize) <= self.array.len() {
-                return self.array[i as usize - 1];
-            }
+            && i >= 1
+            && (i as usize) <= self.array.len()
+        {
+            return self.array[i as usize - 1];
+        }
         self.hash.get(&k).copied().unwrap_or(Value::Nil)
     }
 
@@ -290,6 +299,29 @@ impl Table {
             f(key_to_value(k));
             f(v);
         }
+    }
+
+    /// Snapshot of every live (non-nil) entry as Lua key/value pairs. Used by
+    /// the collector to clear dead weak entries; O(n) and allocation-heavy,
+    /// which is fine because it only runs during a collection.
+    pub(crate) fn entries(&self) -> Vec<(Value, Value)> {
+        let mut out = Vec::with_capacity(self.array.len() + self.hash.len());
+        for (i, &v) in self.array.iter().enumerate() {
+            if v != Value::Nil {
+                out.push((Value::Int(i as i64 + 1), v));
+            }
+        }
+        for (&k, &v) in &self.hash {
+            if v != Value::Nil {
+                out.push((key_to_value(k), v));
+            }
+        }
+        out
+    }
+
+    /// Removes an entry by key (a table key produced by [`Table::entries`]).
+    pub(crate) fn remove(&mut self, key: Value) {
+        let _ = self.set(key, Value::Nil);
     }
 
     /// Rough heap footprint in bytes, for memory budgeting.

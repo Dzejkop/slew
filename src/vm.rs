@@ -113,6 +113,9 @@ pub(crate) enum Intrinsic {
     WrapResume(ThreadId),
     IsYieldable,
     Running,
+    CoroutineClose,
+    CollectGarbage,
+    Print,
     DebugGetinfo,
     DebugTraceback,
     DebugGetupvalue,
@@ -186,6 +189,10 @@ enum Pending {
     /// results now sit at `start` (with `th.top` already updated); complete
     /// the frame's return as usual.
     TailReturn { start: usize },
+    /// Advance the active `coroutine.close` driver by one `__close` handler.
+    CloseStep,
+    /// Advance the active `print` driver by one `__tostring` call.
+    PrintStep,
 }
 
 struct Frame {
@@ -249,6 +256,12 @@ pub(crate) struct Thread {
     resume_ret: Option<ResumeRet>,
     /// Where the next resume's arguments land (set at each yield).
     yield_ret: Option<(usize, u8, RetShape)>,
+    /// True for a root execution's thread. The main thread cannot yield;
+    /// every coroutine created by `coroutine.create`/`wrap` can.
+    is_main: bool,
+    /// For a dead coroutine: the error it died with, returned once by
+    /// `coroutine.close`. `Some(Nil)` means "died cleanly".
+    close_error: Option<Value>,
 }
 
 /// A compiled script, reusable across executions.
@@ -416,6 +429,72 @@ pub struct Lua {
     /// `package.searchpath`. Absent by default: the core has no filesystem
     /// authority of its own.
     file_reader: Option<Box<FileReaderFn>>,
+    // ---- GC controls (`collectgarbage`) ----
+    /// False after `collectgarbage("stop")`: automatic collection pauses
+    /// (explicit `collect`/`step` still run).
+    pub(crate) gc_running: bool,
+    /// 0 = incremental, 1 = generational. Only reported by the mode switches;
+    /// the collector itself is a stop-the-world mark-sweep.
+    pub(crate) gc_mode: u8,
+    pub(crate) gc_pause: i64,
+    pub(crate) gc_stepmul: i64,
+    /// Objects selected for `__gc`, awaiting a dispatch safe point. A GC root.
+    pending_finalizers: Vec<Value>,
+    /// Frame depth at which the in-flight finalizer was started; suppresses
+    /// nested finalizer dispatch until that frame returns.
+    finalizer_depth: Option<usize>,
+    /// In-progress `coroutine.close` driver (see [`CloseJob`]).
+    close_job: Option<CloseJob>,
+    /// In-progress `print` driver (see [`PrintJob`]).
+    print_job: Option<PrintJob>,
+}
+
+/// State for the incremental `coroutine.close` driver: `__close` handlers are
+/// invoked one per dispatch step, protected, until every pending value has
+/// been closed. Driven by [`Pending::CloseStep`].
+struct CloseJob {
+    target: ThreadId,
+    /// Values to close, innermost-first.
+    items: Vec<Value>,
+    idx: usize,
+    /// Error accumulated so far (passed to later handlers).
+    err: Value,
+    failed: bool,
+    /// Where the eventual `true` / `false, err` result lands in the caller.
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    /// Scratch slot where the last protected `__close` result was delivered.
+    result_slot: usize,
+    /// True when `result_slot` holds an unread result.
+    awaiting: bool,
+}
+
+/// State for the incremental `print` driver: arguments are rendered one per
+/// dispatch step, invoking `__tostring` where present. Driven by
+/// [`Pending::PrintStep`].
+struct PrintJob {
+    items: Vec<Value>,
+    idx: usize,
+    /// Rendered argument bytes, in order.
+    out: Vec<Vec<u8>>,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    result_slot: usize,
+    awaiting: bool,
+}
+
+/// How a table participates in the weak-reference machinery (`__mode`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeakKind {
+    Strong,
+    /// `k`: keys weak, values strong (ephemeron).
+    Keys,
+    /// `v`: keys strong, values weak.
+    Values,
+    /// `kv`: both weak.
+    Both,
 }
 
 impl Default for Lua {
@@ -478,6 +557,14 @@ impl Lua {
             gc_alloc_threshold: 50_000,
             memory_limit: None,
             file_reader: None,
+            gc_running: true,
+            gc_mode: 1, // PUC 5.4 defaults to generational
+            gc_pause: 200,
+            gc_stepmul: 100,
+            pending_finalizers: Vec::new(),
+            finalizer_depth: None,
+            close_job: None,
+            print_job: None,
         };
         lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
@@ -530,7 +617,10 @@ impl Lua {
             proto: chunk.proto.clone(),
             upvals: vec![env],
         });
-        let mut th = Thread::default();
+        let mut th = Thread {
+            is_main: true,
+            ..Default::default()
+        };
         th.stack.resize(chunk.proto.max_regs as usize, Value::Nil);
         th.frames.push(Frame {
             closure: cid,
@@ -694,6 +784,7 @@ impl Lua {
     pub(crate) fn create_coroutine(&mut self, f: Value) -> Value {
         let mut th = Thread::default();
         th.stack.push(f); // consumed on first resume
+        th.top = 1;
         th.status = CoStatus::Start;
         Value::Thread(self.alloc_thread(th))
     }
@@ -1319,6 +1410,18 @@ impl Lua {
         }
     }
 
+    /// Metatable field lookup by name that never interns, so it is safe to
+    /// call while a collection is in progress (`__gc`, `__close`).
+    fn raw_metafield(&self, v: Value, name: &str) -> Value {
+        let Some(k) = self.strings.lookup(name.as_bytes()) else {
+            return Value::Nil;
+        };
+        match self.get_metatable(v) {
+            Some(mt) => self.tables[mt.0 as usize].get(Value::Str(k)),
+            None => Value::Nil,
+        }
+    }
+
     fn binary_mm(&self, a: Value, b: Value, mm: Mm) -> Value {
         let m = self.metamethod(a, mm);
         if m != Value::Nil {
@@ -1384,7 +1487,9 @@ impl Lua {
                         let parent = th.parent.take();
                         let rr = th.resume_ret.take();
                         th.stack.clear();
+                        let death_err = self.err_value(&e);
                         self.threads[cur.0 as usize] = th;
+                        self.threads[cur.0 as usize].close_error = Some(death_err);
                         match parent {
                             None => {
                                 let root_line = root_line.unwrap_or(e.line);
@@ -1448,6 +1553,10 @@ impl Lua {
         fuel: &mut i64,
     ) -> Result<DispatchEnd, VmError> {
         loop {
+            if *fuel <= 0 {
+                return Ok(DispatchEnd::Pending);
+            }
+            self.service_finalizers(tid, th, fuel)?;
             if *fuel <= 0 {
                 return Ok(DispatchEnd::Pending);
             }
@@ -1571,6 +1680,8 @@ impl Lua {
                     }
                     deliver_return(th, &frame, start, count);
                 }
+                Pending::CloseStep => self.close_step(th, fuel)?,
+                Pending::PrintStep => self.print_step(th, fuel)?,
             }
             return Ok(Flow::Continue);
         }
@@ -2343,9 +2454,67 @@ impl Lua {
                 Ok(())
             }
             Intrinsic::IsYieldable => {
-                let r = Value::Bool(th.parent.is_some());
-                place_shaped(th, ret_to, nres, shape, &[r]);
+                // Optional `co` argument: true for any coroutine (even a dead
+                // or never-started one), false for the main thread.
+                let r = match arg_opt(th, 0) {
+                    None => !th.is_main,
+                    // the running thread is taken out of the arena, so read
+                    // its flag from the live `th`, not the placeholder
+                    Some(Value::Thread(t)) if t == self.current_thread => !th.is_main,
+                    Some(Value::Thread(t)) => !self.threads[t.0 as usize].is_main,
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'isyieldable' (thread expected, got {})",
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                place_shaped(th, ret_to, nres, shape, &[Value::Bool(r)]);
                 Ok(())
+            }
+            Intrinsic::CollectGarbage => {
+                // An intrinsic so the running thread (taken out of the arena
+                // during dispatch) can be passed as a GC root.
+                let r = self
+                    .gc_command(th, arg(th, 0), (argc > 1).then(|| arg(th, 1)))
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &r);
+                Ok(())
+            }
+            Intrinsic::Print => {
+                let items: Vec<Value> = (0..argc).map(|i| arg(th, i)).collect();
+                self.print_job = Some(PrintJob {
+                    items,
+                    idx: 0,
+                    out: Vec::new(),
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot: 0,
+                    awaiting: false,
+                });
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending
+                    .push(Pending::PrintStep);
+                Ok(())
+            }
+            Intrinsic::CoroutineClose => {
+                let co = arg(th, 0);
+                let Value::Thread(co) = co else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'close' (coroutine expected, got {})",
+                            co.type_name()
+                        ),
+                    ));
+                };
+                self.begin_close(th, fuel, co, ret_to, nres, shape)
             }
             Intrinsic::Running => {
                 let cur = Value::Thread(self.current_thread);
@@ -2623,10 +2792,47 @@ impl Lua {
                             co_th.status = CoStatus::Dead;
                             co_th.parent = None;
                             co_th.resume_ret = None;
-                            let kind_result = match &self.natives[nid.0 as usize].kind {
-                                NativeKind::Plain(f) => f(self, args),
-                                NativeKind::Intrinsic(_) => {
-                                    Err("cannot use this builtin as a coroutine body".into())
+                            let native_is_error = matches!(
+                                self.natives[nid.0 as usize].kind,
+                                NativeKind::Intrinsic(Intrinsic::Error)
+                            );
+                            if native_is_error {
+                                // `coroutine.create(error)`; error() with a
+                                // non-string argument raises that value.
+                                let errv = args.first().copied().unwrap_or(Value::Nil);
+                                self.threads[co.0 as usize].close_error = Some(errv);
+                                if wrap {
+                                    return Err(VmError {
+                                        val: ErrVal::Val(errv),
+                                        line: 0,
+                                        root_line: 0,
+                                        source: None,
+                                    });
+                                }
+                                place_shaped(th, ret_to, nres, shape, &[Value::Bool(false), errv]);
+                                return Ok(());
+                            }
+                            let native_is_print = matches!(
+                                self.natives[nid.0 as usize].kind,
+                                NativeKind::Intrinsic(Intrinsic::Print)
+                            );
+                            let kind_result = if native_is_print {
+                                // `coroutine.create(print)`: render directly
+                                // (no frame is available to drive
+                                // `__tostring` here).
+                                let line = args
+                                    .iter()
+                                    .map(|v| self.tostring_default(*v))
+                                    .collect::<Vec<_>>()
+                                    .join("\t");
+                                println!("{line}");
+                                Ok(Vec::new())
+                            } else {
+                                match &self.natives[nid.0 as usize].kind {
+                                    NativeKind::Plain(f) => f(self, args),
+                                    NativeKind::Intrinsic(_) => {
+                                        Err("cannot use this builtin as a coroutine body".into())
+                                    }
                                 }
                             };
                             return match kind_result {
@@ -2661,6 +2867,192 @@ impl Lua {
                 Ok(())
             }
         }
+    }
+
+    /// Starts `coroutine.close(co)`. Dead-and-clean and to-be-closed-free
+    /// coroutines resolve immediately; otherwise a [`CloseJob`] is installed
+    /// and driven by [`Pending::CloseStep`].
+    fn begin_close(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        co: ThreadId,
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+    ) -> Result<(), VmError> {
+        // Closing the running/normal coroutine is an error (catchable with
+        // pcall), not a `false, msg` result.
+        if co == self.current_thread {
+            return Err(self.rt_err(th, "cannot close a running coroutine".into()));
+        }
+        match self.threads[co.0 as usize].status {
+            CoStatus::Running => Err(self.rt_err(th, "cannot close a running coroutine".into())),
+            CoStatus::Normal => Err(self.rt_err(th, "cannot close a normal coroutine".into())),
+            CoStatus::Dead => {
+                let err = self.threads[co.0 as usize].close_error.take();
+                match err {
+                    Some(e) => place_shaped(th, ret_to, nres, shape, &[Value::Bool(false), e]),
+                    None => place_shaped(th, ret_to, nres, shape, &[Value::Bool(true)]),
+                }
+                Ok(())
+            }
+            CoStatus::Start | CoStatus::Suspended => {
+                let mut items = Vec::new();
+                {
+                    let ct = &self.threads[co.0 as usize];
+                    for f in ct.frames.iter().rev() {
+                        for &r in f.tbc.iter().rev() {
+                            items.push(ct.stack[f.base + r as usize]);
+                        }
+                    }
+                }
+                if items.is_empty() {
+                    self.finish_close(co);
+                    place_shaped(th, ret_to, nres, shape, &[Value::Bool(true)]);
+                    return Ok(());
+                }
+                // Mark running so a reentrant close from inside a __close
+                // handler reports "cannot close a running coroutine".
+                self.threads[co.0 as usize].status = CoStatus::Running;
+                self.close_job = Some(CloseJob {
+                    target: co,
+                    items,
+                    idx: 0,
+                    err: Value::Nil,
+                    failed: false,
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot: 0,
+                    awaiting: false,
+                });
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending
+                    .push(Pending::CloseStep);
+                *fuel -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// One step of the [`CloseJob`] state machine: consume a pending result,
+    /// then either call the next `__close` (protected, staged through
+    /// `Pending::CloseStep`) or deliver the final `true`/`false, err`.
+    fn close_step(&mut self, th: &mut Thread, fuel: &mut i64) -> Result<(), VmError> {
+        let Some(mut job) = self.close_job.take() else {
+            return Ok(());
+        };
+        if job.awaiting {
+            job.awaiting = false;
+            if th.stack[job.result_slot] == Value::Bool(false) {
+                job.err = th.stack[job.result_slot + 1];
+                job.failed = true;
+            }
+        }
+        if job.idx < job.items.len() {
+            let item = job.items[job.idx];
+            job.idx += 1;
+            let mm = self.metamethod_pub(item, "__close");
+            if mm == Value::Nil {
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending
+                    .push(Pending::CloseStep);
+                self.close_job = Some(job);
+                return Ok(());
+            }
+            let scratch = scratch_base(th);
+            ensure_len(&mut th.stack, scratch + 3);
+            th.stack[scratch] = mm;
+            th.stack[scratch + 1] = item;
+            th.stack[scratch + 2] = job.err;
+            let result_slot = scratch + 3;
+            ensure_len(&mut th.stack, result_slot + 2);
+            job.result_slot = result_slot;
+            job.awaiting = true;
+            th.frames
+                .last_mut()
+                .unwrap()
+                .pending
+                .push(Pending::CloseStep);
+            self.close_job = Some(job);
+            *fuel -= 1;
+            // nres = 0 (multret) so an error's `false, err` pair both land.
+            return self.protected_call(th, fuel, scratch, 2, result_slot, 0, None);
+        }
+        // all handlers ran: kill the target and report
+        self.finish_close(job.target);
+        let results: [Value; 2] = [Value::Bool(!job.failed), job.err];
+        let slice: &[Value] = if job.failed { &results } else { &results[..1] };
+        place_shaped(th, job.ret_to, job.nres, job.shape, slice);
+        self.close_job = None;
+        Ok(())
+    }
+
+    /// One step of the [`PrintJob`] state machine: consume a `__tostring`
+    /// result, then either call the next one or emit the line.
+    fn print_step(&mut self, th: &mut Thread, fuel: &mut i64) -> Result<(), VmError> {
+        let Some(mut job) = self.print_job.take() else {
+            return Ok(());
+        };
+        if job.awaiting {
+            job.awaiting = false;
+            let v = th.stack[job.result_slot];
+            match v {
+                Value::Str(s) => job.out.push(self.strings.get(s).to_vec()),
+                _ => {
+                    self.print_job = Some(job);
+                    return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                }
+            }
+        }
+        while job.idx < job.items.len() {
+            let v = job.items[job.idx];
+            job.idx += 1;
+            let mm = self.metamethod(v, Mm::ToString);
+            if mm != Value::Nil {
+                let result_slot = scratch_base(th);
+                ensure_len(&mut th.stack, result_slot + 1);
+                job.result_slot = result_slot;
+                job.awaiting = true;
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending
+                    .push(Pending::PrintStep);
+                self.print_job = Some(job);
+                // nres = 2 -> exactly one result
+                return self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel);
+            }
+            job.out.push(self.tostring_default(v).into_bytes());
+        }
+        let line = job
+            .out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+            .join("\t");
+        println!("{line}");
+        place_shaped(th, job.ret_to, job.nres, job.shape, &[]);
+        self.print_job = None;
+        Ok(())
+    }
+
+    /// Puts a coroutine into the dead state, dropping its frames and stack.
+    fn finish_close(&mut self, co: ThreadId) {
+        let ct = &mut self.threads[co.0 as usize];
+        ct.status = CoStatus::Dead;
+        ct.frames.clear();
+        ct.stack.clear();
+        ct.open_upvals.clear();
+        ct.parent = None;
+        ct.resume_ret = None;
+        ct.yield_ret = None;
+        ct.close_error = None;
     }
 
     /// Calls the value at `f_abs` under error protection: results arrive as
@@ -3241,6 +3633,45 @@ impl Lua {
         self.memory_used()
     }
 
+    /// Runs queued `__gc` handlers, one per call, as protected calls so that
+    /// an erroring finalizer cannot escape into the running program. Returns
+    /// after setting up one handler call (the dispatch loop invokes us again
+    /// once it returns). `__gc` handlers execute on the running thread, which
+    /// matches PUC's "called from a C function" context.
+    fn service_finalizers(
+        &mut self,
+        tid: ThreadId,
+        th: &mut Thread,
+        fuel: &mut i64,
+    ) -> Result<(), VmError> {
+        if let Some(depth) = self.finalizer_depth {
+            if th.frames.len() < depth || self.current_thread != tid {
+                self.finalizer_depth = None;
+            } else {
+                return Ok(());
+            }
+        }
+        if th.frames.is_empty() {
+            return Ok(());
+        }
+        while let Some(v) = self.pending_finalizers.pop() {
+            let mm = self.raw_metafield(v, "__gc");
+            if mm == Value::Nil {
+                continue;
+            }
+            let scratch = scratch_base(th);
+            ensure_len(&mut th.stack, scratch + 2);
+            th.stack[scratch] = mm;
+            th.stack[scratch + 1] = v;
+            let discard = scratch + 2;
+            ensure_len(&mut th.stack, discard + 2);
+            self.protected_call(th, fuel, scratch, 1, discard, 0, None)?;
+            self.finalizer_depth = Some(th.frames.len());
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Approximate live heap footprint in bytes.
     pub fn memory_used(&self) -> usize {
         let mut total = self.strings.bytes() + self.strings.live_count() * 40;
@@ -3274,7 +3705,8 @@ impl Lua {
     /// `th` is the running thread (moved out of the arena), which must be
     /// traced as an extra root. Enforces the memory ceiling.
     fn maybe_gc(&mut self, tid: ThreadId, th: &Thread) -> Result<(), VmError> {
-        let due = self.gc_alloc_threshold != 0
+        let due = self.gc_running
+            && self.gc_alloc_threshold != 0
             && (self.allocs_since_gc >= self.gc_alloc_threshold
                 || self.strings.bytes() > self.str_bytes_at_gc + (8 << 20));
         if due {
@@ -3289,16 +3721,108 @@ impl Lua {
         Ok(())
     }
 
+    /// Implements `collectgarbage([opt [, arg]])`. See `n_collectgarbage`'s
+    /// PUC-compatible option set; because the collector is a stop-the-world
+    /// mark-sweep, "collect"/"step" run a full collection (with the running
+    /// thread as an extra root).
+    fn gc_command(
+        &mut self,
+        th: &Thread,
+        opt: Value,
+        arg1: Option<Value>,
+    ) -> Result<Vec<Value>, String> {
+        let opt = match opt {
+            Value::Str(s) => self.strings.get(s).to_vec(),
+            Value::Nil => b"collect".to_vec(),
+            v => {
+                return Err(format!(
+                    "bad argument #1 to 'collectgarbage' (string expected, got {})",
+                    v.type_name()
+                ));
+            }
+        };
+        let opt = String::from_utf8_lossy(&opt).into_owned();
+        let int_arg = |v: Option<Value>| -> Result<i64, String> {
+            match v {
+                None | Some(Value::Nil) => Ok(0),
+                Some(Value::Int(i)) => Ok(i),
+                Some(Value::Float(f)) => Ok(f as i64),
+                Some(v) => Err(format!(
+                    "bad argument #2 to 'collectgarbage' (number expected, got {})",
+                    v.type_name()
+                )),
+            }
+        };
+        let collect_now = |me: &mut Self| me.collect(Some((me.current_thread, th)));
+        match opt.as_str() {
+            "collect" => {
+                collect_now(self);
+                Ok(vec![Value::Int(0)])
+            }
+            "step" => {
+                collect_now(self);
+                Ok(vec![Value::Bool(false)])
+            }
+            "stop" => {
+                self.gc_running = false;
+                Ok(vec![Value::Int(0)])
+            }
+            "restart" => {
+                self.gc_running = true;
+                Ok(vec![Value::Int(0)])
+            }
+            "count" => Ok(vec![Value::Float(self.memory_used() as f64 / 1024.0)]),
+            "isrunning" => Ok(vec![Value::Bool(self.gc_running)]),
+            "incremental" => {
+                let prev = self.gc_mode == 0;
+                self.gc_mode = 0;
+                Ok(vec![self.new_string(if prev {
+                    b"incremental"
+                } else {
+                    b"generational"
+                })])
+            }
+            "generational" => {
+                let prev = self.gc_mode == 1;
+                self.gc_mode = 1;
+                Ok(vec![self.new_string(if prev {
+                    b"generational"
+                } else {
+                    b"incremental"
+                })])
+            }
+            "setpause" => {
+                let v = int_arg(arg1)?;
+                let prev = self.gc_pause;
+                self.gc_pause = v;
+                Ok(vec![Value::Int(prev)])
+            }
+            "setstepmul" => {
+                let v = int_arg(arg1)?;
+                let prev = self.gc_stepmul;
+                self.gc_stepmul = v;
+                Ok(vec![Value::Int(prev)])
+            }
+            other => Err(format!(
+                "bad argument #1 to 'collectgarbage' (invalid option '{other}')"
+            )),
+        }
+    }
+
     fn collect(&mut self, extra: Option<(ThreadId, &Thread)>) {
+        let table_count = self.tables.len();
         let mut m = Marks {
             strings: vec![false; self.strings.len()],
-            tables: vec![false; self.tables.len()],
+            tables: vec![false; table_count],
             closures: vec![false; self.closures.len()],
             natives: vec![false; self.natives.len()],
             upvals: vec![false; self.upvals.len()],
             threads: vec![false; self.threads.len()],
         };
+        let weak = self.weak_kinds(table_count);
+        let gc_name = self.strings.lookup(b"__gc");
         let mut work: Vec<Value> = Vec::with_capacity(64);
+        let mut ephemerons: Vec<usize> = Vec::new();
         // roots
         work.push(Value::Table(self.globals));
         if let Some(sm) = self.string_meta {
@@ -3308,6 +3832,15 @@ impl Lua {
             work.push(Value::Table(*mt));
         }
         work.extend_from_slice(&self.anchors);
+        work.extend_from_slice(&self.pending_finalizers);
+        if let Some(job) = &self.close_job {
+            work.push(Value::Thread(job.target));
+            work.extend_from_slice(&job.items);
+            work.push(job.err);
+        }
+        if let Some(job) = &self.print_job {
+            work.extend_from_slice(&job.items);
+        }
         for (&root, &cur) in &self.exec_roots {
             work.push(Value::Thread(ThreadId(root)));
             work.push(Value::Thread(ThreadId(cur)));
@@ -3316,17 +3849,114 @@ impl Lua {
             m.threads[etid.0 as usize] = true;
             Self::trace_thread(eth, &mut m, &mut work, &self.upvals);
         }
+        self.mark_loop(&mut m, &mut work, &weak, &mut ephemerons);
+        self.ephemeron_fixpoint(&mut m, &mut work, &weak, &mut ephemerons);
+        // Finalization: resurrect unreachable objects carrying a `__gc`,
+        // keeping them (and everything they reach) alive for one more cycle
+        // while the handler is queued. Repeat until nothing new surfaces.
+        if let Some(gc_name) = gc_name {
+            loop {
+                let mut found = false;
+                for i in 0..table_count {
+                    if !self.tables_live[i] || m.tables[i] || self.tables[i].finalized {
+                        continue;
+                    }
+                    let has_gc = match self.tables[i].metatable {
+                        Some(mt) => {
+                            self.tables[mt.0 as usize].get(Value::Str(gc_name)) != Value::Nil
+                        }
+                        None => false,
+                    };
+                    if has_gc {
+                        // Do NOT pre-mark here: `mark_loop` must see the
+                        // table unmarked so it also traces its metatable
+                        // (which holds `__gc`) and its whole reachable graph.
+                        self.tables[i].finalized = true;
+                        work.push(Value::Table(TableId(i as u32)));
+                        self.pending_finalizers
+                            .push(Value::Table(TableId(i as u32)));
+                        found = true;
+                    }
+                }
+                if !found {
+                    break;
+                }
+                self.mark_loop(&mut m, &mut work, &weak, &mut ephemerons);
+                self.ephemeron_fixpoint(&mut m, &mut work, &weak, &mut ephemerons);
+            }
+        }
+        self.clear_weak(&mut m, &weak);
+        self.sweep(&m);
+        self.allocs_since_gc = 0;
+        self.str_bytes_at_gc = self.strings.bytes();
+    }
+
+    /// Weakness of every table index, derived from each metatable's `__mode`.
+    fn weak_kinds(&self, table_count: usize) -> Vec<WeakKind> {
+        let mut weak = vec![WeakKind::Strong; table_count];
+        let Some(mode_key) = self.strings.lookup(b"__mode") else {
+            return weak;
+        };
+        for (i, w) in weak.iter_mut().enumerate() {
+            if !self.tables_live.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(mt) = self.tables[i].metatable else {
+                continue;
+            };
+            let Value::Str(mode) = self.tables[mt.0 as usize].get(Value::Str(mode_key)) else {
+                continue;
+            };
+            let bytes = self.strings.get(mode);
+            let k = bytes.contains(&b'k');
+            let v = bytes.contains(&b'v');
+            *w = match (k, v) {
+                (true, true) => WeakKind::Both,
+                (true, false) => WeakKind::Keys,
+                (false, true) => WeakKind::Values,
+                (false, false) => WeakKind::Strong,
+            };
+        }
+        weak
+    }
+
+    /// Drains the mark worklist, honouring weak tables: strong tables are
+    /// traced fully, weak-value tables trace only their keys, weak-key tables
+    /// become ephemerons, weak-both trace nothing here.
+    fn mark_loop(
+        &self,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        weak: &[WeakKind],
+        ephemerons: &mut Vec<usize>,
+    ) {
         while let Some(v) = work.pop() {
             match v {
-                Value::Str(s) => m.strings[s.0 as usize] = true,
+                Value::Str(s) => {
+                    if let Some(slot) = m.strings.get_mut(s.0 as usize) {
+                        *slot = true;
+                    }
+                }
                 Value::Table(t) => {
                     let i = t.0 as usize;
-                    if !m.tables[i] {
-                        m.tables[i] = true;
-                        self.tables[i].trace(|v| work.push(v));
-                        if let Some(mt) = self.tables[i].metatable {
-                            work.push(Value::Table(mt));
+                    if m.tables[i] {
+                        continue;
+                    }
+                    m.tables[i] = true;
+                    if let Some(mt) = self.tables[i].metatable {
+                        work.push(Value::Table(mt));
+                    }
+                    match weak[i] {
+                        WeakKind::Strong => {
+                            self.tables[i].trace(|v| work.push(v));
                         }
+                        WeakKind::Values => {
+                            for (k, _) in self.tables[i].entries() {
+                                work.push(k);
+                            }
+                        }
+                        WeakKind::Keys => ephemerons.push(i),
+                        WeakKind::Both => {}
                     }
                 }
                 Value::Closure(c) => {
@@ -3334,7 +3964,7 @@ impl Lua {
                     if !m.closures[i] {
                         m.closures[i] = true;
                         for &uid in &self.closures[i].upvals {
-                            mark_upval(uid, &mut m, &mut work, &self.upvals);
+                            mark_upval(uid, m, work, &self.upvals);
                         }
                     }
                 }
@@ -3353,20 +3983,103 @@ impl Lua {
                     let i = t.0 as usize;
                     if !m.threads[i] {
                         m.threads[i] = true;
-                        Self::trace_thread(&self.threads[i], &mut m, &mut work, &self.upvals);
+                        Self::trace_thread(&self.threads[i], m, work, &self.upvals);
                     }
                 }
                 _ => {}
             }
         }
-        self.sweep(&m);
-        self.allocs_since_gc = 0;
-        self.str_bytes_at_gc = self.strings.bytes();
+    }
+
+    /// Ephemeron fixpoint: for weak-key/strong-value tables a value is only
+    /// reachable through its key, so iterate until no new value is marked.
+    fn ephemeron_fixpoint(
+        &self,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        weak: &[WeakKind],
+        ephemerons: &mut Vec<usize>,
+    ) {
+        loop {
+            let mut changed = false;
+            let mut i = 0;
+            while i < ephemerons.len() {
+                let ti = ephemerons[i];
+                for (k, v) in self.tables[ti].entries() {
+                    if !self.value_marked(m, k) {
+                        continue;
+                    }
+                    if !self.value_marked(m, v) {
+                        work.push(v);
+                        changed = true;
+                    }
+                }
+                i += 1;
+            }
+            if !changed {
+                break;
+            }
+            self.mark_loop(m, work, weak, ephemerons);
+        }
+    }
+
+    /// True when `v` is alive for weak-reference purposes: non-collectable
+    /// values and strings always are (PUC never collects a string through a
+    /// weak table); everything else must be marked.
+    fn value_marked(&self, m: &Marks, v: Value) -> bool {
+        match v {
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
+            Value::Table(t) => m.tables[t.0 as usize],
+            Value::Closure(c) => m.closures[c.0 as usize],
+            Value::Native(n) => m.natives[n.0 as usize],
+            Value::Thread(t) => m.threads[t.0 as usize],
+        }
+    }
+
+    fn weak_dead(&self, m: &Marks, v: Value) -> bool {
+        matches!(
+            v,
+            Value::Table(_) | Value::Closure(_) | Value::Native(_) | Value::Thread(_)
+        ) && !self.value_marked(m, v)
+    }
+
+    /// Removes entries whose weak component died, and marks string keys/values
+    /// of surviving entries so they are not swept while still referenced.
+    fn clear_weak(&mut self, m: &mut Marks, weak: &[WeakKind]) {
+        for (i, &kind) in weak.iter().enumerate().take(self.tables.len()) {
+            if kind == WeakKind::Strong || !m.tables[i] {
+                continue;
+            }
+            let keys_weak = matches!(kind, WeakKind::Keys | WeakKind::Both);
+            let values_weak = matches!(kind, WeakKind::Values | WeakKind::Both);
+            for (k, v) in self.tables[i].entries() {
+                let key_dead = keys_weak && self.weak_dead(m, k);
+                let val_dead = values_weak && self.weak_dead(m, v);
+                if key_dead || val_dead {
+                    self.tables[i].remove(k);
+                } else {
+                    if let Value::Str(s) = k {
+                        m.strings[s.0 as usize] = true;
+                    }
+                    if let Value::Str(s) = v {
+                        m.strings[s.0 as usize] = true;
+                    }
+                }
+            }
+        }
     }
 
     fn trace_thread(th: &Thread, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
-        for &v in &th.stack {
-            work.push(v);
+        if th.frames.is_empty() {
+            // e.g. a created-but-never-resumed coroutine: the body lives at
+            // stack[0] with no frame to bound the window
+            for &v in &th.stack {
+                work.push(v);
+            }
+        } else {
+            for &v in &th.stack {
+                work.push(v);
+            }
         }
         for f in &th.frames {
             work.push(Value::Closure(f.closure));
@@ -3391,12 +4104,17 @@ impl Lua {
                     Pending::CloseTbc { err, .. } => work.push(err),
                     Pending::Concat { .. }
                     | Pending::FinishReturn { .. }
-                    | Pending::TailReturn { .. } => {}
+                    | Pending::TailReturn { .. }
+                    | Pending::CloseStep
+                    | Pending::PrintStep => {}
                 }
             }
         }
         for &(_, uid) in &th.open_upvals {
             mark_upval(uid, m, work, upvals);
+        }
+        if let Some(e) = th.close_error {
+            work.push(e);
         }
         if let Some(p) = th.parent {
             work.push(Value::Thread(p));

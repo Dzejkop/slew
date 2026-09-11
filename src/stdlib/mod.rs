@@ -18,7 +18,7 @@ use crate::value::{Value, fmt_number, to_key};
 use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind, Step};
 
 pub fn install(lua: &mut Lua) {
-    lua.register_native("print", n_print);
+    lua.register_intrinsic("print", Intrinsic::Print);
     lua.register_native("type", n_type);
     lua.register_native("tonumber", n_tonumber);
     lua.register_native("select", n_select);
@@ -26,6 +26,7 @@ pub fn install(lua: &mut Lua) {
     lua.register_native("rawset", n_rawset);
     lua.register_native("rawequal", n_rawequal);
     lua.register_native("rawlen", n_rawlen);
+    lua.register_intrinsic("collectgarbage", Intrinsic::CollectGarbage);
     lua.register_native("setmetatable", n_setmetatable);
     lua.register_native("getmetatable", n_getmetatable);
     // Private helper for the prelude's `__pairs` lookup: the public
@@ -122,6 +123,8 @@ fn install_coroutine(lua: &mut Lua) {
     set_field(lua, ct, "isyieldable", isyieldable);
     let running = lua.add_native_kind("running", NativeKind::Intrinsic(Intrinsic::Running));
     set_field(lua, ct, "running", running);
+    let close = lua.add_native_kind("close", NativeKind::Intrinsic(Intrinsic::CoroutineClose));
+    set_field(lua, ct, "close", close);
 }
 
 /// Creates the `package` table: `loaded`/`preload`/paths plus the
@@ -422,16 +425,6 @@ pub(super) fn check_table(
             v.type_name()
         )),
     }
-}
-
-fn n_print(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let line = args
-        .iter()
-        .map(|v| lua.display_value(*v))
-        .collect::<Vec<_>>()
-        .join("\t");
-    println!("{line}");
-    Ok(vec![])
 }
 
 fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
