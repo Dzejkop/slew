@@ -177,8 +177,8 @@ pub enum Instr {
         base: u8,
         off: i32,
     },
-    /// Generic for: `base` holds (func, state, control); vars start at
-    /// `base+3`. If `R[base+3] ~= nil`, sets control and jumps back.
+    /// Generic for: `base` holds (func, state, control, closing value); vars
+    /// start at `base+4`. If `R[base+4] ~= nil`, sets control and jumps back.
     TForLoop {
         base: u8,
         off: i32,

@@ -211,9 +211,7 @@ fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn minmax(args: &[Value], who: &str, want_max: bool) -> Result<Vec<Value>, String> {
     if args.is_empty() {
-        return Err(format!(
-            "bad argument #1 to '{who}' (number expected, got no value)"
-        ));
+        return Err(format!("bad argument #1 to '{who}' (value expected)"));
     }
     let mut best = args[0];
     for (i, &v) in args.iter().enumerate() {

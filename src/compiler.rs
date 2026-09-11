@@ -635,6 +635,7 @@ impl<'h> Compiler<'h> {
                 line,
             } => {
                 self.at_line(*line);
+                let tmp_start = self.fs().free_reg;
                 let resolved: Vec<Target> = targets
                     .iter()
                     .map(|t| self.target_of(t))
@@ -644,6 +645,10 @@ impl<'h> Compiler<'h> {
                 for (i, t) in resolved.into_iter().enumerate() {
                     self.store(t, base + i as u8)?;
                 }
+                // Drop the target-prefix temporaries: the collector scans the
+                // whole stack (including dead slots), so leaving a captured
+                // value there would over-retain it (e.g. a weak key).
+                self.clear_regs(tmp_start, base);
             }
             Stmt::ExprStat(e) => {
                 self.call_like(e, Some(0))?;
@@ -770,12 +775,17 @@ impl<'h> Compiler<'h> {
                 self.at_line(*line);
                 let floor = self.enter_scope();
                 let base = self.fs().free_reg;
-                self.explist_to(exprs, 3)?;
+                // explist is adjusted to four values: iterator, state, control,
+                // and the closing value (5.4's 4th result, closed at loop exit).
+                self.explist_to(exprs, 4)?;
                 self.declare_local("(for state)".into(), base, Attrib::None);
                 self.declare_local("(for state)".into(), base + 1, Attrib::None);
                 self.declare_local("(for state)".into(), base + 2, Attrib::None);
+                self.declare_local("(for close)".into(), base + 3, Attrib::Close);
+                self.fs().has_tbc = true;
+                self.emit(Instr::Tbc { reg: base + 3 });
                 let vars_base = self.fs().free_reg;
-                debug_assert_eq!(vars_base, base + 3);
+                debug_assert_eq!(vars_base, base + 4);
                 for v in vars {
                     let r = self.alloc_reg()?;
                     self.declare_local(v.clone(), r, Attrib::None);
@@ -919,12 +929,16 @@ impl<'h> Compiler<'h> {
             }
             Expr::Index { obj, key, line } => {
                 self.at_line(*line);
-                let o = self.expr_to_any(obj)?;
+                // Target prefixes must capture their pre-assignment values,
+                // because an earlier or later target may overwrite the local
+                // they read (e.g. `i, a[i], a = ...`). Force fresh temps
+                // instead of aliasing a local's register.
+                let o = self.expr_to_fresh(obj)?;
                 if let Expr::Str(s) = &**key {
                     let k = self.str_const(s)?;
                     Ok(Target::Field { obj: o, k })
                 } else {
-                    let k = self.expr_to_any(key)?;
+                    let k = self.expr_to_fresh(key)?;
                     Ok(Target::Index { obj: o, key: k })
                 }
             }
@@ -1228,6 +1242,26 @@ impl<'h> Compiler<'h> {
         let r = self.alloc_reg()?;
         self.expr_to_reg(e, r)?;
         Ok(r)
+    }
+
+    /// Like [`Self::expr_to_any`], but always materializes the value in a
+    /// fresh temporary, even for a local. Assignment-target prefixes use this
+    /// so a later store to that local cannot invalidate the captured value.
+    fn expr_to_fresh(&mut self, e: &Expr) -> Result<u8, CompileError> {
+        let r = self.alloc_reg()?;
+        self.expr_to_reg(e, r)?;
+        Ok(r)
+    }
+
+    /// Sets registers `from..to` to nil. Keeps stale references out of dead
+    /// slots, which the whole-stack collector would otherwise treat as roots.
+    fn clear_regs(&mut self, from: u8, to: u8) {
+        if from < to {
+            self.emit(Instr::LoadNil {
+                dst: from,
+                n: to - from,
+            });
+        }
     }
 
     fn expr_to_reg(&mut self, e: &Expr, dst: u8) -> Result<(), CompileError> {

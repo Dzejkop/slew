@@ -24,8 +24,11 @@ use std::rc::Rc;
 /// Default cap on call-frame depth; a deliberately bounded execution profile
 /// knob (recursion consumes heap, not the host stack).
 const MAX_CALL_DEPTH: usize = 10_000;
-/// Bound on `__index`/`__newindex`/`__call` metamethod chains.
-const MAX_META_CHAIN: usize = 100;
+/// Bound on `__index`/`__newindex`/`__call` metamethod chains. High enough
+/// for the upstream suite's 100-deep `__call` chains while still catching a
+/// genuine cycle; `__call` resolution keeps the argument window at a fixed
+/// scratch base, so chasing N levels costs O(N) space, not O(N^2).
+const MAX_META_CHAIN: usize = 10_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -2175,7 +2178,7 @@ impl Lua {
             }
             Instr::TForLoop { base: b, off } => {
                 let a = base + b as usize;
-                let v = th.stack[a + 3];
+                let v = th.stack[a + 4];
                 if v != Value::Nil {
                     th.stack[a + 2] = v;
                     jump(th, off);
@@ -2288,10 +2291,15 @@ impl Lua {
                         return Err(self
                             .rt_err(th, format!("attempt to call a {} value", other.type_name())));
                     }
-                    let wb = scratch_base(th).max(func_abs + 1 + argc);
+                    // Prepend `mm`, keeping the window pinned at the frame's
+                    // scratch base. Repeated chases then shift in place (the
+                    // window stays put) instead of growing the stack by one
+                    // slot per level.
+                    let sb = scratch_base(th);
+                    let wb = func_abs.max(sb);
                     ensure_len(&mut th.stack, wb + 2 + argc);
-                    th.stack[wb] = mm;
                     th.stack.copy_within(func_abs..func_abs + 1 + argc, wb + 1);
+                    th.stack[wb] = mm;
                     func_abs = wb;
                     argc += 1;
                 }
@@ -2319,10 +2327,15 @@ impl Lua {
                         return Err(self
                             .rt_err(th, format!("attempt to call a {} value", other.type_name())));
                     }
-                    let wb = scratch_base(th).max(func_abs + 1 + argc);
+                    // Prepend `mm`, keeping the window pinned at the frame's
+                    // scratch base. Repeated chases then shift in place (the
+                    // window stays put) instead of growing the stack by one
+                    // slot per level.
+                    let sb = scratch_base(th);
+                    let wb = func_abs.max(sb);
                     ensure_len(&mut th.stack, wb + 2 + argc);
-                    th.stack[wb] = mm;
                     th.stack.copy_within(func_abs..func_abs + 1 + argc, wb + 1);
+                    th.stack[wb] = mm;
                     func_abs = wb;
                     argc += 1;
                 }
@@ -4613,7 +4626,8 @@ fn instr_dst(i: &Instr) -> Option<u8> {
         | Instr::Vararg { dst, .. }
         | Instr::Closure { dst, .. } => Some(dst),
         Instr::Call { base, .. } | Instr::TailCall { base, .. } => Some(base),
-        Instr::ForLoop { base, .. } | Instr::TForLoop { base, .. } => Some(base + 3),
+        Instr::ForLoop { base, .. } => Some(base + 3),
+        Instr::TForLoop { base, .. } => Some(base + 4),
         _ => None,
     }
 }

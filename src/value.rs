@@ -219,6 +219,15 @@ pub struct Table {
     /// Dense array part for keys `1..=array.len()` (may contain trailing nils).
     array: Vec<Value>,
     hash: HashMap<HKey, Value>,
+    /// Insertion order of every key ever placed in the hash part. Removed keys
+    /// stay here as tombstones so an in-progress `next` traversal can still
+    /// locate a key that was set to nil mid-iteration (PUC keeps its dead
+    /// keys around for exactly this reason). Never mutated during iteration,
+    /// so the cursor survives deletion and collection of the current key.
+    order: Vec<HKey>,
+    /// Position of a key in `order`, also serving as "was this key ever
+    /// inserted" so re-inserting a removed key does not add a duplicate.
+    order_pos: HashMap<HKey, usize>,
     pub metatable: Option<TableId>,
     /// Set once the collector has selected this table for a `__gc` run, so a
     /// resurrected object is never finalized twice.
@@ -266,6 +275,10 @@ impl Table {
         if value == Value::Nil {
             self.hash.remove(&k);
         } else {
+            if !self.order_pos.contains_key(&k) {
+                self.order_pos.insert(k, self.order.len());
+                self.order.push(k);
+            }
             self.hash.insert(k, value);
         }
         Ok(())
@@ -334,17 +347,22 @@ impl Table {
 
     /// Rough heap footprint in bytes, for memory budgeting.
     pub fn mem_estimate(&self) -> usize {
-        64 + self.array.capacity() * 16 + self.hash.capacity() * 48
+        64 + self.array.capacity() * 16
+            + self.hash.capacity() * 48
+            + self.order.capacity() * 16
+            + self.order_pos.capacity() * 48
     }
 
-    /// Iteration support for `next`: a stable snapshot order is array part
-    /// then hash part. O(n) per call; fine until we move to an ordered map.
+    /// Iteration support for `next`: a stable order is array part, then hash
+    /// part in insertion order. O(n) per call; fine until we move to an
+    /// ordered map.
     ///
-    /// Returns `Err(InvalidKey)` when `key` is not present in the table,
-    /// which the base library turns into an "invalid key to 'next'" error.
+    /// Returns `Err(InvalidKey)` when `key` was never in the table, which the
+    /// base library turns into an "invalid key to 'next'" error. A key that
+    /// was removed is still locatable (its `order` slot is a tombstone), so
+    /// deleting the current key mid-iteration is safe.
     pub fn next_after(&self, key: Option<HKey>) -> Result<Option<(Value, Value)>, InvalidKey> {
-        let array_iter = (1..=self.array.len() as i64).map(HKey::Int);
-        let mut all = array_iter.chain(self.hash.keys().copied());
+        let mut all = self.iter_keys();
         if let Some(prev) = key {
             // skip until just past `prev`
             let mut found = false;
@@ -365,6 +383,19 @@ impl Table {
             }
         }
         Ok(None)
+    }
+
+    /// The `next` traversal order: array indices `1..=len`, then hash keys in
+    /// insertion order. Integer keys that have migrated into the array part
+    /// are skipped in the hash phase so a key is never visited twice.
+    fn iter_keys(&self) -> impl Iterator<Item = HKey> + '_ {
+        let array_len = self.array.len() as i64;
+        (1..=array_len).map(HKey::Int).chain(
+            self.order
+                .iter()
+                .copied()
+                .filter(move |k| !matches!(k, HKey::Int(i) if *i >= 1 && *i <= array_len)),
+        )
     }
 }
 
