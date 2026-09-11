@@ -603,15 +603,19 @@ impl Lua {
         lua
     }
 
+    /// Reseeds the PRNG with PUC 5.4's `setseed`, using `0` for the second
+    /// 64-bit word. Equivalent to `seed_random_pair(seed, 0)`.
     pub fn seed_random(&mut self, seed: u64) {
-        // splitmix64 to expand the seed into the xoshiro state
-        let mut x = seed;
-        for s in &mut self.rng {
-            x = x.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            *s = z ^ (z >> 31);
+        self.seed_random_pair(seed, 0);
+    }
+
+    /// Seeds the PRNG with two 64-bit words exactly like PUC 5.4's `setseed`:
+    /// state `{n1, 0xff, n2, 0}`, then 16 discarded `nextrand` calls to spread
+    /// the seed. (`0xff` avoids the all-zero state.)
+    pub fn seed_random_pair(&mut self, n1: u64, n2: u64) {
+        self.rng = [n1, 0xff, n2, 0];
+        for _ in 0..16 {
+            self.next_random();
         }
     }
 

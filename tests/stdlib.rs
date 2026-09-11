@@ -767,6 +767,51 @@ fn math_random_deterministic() {
     assert_ne!(a[0], c[0]); // overwhelmingly likely
 }
 
+#[test]
+fn math_random_matches_puc_xoshiro() {
+    // PUC 5.4's `math.randomseed(1007)` then `math.random(0)` is
+    // 0x7a7040a5a323c9d6 (asserted by upstream math.lua).
+    assert_eq!(
+        eval("math.randomseed(1007) return math.random(0)"),
+        (0x7a7040a5a323c9d6u64 as i64).to_string()
+    );
+    // One seed word defaults the second to 0; both reseed identically.
+    assert_eq!(
+        eval(
+            "math.randomseed(1007) local a = math.random(0) \
+              math.randomseed(1007, 0) return math.random(0) == a"
+        ),
+        "true"
+    );
+    // `randomseed` returns the two seed words and reseeding with them repeats.
+    assert_eq!(
+        eval(
+            "local x, y = math.randomseed(123, 456) \
+             local a = math.random(0) \
+             math.randomseed(x, y) \
+             return math.random(0) == a and type(x) == 'number' and type(y) == 'number'"
+        ),
+        "true"
+    );
+    // A single-argument upper bound projects into [1, m] (m == 0 is the full
+    // integer); the two-argument form projects into [low, up].
+    assert_eq!(
+        eval(
+            "math.randomseed(1) \
+             for i = 1, 500 do local r = math.random(7) assert(r >= 1 and r <= 7) end \
+             for i = 1, 500 do local r = math.random(-3, 3) assert(r >= -3 and r <= 3) end \
+             return 'ok'"
+        ),
+        "ok"
+    );
+    // More than two arguments is an error, as in PUC.
+    assert_eq!(eval("return (pcall(math.random, 1, 2, 3))"), "false");
+    assert_eq!(
+        eval("return (pcall(math.random, math.maxinteger, math.maxinteger - 1))"),
+        "false"
+    );
+}
+
 // ---- integration: stdlib under strict fuel ----
 
 #[test]

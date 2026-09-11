@@ -8,7 +8,7 @@ pm.lua	line:436
 utf8.lua	ok
 sort.lua	ok
 strings.lua	line:194
-math.lua	line:825
+math.lua	ok
 verybig.lua	ok
 constructs.lua	ok
 locals.lua	line:418
