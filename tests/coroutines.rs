@@ -391,6 +391,59 @@ fn error_inside_close_propagates() {
 }
 
 #[test]
+fn errors_chained_through_unwinding_close() {
+    let closers = "local function c(f) return setmetatable({}, {__close = f}) end \
+                   local seen = {} local count = 0 ";
+    // Every to-be-closed variable is closed even when a __close raises during
+    // unwinding, each handler receives the previous error, and the final
+    // error is the last one raised (upstream locals.lua:418).
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) count = count + 1; error('@x') end) \
+                 local y <close> = c(function(_, msg) count = count + 1; error('@y') end) \
+                 local z <close> = c(function(_, msg) count = count + 1; error('@z') end) \
+                 return 200 \
+             end \
+             local _, msg = pcall(foo) \
+             return table.concat({{tostring(string.find(msg, '@x') ~= nil), tostring(count)}}, ',')"
+        )),
+        "true,3"
+    );
+    // The error object passed to the remaining handler is the newest one:
+    // `z` raises `@z` on the normal-return close, then `y` sees `@z` and
+    // raises `@y`, and `x` sees `@y`.
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) seen.x = msg end) \
+                 local y <close> = c(function(_, msg) seen.y = msg; error('@y') end) \
+                 local z <close> = c(function(_, msg) error('@z') end) \
+                 return 200 \
+             end \
+             pcall(foo) \
+             return tostring(string.find(seen.x, '@y') ~= nil)"
+        )),
+        "true"
+    );
+    // A non-string original error object reaches the first handler unchanged.
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) seen.x = msg end) \
+                 error(4) \
+             end \
+             pcall(foo) \
+             return tostring(seen.x == 4)"
+        )),
+        "true"
+    );
+}
+
+#[test]
 fn close_suspends_correctly() {
     // __close handlers run as frames: stepping one instruction at a time
     // through scope exits with closes must work

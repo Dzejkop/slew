@@ -1687,6 +1687,36 @@ impl Lua {
         // values of to-be-closed variables in unwound frames, innermost first
         let mut to_close: Vec<Value> = Vec::new();
         loop {
+            // A frame that already carries a staged `DeliverError` is a
+            // recovery chain in progress: the error just raised came from a
+            // `__close` handler while unwinding. PUC's `luaD_closeprotected`
+            // keeps closing instead of unwinding past the chain, passing the
+            // newest error object to the remaining handlers and the final
+            // delivery. Fold it in and resume.
+            let staged = th.frames.last().is_some_and(|f| {
+                f.pending
+                    .iter()
+                    .any(|p| matches!(p, Pending::DeliverError { .. }))
+            });
+            if staged {
+                let new_err = self.err_value(&e);
+                let f = th.frames.last_mut().unwrap();
+                for p in f.pending.iter_mut() {
+                    match p {
+                        Pending::CallClose { err, .. } | Pending::DeliverError { err, .. } => {
+                            *err = new_err;
+                        }
+                        _ => {}
+                    }
+                }
+                // To-be-closed variables of the frames popped on the way here
+                // (nested inside the failing handler) close first, with the
+                // same newest error.
+                for v in to_close.into_iter().rev() {
+                    f.pending.push(Pending::CallClose { v, err: new_err });
+                }
+                return Ok(());
+            }
             match th.frames.last() {
                 None => return Err(e),
                 Some(f) if f.protected => break,

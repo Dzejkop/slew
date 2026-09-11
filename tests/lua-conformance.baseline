@@ -11,7 +11,7 @@ strings.lua	line:194
 math.lua	ok
 verybig.lua	ok
 constructs.lua	ok
-locals.lua	line:418
+locals.lua	line:463
 goto.lua	ok
 calls.lua	line:331
 events.lua	ok
