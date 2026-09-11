@@ -9,9 +9,9 @@ sort.lua	line:199
 strings.lua	line:171
 math.lua	line:342
 verybig.lua	ok
-constructs.lua	line:247
+constructs.lua	ok
 locals.lua	line:8
-goto.lua	line:21
+goto.lua	ok
 calls.lua	line:165
 events.lua	line:196
 bitwise.lua	ok

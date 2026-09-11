@@ -121,7 +121,7 @@ pub enum Stmt {
         label: Box<str>,
         line: u32,
     },
-    Label(Box<str>),
+    Label(Box<str>, u32),
 }
 
 #[derive(Debug, Clone)]

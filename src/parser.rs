@@ -196,7 +196,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 let name = self.expect_name()?;
                 self.expect_token(Token::DoubleColon)?;
-                Ok(Stmt::Label(name))
+                Ok(Stmt::Label(name, line))
             }
             Token::Do => {
                 self.advance()?;

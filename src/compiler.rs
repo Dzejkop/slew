@@ -40,6 +40,7 @@ pub fn compile(
     // it with the globals table when instantiating the chunk.
     main.upvals.push(UpvalDesc::Upval(0));
     main.upval_names.push("_ENV".into());
+    main.upval_attribs.push(Attrib::None);
     c.funcs.push(main);
     c.block_scope(block)?;
     c.check_pending_gotos()?;
@@ -79,6 +80,9 @@ struct PendingGoto {
     jump_pc: usize,
     /// Active-local count at the goto, capped at each enclosing block exit.
     nact: usize,
+    /// Set when the goto leaves a block that has a captured or to-be-closed
+    /// local, so its placeholder `Close` must be patched (PUC's `gt->close`).
+    close: bool,
     line: u32,
 }
 
@@ -87,6 +91,8 @@ struct LabelDef {
     name: Box<str>,
     pc: usize,
     reg: u8,
+    /// Source line of the `::name::` definition (for repeated-label errors).
+    line: u32,
 }
 
 struct FuncState {
@@ -97,6 +103,10 @@ struct FuncState {
     protos: Vec<Rc<Proto>>,
     upvals: Vec<UpvalDesc>,
     upval_names: Vec<Box<str>>,
+    /// Attribute of each upvalue, parallel to `upvals`/`upval_names`. Only
+    /// needed at compile time to reject writes to captured `<const>`/`<close>`
+    /// locals; not carried into the `Proto`.
+    upval_attribs: Vec<Attrib>,
     /// Debug call names, parallel to `code` (see `Proto::call_names`).
     call_names: Vec<Option<(&'static str, Box<str>)>>,
     locals: Vec<LocalVar>,
@@ -132,6 +142,7 @@ impl FuncState {
             protos: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
+            upval_attribs: Vec::new(),
             call_names: Vec::new(),
             locals: Vec::new(),
             loops: Vec::new(),
@@ -348,7 +359,7 @@ impl<'h> Compiler<'h> {
 
     fn block_scope(&mut self, b: &Block) -> Result<(), CompileError> {
         let floor = self.enter_scope();
-        self.stmt_seq(&b.stmts)?;
+        self.stmt_seq(&b.stmts, true)?;
         self.exit_scope(floor);
         Ok(())
     }
@@ -356,27 +367,42 @@ impl<'h> Compiler<'h> {
     /// Compiles a statement sequence, handling label visibility: a label is
     /// "at the end of the block" (and may be jumped to over the block's
     /// locals) when only other labels follow it.
-    fn stmt_seq(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
+    fn stmt_seq(&mut self, stmts: &[Stmt], trailing_label_last: bool) -> Result<(), CompileError> {
         let nact_entry = self.funcs.last().unwrap().locals.len();
         let labels_floor = self.funcs.last().unwrap().labels.len();
         let gotos_floor = self.funcs.last().unwrap().gotos.len();
         let outer_goto_floor = self.funcs.last().unwrap().goto_floor;
         self.funcs.last_mut().unwrap().goto_floor = gotos_floor;
         for (i, s) in stmts.iter().enumerate() {
-            if let Stmt::Label(name) = s {
-                let last = stmts[i + 1..].iter().all(|s| matches!(s, Stmt::Label(_)));
-                self.define_label(name, last, nact_entry)?;
+            if let Stmt::Label(name, line) = s {
+                // PUC treats a label as "at the end of the block" only when
+                // nothing but no-op statements (`;` and other labels) follow
+                // *and* the block's closing token is not `until` (a repeat's
+                // condition still sees the body's locals).
+                let rest_noop = stmts[i + 1..]
+                    .iter()
+                    .all(|s| matches!(s, Stmt::Label(..) | Stmt::Empty));
+                let last = trailing_label_last && rest_noop;
+                self.define_label(name, *line, last, nact_entry)?;
             } else {
                 self.stmt(s)?;
             }
         }
         self.funcs.last_mut().unwrap().goto_floor = outer_goto_floor;
         // leaving the block: labels go out of scope; unmatched gotos float
-        // up with their local count capped at this block's entry level
+        // up with their local count capped at this block's entry level. A
+        // goto that leaves a block holding captured or to-be-closed locals
+        // must run their `Close` (PUC's `movegotosout`/`gt->close`).
         let fs = self.funcs.last_mut().unwrap();
         fs.labels.truncate(labels_floor);
+        let block_has_upval = fs.locals[nact_entry.min(fs.locals.len())..]
+            .iter()
+            .any(|l| l.captured || l.attrib == Attrib::Close);
         let start = gotos_floor.min(fs.gotos.len());
         for g in &mut fs.gotos[start..] {
+            if block_has_upval && g.nact > nact_entry {
+                g.close = true;
+            }
             g.nact = g.nact.min(nact_entry);
         }
         Ok(())
@@ -385,18 +411,20 @@ impl<'h> Compiler<'h> {
     fn define_label(
         &mut self,
         name: &str,
+        line: u32,
         last_in_block: bool,
         block_nact: usize,
     ) -> Result<(), CompileError> {
-        if self
+        if let Some(old) = self
             .funcs
             .last()
             .unwrap()
             .labels
             .iter()
-            .any(|l| &*l.name == name)
+            .find(|l| &*l.name == name)
         {
-            return self.err(format!("label '{name}' already defined"));
+            let old_line = old.line;
+            return self.err(format!("label '{name}' already defined on line {old_line}"));
         }
         let fs = self.funcs.last().unwrap();
         let nact = if last_in_block {
@@ -415,19 +443,33 @@ impl<'h> Compiler<'h> {
         // this block can see it (labels are not visible to enclosing blocks)
         let mut i = floor;
         while i < self.funcs.last().unwrap().gotos.len() {
-            let g = &self.funcs.last().unwrap().gotos[i];
-            if &*g.name != name {
+            let (gname, gline, gnact) = {
+                let g = &self.funcs.last().unwrap().gotos[i];
+                (g.name.clone(), g.line, g.nact)
+            };
+            if &*gname != name {
                 i += 1;
                 continue;
             }
-            if g.nact < nact {
-                let line = g.line;
+            if gnact < nact {
+                // PUC names the first local active at the label but not at
+                // the goto, i.e. `actvar[goto.nactvar]`.
+                let var = self
+                    .funcs
+                    .last()
+                    .unwrap()
+                    .locals
+                    .get(gnact)
+                    .map(|l| l.name.to_string())
+                    .unwrap_or_default();
                 self.fs().cur_line = line;
-                return self.err(format!("<goto {name}> jumps into the scope of a local"));
+                return self.err(format!(
+                    "<goto {gname}> at line {gline} jumps into the scope of local '{var}'"
+                ));
             }
             let g = self.funcs.last_mut().unwrap().gotos.remove(i);
-            if nact < g.nact {
-                // jumping out of local scopes: close their upvalues
+            if g.close || nact < g.nact {
+                // jumping out of local scopes: close their upvalues / TBC vars
                 if let Instr::Close { from } = &mut self.funcs.last_mut().unwrap().code[g.close_pc]
                 {
                     *from = reg;
@@ -442,6 +484,7 @@ impl<'h> Compiler<'h> {
             name: name.into(),
             pc,
             reg,
+            line,
         });
         Ok(())
     }
@@ -450,7 +493,12 @@ impl<'h> Compiler<'h> {
         if let Some(g) = self.funcs.last().unwrap().gotos.first() {
             let (name, line) = (g.name.clone(), g.line);
             self.fs().cur_line = line;
-            return self.err(format!("no visible label '{name}' for goto"));
+            if &*name == "break" {
+                return self.err(format!("break outside loop at line {line}"));
+            }
+            return self.err(format!(
+                "no visible label '{name}' for <goto> at line {line}"
+            ));
         }
         Ok(())
     }
@@ -480,23 +528,30 @@ impl<'h> Compiler<'h> {
             return NameLoc::Global;
         }
         // resolve in the enclosing function, then capture
-        let desc = if let Some(i) = self.funcs[level - 1]
+        let (desc, attrib) = if let Some(i) = self.funcs[level - 1]
             .locals
             .iter()
             .rposition(|l| &*l.name == name)
         {
             self.funcs[level - 1].locals[i].captured = true;
-            UpvalDesc::Local(self.funcs[level - 1].locals[i].reg)
+            (
+                UpvalDesc::Local(self.funcs[level - 1].locals[i].reg),
+                self.funcs[level - 1].locals[i].attrib,
+            )
         } else {
             match self.resolve_at(level - 1, name) {
                 NameLoc::Local(_) => unreachable!("handled above"),
-                NameLoc::Upval(i) => UpvalDesc::Upval(i),
+                NameLoc::Upval(i) => (
+                    UpvalDesc::Upval(i),
+                    self.funcs[level - 1].upval_attribs[i as usize],
+                ),
                 NameLoc::Global => return NameLoc::Global,
             }
         };
         let fs = &mut self.funcs[level];
         fs.upvals.push(desc);
         fs.upval_names.push(name.into());
+        fs.upval_attribs.push(attrib);
         NameLoc::Upval(fs.upvals.len() as u8 - 1)
     }
 
@@ -506,11 +561,11 @@ impl<'h> Compiler<'h> {
         let watermark = self.local_top();
         match s {
             Stmt::Empty => {}
-            Stmt::Label(name) => {
+            Stmt::Label(name, line) => {
                 // labels are normally handled by stmt_seq (which knows
                 // block-end position); a stray one is not last-in-block
                 let nact = self.funcs.last().unwrap().locals.len();
-                self.define_label(name, false, nact)?;
+                self.define_label(name, *line, false, nact)?;
             }
             Stmt::Goto { label, line } => {
                 self.at_line(*line);
@@ -531,6 +586,7 @@ impl<'h> Compiler<'h> {
                         close_pc,
                         jump_pc,
                         nact,
+                        close: false,
                         line: *line,
                     });
                 }
@@ -621,7 +677,7 @@ impl<'h> Compiler<'h> {
                     breaks: Vec::new(),
                     reg_floor,
                 });
-                self.stmt_seq(&body.stmts)?;
+                self.stmt_seq(&body.stmts, false)?;
                 // condition sees the body's locals (Lua scoping rule)
                 let r = self.expr_to_any(cond)?;
                 let exit = self.emit_jump(Instr::Test {
@@ -789,7 +845,7 @@ impl<'h> Compiler<'h> {
             Stmt::Break(line) => {
                 self.at_line(*line);
                 if self.funcs.last().unwrap().loops.is_empty() {
-                    return self.err("break outside a loop");
+                    return self.err(format!("break outside loop at line {line}"));
                 }
                 let floor = self.funcs.last().unwrap().loops.last().unwrap().reg_floor;
                 self.emit(Instr::Close { from: floor });
@@ -839,13 +895,25 @@ impl<'h> Compiler<'h> {
                             .iter()
                             .rev()
                             .find(|l| l.reg == reg)
-                            .is_some_and(|l| l.attrib == Attrib::Const);
+                            .is_some_and(|l| l.attrib != Attrib::None);
                         if is_const {
                             return self.err(format!("attempt to assign to const variable '{n}'"));
                         }
                         Ok(Target::Local(reg))
                     }
-                    NameLoc::Upval(i) => Ok(Target::Upval(i)),
+                    NameLoc::Upval(i) => {
+                        let read_only = self
+                            .funcs
+                            .last()
+                            .unwrap()
+                            .upval_attribs
+                            .get(i as usize)
+                            .is_some_and(|a| *a != Attrib::None);
+                        if read_only {
+                            return self.err(format!("attempt to assign to const variable '{n}'"));
+                        }
+                        Ok(Target::Upval(i))
+                    }
                     NameLoc::Global => Ok(Target::Global(self.str_const(n.as_bytes())?)),
                 }
             }
