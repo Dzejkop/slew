@@ -302,6 +302,59 @@ fn numeric_for_edge_cases() {
     assert!(run_err("for i = 1, 'x' do end").contains("must be a number"));
 }
 
+#[test]
+fn numeric_for_string_coercion() {
+    // PUC accepts numeric strings for control/limit/step. Because the control
+    // and step are strings, the loop runs in the float path.
+    assert_eq!(
+        eval(r#"local a = 0 for i = "10", "1", "-2" do a = a + 1 end return a"#),
+        "5"
+    );
+    assert_eq!(
+        eval(r#"for i = "10", "1", "-2" do return math.type(i) end"#),
+        "float"
+    );
+    // A numeric string limit on an otherwise-integer loop stays integral:
+    // `forlimit` parses it and rounds toward the loop interior.
+    assert_eq!(
+        eval(r#"for i = 1, "3.5" do return math.type(i) end"#),
+        "integer"
+    );
+    // A string step forces the float path even when init is an integer.
+    assert_eq!(
+        eval(r#"for i = 1, 3, "1.0" do return math.type(i) end"#),
+        "float"
+    );
+    // A numeric string limit on a fully-integer loop stays integral.
+    assert_eq!(
+        eval(r#"local n = 0 for i = 1, "3" do n = n + 1 end return n"#),
+        "3"
+    );
+    // `10.0` init keeps float counting.
+    assert_eq!(
+        eval("local a = 0 for i = 10.0, 1, -1 do a = a + 1 end return a"),
+        "10"
+    );
+    // Changing the control variable does not disturb the internal counter.
+    assert_eq!(
+        eval(r#"local a = 0 for i = 1, 10 do a = a + 1; i = "x" end return a"#),
+        "10"
+    );
+    // Non-numeric strings use PUC's per-slot error wording.
+    assert!(
+        run_err(r#"for i = 1, "x" do end"#).contains("'for' limit must be a number"),
+        "integer loop limit error"
+    );
+    assert!(
+        run_err(r#"for i = "x", 1 do end"#).contains("'for' initial value must be a number"),
+        "float loop initial-value error"
+    );
+    assert!(
+        run_err(r#"for i = 1, 10, "x" do end"#).contains("'for' step must be a number"),
+        "float loop step error"
+    );
+}
+
 // ---- functions, closures, multrets ----
 
 #[test]

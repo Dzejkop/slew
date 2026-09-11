@@ -3553,57 +3553,76 @@ impl Lua {
     }
 
     fn for_prep(&mut self, th: &mut Thread, a: usize, off: i32) -> Result<(), VmError> {
-        let init = th.stack[a];
-        let limit = th.stack[a + 1];
-        let step = th.stack[a + 2];
-        let num = |me: &Self, v: Value, what: &str| -> Result<Value, VmError> {
-            match v {
-                Value::Int(_) | Value::Float(_) => Ok(v),
-                _ => Err(me.rt_err(th, format!("'for' {what} must be a number"))),
+        // PUC `forprep`: the integer path is taken only when the *control*
+        // and *step* are actual integers; any numeric string (even when
+        // integral) forces the float path.
+        if let (Value::Int(i0), Value::Int(s)) = (th.stack[a], th.stack[a + 2]) {
+            if s == 0 {
+                return Err(self.rt_err(th, "'for' step is zero".into()));
             }
-        };
-        let init = num(self, init, "initial value")?;
-        let limit = num(self, limit, "limit")?;
-        let step = num(self, step, "step")?;
-        match (init, step) {
-            (Value::Int(i0), Value::Int(s)) => {
-                if s == 0 {
-                    return Err(self.rt_err(th, "'for' step is zero".into()));
+            match self.for_limit(th, a + 1, s > 0)? {
+                Some(l) if (s > 0 && i0 <= l) || (s < 0 && i0 >= l) => {
+                    th.stack[a + 1] = Value::Int(l);
+                    th.stack[a + 3] = Value::Int(i0);
                 }
-                let l = match limit {
-                    Value::Int(l) => Some(l),
-                    Value::Float(f) => for_int_limit(f, s > 0),
-                    _ => unreachable!(),
-                };
-                match l {
-                    Some(l) if (s > 0 && i0 <= l) || (s < 0 && i0 >= l) => {
-                        th.stack[a + 1] = Value::Int(l);
-                        th.stack[a + 3] = Value::Int(i0);
-                    }
-                    _ => jump(th, off),
-                }
+                _ => jump(th, off),
             }
-            _ => {
-                let to_f = |v: Value| match v {
-                    Value::Int(i) => i as f64,
-                    Value::Float(f) => f,
-                    _ => unreachable!(),
-                };
-                let (i0, l, s) = (to_f(init), to_f(limit), to_f(step));
-                if s == 0.0 {
-                    return Err(self.rt_err(th, "'for' step is zero".into()));
-                }
-                if (s > 0.0 && i0 <= l) || (s < 0.0 && i0 >= l) {
-                    th.stack[a] = Value::Float(i0);
-                    th.stack[a + 1] = Value::Float(l);
-                    th.stack[a + 2] = Value::Float(s);
-                    th.stack[a + 3] = Value::Float(i0);
-                } else {
-                    jump(th, off);
-                }
+        } else {
+            // PUC checks limit, then step, then initial value.
+            let limit = self.for_number(th, a + 1, "limit")?;
+            let step = self.for_number(th, a + 2, "step")?;
+            let init = self.for_number(th, a, "initial value")?;
+            if step == 0.0 {
+                return Err(self.rt_err(th, "'for' step is zero".into()));
+            }
+            if (step > 0.0 && init <= limit) || (step < 0.0 && init >= limit) {
+                th.stack[a] = Value::Float(init);
+                th.stack[a + 1] = Value::Float(limit);
+                th.stack[a + 2] = Value::Float(step);
+                th.stack[a + 3] = Value::Float(init);
+            } else {
+                jump(th, off);
             }
         }
         Ok(())
+    }
+
+    /// PUC `forprep`'s `tonumber`: numbers pass through and numeric strings
+    /// are parsed, all converted to `lua_Number` (f64). Anything else raises
+    /// `'for' <what> must be a number`.
+    fn for_number(&self, th: &Thread, idx: usize, what: &str) -> Result<f64, VmError> {
+        let n = match th.stack[idx] {
+            Value::Int(i) => Some(i as f64),
+            Value::Float(f) => Some(f),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(Value::Int(i)) => Some(i as f64),
+                Some(Value::Float(f)) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        };
+        n.ok_or_else(|| self.rt_err(th, format!("'for' {what} must be a number")))
+    }
+
+    /// PUC `forlimit`: coerce an integer loop's limit. Numeric strings are
+    /// parsed; a float limit is rounded toward the loop interior (or clamped)
+    /// by `for_int_limit`. `None` means the loop must not run.
+    fn for_limit(
+        &self,
+        th: &Thread,
+        idx: usize,
+        step_positive: bool,
+    ) -> Result<Option<i64>, VmError> {
+        match th.stack[idx] {
+            Value::Int(l) => Ok(Some(l)),
+            Value::Float(f) => Ok(for_int_limit(f, step_positive)),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(Value::Int(l)) => Ok(Some(l)),
+                Some(Value::Float(f)) => Ok(for_int_limit(f, step_positive)),
+                _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+            },
+            _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+        }
     }
 
     fn unary(
