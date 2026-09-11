@@ -701,6 +701,24 @@ impl Lua {
         Value::Closure(cid)
     }
 
+    /// Builds a closure from an already-decoded `Proto` (binary chunks). The
+    /// first upvalue receives `env` (the globals table when absent) and any
+    /// further upvalues start closed over `nil`, matching PUC's `lua_load`.
+    pub(crate) fn make_function_from_proto(
+        &mut self,
+        proto: Rc<Proto>,
+        env: Option<Value>,
+    ) -> Value {
+        let first = env.unwrap_or(Value::Table(self.globals));
+        let mut upvals = Vec::with_capacity(proto.upvals.len());
+        for i in 0..proto.upvals.len() {
+            let v = if i == 0 { first } else { Value::Nil };
+            upvals.push(self.new_upval(Upval::Closed(v)));
+        }
+        let cid = self.alloc_closure(LuaClosure { proto, upvals });
+        Value::Closure(cid)
+    }
+
     /// Installs the host reader behind `loadfile`, `dofile`, and
     /// `package.searchpath`. `Ok(None)` means "not found"; `Err` is a hard
     /// failure. Without a reader those functions report "cannot open" and

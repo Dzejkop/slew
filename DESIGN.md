@@ -164,8 +164,10 @@ through a capability the embedder installs explicitly.
   not track a precise dynamic stack top. Values can therefore survive a
   collection that PUC would have reclaimed (visible only through weak tables
   or `__gc`); it is over-retention, never premature collection.
-- Binary chunks are rejected: `string.dump` is absent and `load` refuses the
-  `\x1bLua` signature.
+- Binary chunks carry PUC 5.4's header and `LUAC_INT`/`LUAC_NUM` sentinels,
+  but the proto body after them is slew-specific (see `src/stdlib/dump.rs`),
+  so dumps round-trip through slew's `load` and are not portable to PUC's
+  `luac`/`undump`.
 - `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
   supported.
 - `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the

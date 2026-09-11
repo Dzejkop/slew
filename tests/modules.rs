@@ -393,3 +393,87 @@ fn fs_reader_is_rooted_and_confined() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
 }
+
+// ---- string.dump / binary chunks ----
+
+#[test]
+fn string_dump_round_trips_and_loads_binary() {
+    let mut lua = Lua::new();
+    // A dumped function round-trips through binary `load` with an env.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = assert(load(string.dump(function() return 1 end), nil, 'b', {})) \
+             return type(f) == 'function' and f() == 1"
+        ),
+        "true"
+    );
+    // The header starts with PUC 5.4's signature, version 0x54, format 0.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local c = string.dump(function() return 1 end) \
+             return string.sub(c, 1, 4) == '\\27Lua' \
+                and string.byte(c, 5) == 0x54 and string.byte(c, 6) == 0"
+        ),
+        "true"
+    );
+    // Upvalue names survive the round-trip and be re-bound afterwards.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local a = 7 \
+             local f = assert(load(string.dump(function() return a end), '', 'b')) \
+             local name = debug.getupvalue(f, 1) \
+             debug.setupvalue(f, 1, a) \
+             return name .. ':' .. f()"
+        ),
+        "a:7"
+    );
+    // Both mode mismatches are rejected with PUC-style messages.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f, err = load(string.dump(function() end), nil, 't') \
+             return f == nil and string.find(err, 'binary chunk') ~= nil"
+        ),
+        "true"
+    );
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f, err = load('return 1', nil, 'b') \
+             return f == nil and string.find(err, 'text chunk') ~= nil"
+        ),
+        "true"
+    );
+    // Truncation (even mid-signature) reports "truncated".
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local c = string.dump(function() return 1 end) \
+             local function bad(s) \
+               local f, err = load(s) \
+               return f == nil and string.find(err, 'truncated') ~= nil \
+             end \
+             return bad(string.sub(c, 1, 1)) and bad(string.sub(c, 1, #c - 1))"
+        ),
+        "true"
+    );
+    // Loading a binary long string interrupted by GC cycles (calls.lua:335).
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local function read1(x) local i = 0; \
+               return function() collectgarbage(); i = i + 1; return string.sub(x, i, i) end end \
+             local c = string.dump(function() return '0123456789' end) \
+             return assert(load(read1(c)))()"
+        ),
+        "0123456789"
+    );
+    // C functions cannot be dumped.
+    assert_eq!(
+        eval(&mut lua, "return not pcall(string.dump, print)"),
+        "true"
+    );
+}

@@ -2,7 +2,7 @@
 //! `gmatch`/`gsub` live in the Lua prelude on top of `string.find`.
 
 use crate::pattern::{self, Capture};
-use crate::value::{fmt_number, fmt_g, Value};
+use crate::value::{Value, fmt_g, fmt_number};
 use crate::vm::Lua;
 
 use super::string_pack::{n_pack, n_packsize, n_unpack};
@@ -26,6 +26,7 @@ pub fn install(lua: &mut Lua) {
         ("pack", n_pack),
         ("unpack", n_unpack),
         ("packsize", n_packsize),
+        ("dump", super::dump::n_dump),
     ] {
         let v = lua.add_native(name, f);
         set_field(lua, st, name, v);
@@ -34,7 +35,9 @@ pub fn install(lua: &mut Lua) {
     // ("x"):upper() method syntax
     let meta = lua.new_table();
     set_field(lua, meta, "__index", st);
-    let Value::Table(meta_id) = meta else { unreachable!() };
+    let Value::Table(meta_id) = meta else {
+        unreachable!()
+    };
     lua.string_meta = Some(meta_id);
 }
 
@@ -55,9 +58,14 @@ fn arg_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
     match arg(args, i) {
         Value::Nil => Ok(None),
         Value::Int(n) => Ok(Some(n)),
-        Value::Float(f) => crate::value::float_to_exact_int(f).map(Some).ok_or_else(|| {
-            format!("bad argument #{} to '{who}' (number has no integer representation)", i + 1)
-        }),
+        Value::Float(f) => crate::value::float_to_exact_int(f)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "bad argument #{} to '{who}' (number has no integer representation)",
+                    i + 1
+                )
+            }),
         v => Err(format!(
             "bad argument #{} to '{who}' (number expected, got {})",
             i + 1,
@@ -168,7 +176,10 @@ fn n_char(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     for (i, _) in args.iter().enumerate() {
         let b = arg_int(args, i, "char")?.unwrap_or(-1);
         if !(0..=255).contains(&b) {
-            return Err(format!("bad argument #{} to 'char' (value out of range)", i + 1));
+            return Err(format!(
+                "bad argument #{} to 'char' (value out of range)",
+                i + 1
+            ));
         }
         out.push(b as u8);
     }
@@ -201,7 +212,10 @@ fn n_find(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         let found = if pat.is_empty() {
             Some(init)
         } else {
-            s[init..].windows(pat.len()).position(|w| w == &pat[..]).map(|p| p + init)
+            s[init..]
+                .windows(pat.len())
+                .position(|w| w == &pat[..])
+                .map(|p| p + init)
         };
         return Ok(match found {
             Some(p) => vec![Value::Int(p as i64 + 1), Value::Int((p + pat.len()) as i64)],
@@ -211,8 +225,7 @@ fn n_find(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     match pattern::find(&s, &pat, init)? {
         None => Ok(vec![Value::Nil]),
         Some(m) => {
-            let mut out =
-                vec![Value::Int(m.start as i64 + 1), Value::Int(m.end as i64)];
+            let mut out = vec![Value::Int(m.start as i64 + 1), Value::Int(m.end as i64)];
             for c in m.captures {
                 out.push(capture_value(lua, &s, c));
             }
@@ -238,7 +251,10 @@ fn n_match(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             if m.captures.is_empty() {
                 Ok(vec![lua.new_string(&s[m.start..m.end])])
             } else {
-                Ok(m.captures.into_iter().map(|c| capture_value(lua, &s, c)).collect())
+                Ok(m.captures
+                    .into_iter()
+                    .map(|c| capture_value(lua, &s, c))
+                    .collect())
             }
         }
     }
@@ -341,7 +357,9 @@ fn pad(s: Vec<u8>, width: usize, flags: Flags, numeric: bool) -> Vec<u8> {
         out.extend(std::iter::repeat_n(b' ', fill));
     } else if flags.zero && numeric {
         // zero-pad after any sign
-        let signed = s.first().is_some_and(|&c| c == b'-' || c == b'+' || c == b' ');
+        let signed = s
+            .first()
+            .is_some_and(|&c| c == b'-' || c == b'+' || c == b' ');
         if signed {
             out.push(s[0]);
             out.extend(std::iter::repeat_n(b'0', fill));
@@ -412,12 +430,22 @@ fn format_one(
         b'x' => {
             let n = want_int(v, argi)? as u64;
             let body = format!("{n:x}");
-            if flags.alt && n != 0 { format!("0x{body}") } else { body }.into_bytes()
+            if flags.alt && n != 0 {
+                format!("0x{body}")
+            } else {
+                body
+            }
+            .into_bytes()
         }
         b'X' => {
             let n = want_int(v, argi)? as u64;
             let body = format!("{n:X}");
-            if flags.alt && n != 0 { format!("0X{body}") } else { body }.into_bytes()
+            if flags.alt && n != 0 {
+                format!("0X{body}")
+            } else {
+                body
+            }
+            .into_bytes()
         }
         b'o' => format!("{:o}", want_int(v, argi)? as u64).into_bytes(),
         b'c' => {
@@ -437,7 +465,12 @@ fn format_one(
             // Rust: "1.5e3" → C: "1.500000e+03"
             if let Some(epos) = body.find('e') {
                 let exp: i32 = body[epos + 1..].parse().unwrap();
-                body = format!("{}e{}{:02}", &body[..epos], if exp < 0 { '-' } else { '+' }, exp.abs());
+                body = format!(
+                    "{}e{}{:02}",
+                    &body[..epos],
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                );
             }
             if conv == b'E' {
                 body = body.to_uppercase();
@@ -474,9 +507,11 @@ fn format_one(
                 Value::Int(_) | Value::Float(_) => return Ok(fmt_number(v).into_bytes()),
                 Value::Nil => return Ok(b"nil".to_vec()),
                 Value::Bool(b) => return Ok(b.to_string().into_bytes()),
-                _ => return Err(format!(
-                    "bad argument #{argi} to 'format' (value has no literal form)"
-                )),
+                _ => {
+                    return Err(format!(
+                        "bad argument #{argi} to 'format' (value has no literal form)"
+                    ));
+                }
             };
             let mut out = vec![b'"'];
             for b in bytes {
@@ -486,9 +521,7 @@ fn format_one(
                     b'\n' => out.extend_from_slice(b"\\n"),
                     b'\r' => out.extend_from_slice(b"\\r"),
                     0 => out.extend_from_slice(b"\\0"),
-                    _ if b < 32 || b == 127 => {
-                        out.extend_from_slice(format!("\\{b}").as_bytes())
-                    }
+                    _ if b < 32 || b == 127 => out.extend_from_slice(format!("\\{b}").as_bytes()),
                     _ => out.push(b),
                 }
             }

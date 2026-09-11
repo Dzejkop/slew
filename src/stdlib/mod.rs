@@ -8,6 +8,7 @@
 //! reentrancy. `os` and `io` are deliberately absent: they are
 //! nondeterministic ambient authority; embedders can register their own.
 
+mod dump;
 mod io;
 mod math;
 mod os;
@@ -188,8 +189,8 @@ fn install_package(lua: &mut Lua) {
 }
 
 /// Compiles `src` the way `load`/`loadfile` do: the function on success,
-/// `nil, message` on any failure. Text/binary `mode` is enforced, and
-/// binary chunks are rejected outright (no `string.dump` support).
+/// `nil, message` on any failure. Text/binary `mode` is enforced, and binary
+/// chunks are decoded by [`dump::undump`].
 fn load_source(
     lua: &mut Lua,
     src: Vec<u8>,
@@ -197,17 +198,20 @@ fn load_source(
     mode: &[u8],
     env: Option<Value>,
 ) -> Vec<Value> {
-    if src.starts_with(b"\x1bLua") {
+    if dump::is_binary(&src) {
         if !mode.contains(&b'b') {
             return vec![
                 Value::Nil,
                 lua.new_string(b"attempt to load a binary chunk (mode is 't')"),
             ];
         }
-        return vec![
-            Value::Nil,
-            lua.new_string(b"binary chunks are not supported (no string.dump/undump)"),
-        ];
+        return match dump::undump(lua, &src, env) {
+            Ok(f) => vec![f],
+            Err(msg) => {
+                let full = format!("{chunkname}: {msg}");
+                vec![Value::Nil, lua.new_string(full.as_bytes())]
+            }
+        };
     }
     if !mode.contains(&b't') {
         return vec![

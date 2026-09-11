@@ -87,7 +87,7 @@ authority out of the core. Verify + bless + commit per phase.
 | `%p`/`%a`, `math.deg`/`rad`, `rep` overflow | strings, math, calls | Native |
 | `collectgarbage`, weak tables, `__gc`, `coroutine.close` | closure, locals(15), events, coroutine(13) | Native + GC/VM |
 | `debug.*` | closure(22), goto(18), coroutine(18), events(15), locals(14), calls(7) | Intrinsic, tiered |
-| `io.*`, `os.*`, `string.dump`/binary chunks | several | Out of scope; host-provided or accept the stop |
+| `io.*`, `os.*` | several | Out of scope; host-provided or accept the stop |
 
 ### Phases
 
@@ -115,8 +115,11 @@ authority out of the core. Verify + bless + commit per phase.
 7. **`debug`** — tier (a): `setmetatable`, upvalue get/set/id/join,
    `traceback`, static `getinfo`; tier (b): `getlocal`/`setlocal` (needs
    compiler local-name metadata); tier (c): `sethook` (needs dispatch hooks).
-8. **Explicit non-goals** — `io`, `os` time/process, `string.dump`/binary
-   chunks. Keep them absent; note terminal stops.
+8. **Explicit non-goals** — `io`, `os` time/process. Keep them absent; note
+   terminal stops. (`string.dump`/binary chunks are implemented in
+   `src/stdlib/dump.rs`: the PUC 5.4 header and `LUAC_INT`/`LUAC_NUM`
+   sentinels are emitted verbatim for observable compatibility, then a
+   slew-specific `Proto` payload that only slew's `load` can read.)
 
 Not in the original inventory: `calls.lua` now stops at line 120 on
 "stack overflow" in its tail-call tests — proper tail calls are unimplemented
