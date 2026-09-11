@@ -131,6 +131,55 @@ return a == false and b == true";
     assert!(ok(src));
 }
 
+#[test]
+fn getinfo_lastlinedefined_and_activelines() {
+    // `lastlinedefined` is the line of the closing `end`, and the implicit
+    // final RETURN puts that line into `activelines` (PUC).
+    let src = "\
+local function f()
+ local a = 1
+ return a
+end
+local function g()
+end
+local i = debug.getinfo(f, 'S')
+assert(i.linedefined == 1, i.linedefined)
+assert(i.lastlinedefined == 4, i.lastlinedefined)
+local lf = debug.getinfo(f, 'L').activelines
+assert(lf[2] and lf[3] and lf[4], 'f activelines')
+assert(lf[1] == nil)
+local gi = debug.getinfo(g, 'S')
+assert(gi.linedefined == 5, gi.linedefined)
+assert(gi.lastlinedefined == 6, gi.lastlinedefined)
+local lg = debug.getinfo(g, 'L').activelines
+assert(lg[6] and lg[5] == nil, 'g activelines')
+local h = function() return 1 end
+local hi = debug.getinfo(h, 'S')
+assert(hi.linedefined == 18 and hi.lastlinedefined == 18)
+-- The main chunk keeps PUC's `lastlinedefined == 0`.
+assert(debug.getinfo(1, 'S').lastlinedefined == 0)
+return true";
+    assert!(ok(src));
+}
+
+#[test]
+fn getinfo_level_coercion() {
+    assert!(ok("return not pcall(debug.getinfo, 0.5)"));
+    assert!(ok("return not pcall(debug.getinfo, 0/0)"));
+    // Integral floats are still valid levels.
+    assert!(ok("return debug.getinfo(1.0) ~= nil"));
+    assert!(ok("local ok, e = pcall(debug.getinfo, 0.5)\n\
+         return not ok and string.find(e, 'integer representation') ~= nil"));
+    // The optional thread shifts the argument number but not the semantics.
+    let src = "\
+local co = coroutine.create(function () coroutine.yield() end)
+coroutine.resume(co)
+local ok, err = pcall(debug.getinfo, co, 0.5)
+assert(not ok and string.find(err, 'integer representation'), err)
+return true";
+    assert!(ok(src));
+}
+
 // ---- traceback ----
 
 #[test]
@@ -159,6 +208,46 @@ return true";
 #[test]
 fn traceback_non_string_message_passthrough() {
     assert_eq!(eval("return type(debug.traceback({}))"), "table");
+    // A non-string message is returned untouched, so the level argument is
+    // never coerced (PUC).
+    assert!(ok("return debug.traceback({}, 0.5) ~= nil"));
+}
+
+#[test]
+fn traceback_level_semantics() {
+    // A level past the stack yields only the header.
+    let src = "\
+local s = debug.traceback('m', 100)
+local _, nl = string.gsub(s, '\\n', '\\n')
+assert(nl == 1, 'expected only the header, got ' .. nl)
+return true";
+    assert!(ok(src));
+    // The default level still shows frames.
+    let src = "\
+local function f () return debug.traceback('m') end
+local s = f()
+local _, nl = string.gsub(s, '\\n', '\\n')
+assert(nl > 1, 'expected frames, got ' .. nl)
+return true";
+    assert!(ok(src));
+    // Non-integral levels are rejected.
+    assert!(ok("local ok, e = pcall(debug.traceback, 'm', 0.5)\n\
+         return not ok and string.find(e, 'integer representation') ~= nil"));
+}
+
+#[test]
+fn traceback_suspended_coroutine() {
+    // Must not panic, and a level past the coroutine's stack shows no frames.
+    let src = "\
+local co = coroutine.create(function () coroutine.yield() end)
+coroutine.resume(co)
+local s = debug.traceback(co)
+assert(type(s) == 'string' and string.find(s, 'stack traceback:'))
+local s2 = debug.traceback(co, 'm', 100)
+local _, nl = string.gsub(s2, '\\n', '\\n')
+assert(nl == 1, 'expected header only, got ' .. nl)
+return true";
+    assert!(ok(src));
 }
 
 // ---- upvalues ----
@@ -169,12 +258,44 @@ fn upvalue_get_set_and_names() {
 local x = 1
 local function f () return x end
 assert(debug.getupvalue(f, 1) == 'x')
-assert(debug.getupvalue(f, 2) == nil)
+-- Out-of-range indices return *zero* values (PUC); `select('#', ...)` sees 0.
+assert(select('#', debug.getupvalue(f, 2)) == 0)
+assert(select('#', debug.getupvalue(f, 0)) == 0)
 assert(debug.setupvalue(f, 1, 42) == 'x')
 assert(f() == 42)
-assert(debug.setupvalue(f, 2, 1) == nil)
-assert(debug.setupvalue(rawget, 1, 1) == nil)
-assert(debug.getupvalue(rawget, 1) == nil)
+assert(select('#', debug.setupvalue(f, 2, 1)) == 0)
+assert(select('#', debug.setupvalue(f, 0, 1)) == 0)
+return true";
+    assert!(ok(src));
+}
+
+#[test]
+fn upvalue_api_argument_validation() {
+    // PUC validates the index (arg #2) before the function (arg #1), and
+    // setupvalue checks the value (arg #3) first.
+    let src = "\
+local x = 1
+local function f () return x end
+assert(not pcall(debug.getupvalue, f))
+assert(not pcall(debug.getupvalue, f, 'x'))
+assert(not pcall(debug.getupvalue, f, 1.5))
+assert(not pcall(debug.getupvalue, f, 0/0))
+assert(not pcall(debug.getupvalue, {}, 1))
+assert(not pcall(debug.setupvalue, f))
+assert(not pcall(debug.setupvalue, f, 1))
+assert(not pcall(debug.setupvalue, f, 'x', 1))
+assert(not pcall(debug.setupvalue, f, 1.5, 1))
+assert(not pcall(debug.setupvalue, {}, 1, 2))
+assert(not pcall(debug.upvalueid, f))
+assert(not pcall(debug.upvalueid, f, 'x'))
+assert(not pcall(debug.upvalueid, f, 1.5))
+assert(not pcall(debug.upvalueid, {}, 1))
+-- upvaluejoin validates both index/function pairs.
+assert(not pcall(debug.upvaluejoin, f, 1, f, 0))
+assert(not pcall(debug.upvaluejoin, {}, 1, f, 1))
+-- non-integral numbers report the integer-representation failure.
+local ok, err = pcall(debug.getupvalue, f, 1.5)
+assert(not ok and string.find(err, 'integer representation'), err)
 return true";
     assert!(ok(src));
 }

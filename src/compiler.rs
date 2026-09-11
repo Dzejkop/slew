@@ -114,6 +114,8 @@ struct FuncState {
     name: String,
     /// Line of the `function` keyword (0 for the main chunk).
     linedefined: u32,
+    /// Line of the closing `end` (0 for the main chunk).
+    line_end: u32,
     /// True once a to-be-closed local is declared in this function; proper
     /// tail calls are disabled while a `__close` handler may be pending
     /// (PUC's `insidetbc` rule).
@@ -143,12 +145,19 @@ impl FuncState {
             cur_line: 0,
             name,
             linedefined: 0,
+            line_end: 0,
             has_tbc: false,
         }
     }
 
     fn into_proto(self, source: Rc<str>) -> Proto {
-        let lastlinedefined = self.lines.iter().copied().max().unwrap_or(self.linedefined);
+        // The main chunk reports `lastlinedefined` 0 (PUC sets it in
+        // `lua_load`); real functions report the line of their closing `end`.
+        let lastlinedefined = if self.linedefined == 0 {
+            0
+        } else {
+            self.line_end
+        };
         Proto {
             code: self.code,
             source,
@@ -1450,6 +1459,10 @@ impl<'h> Compiler<'h> {
         }
         self.block_scope(&fb.body)?;
         self.check_pending_gotos()?;
+        // The implicit final `RETURN` carries the line of the closing `end`,
+        // which is what PUC records in `lastlinedefined` and `activelines`.
+        self.at_line(fb.end_line);
+        self.fs().line_end = fb.end_line;
         self.emit(Instr::Return { base: 0, n: 1 });
         let done = self.funcs.pop().unwrap();
         let proto = Rc::new(done.into_proto(self.source.clone()));

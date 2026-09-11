@@ -139,8 +139,14 @@ through a capability the embedder installs explicitly.
   `\x1bLua` signature.
 - `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
   supported.
-- `debug` is an empty placeholder in the globals and in `package.loaded`; the
-  real library is unimplemented.
+- `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the
+  upvalue API, and the metatable bypass). Two deviations follow from the
+  architecture: prelude stdlib functions are Lua closures carrying an `_ENV`
+  upvalue, so `debug.getinfo` reports `what == "Lua"` for e.g. `print`
+  instead of `"C"` and `debug.upvaluejoin` treats them like any closure; and
+  there is no C-frame model for `pcall`/`coroutine.yield`, so traceback's C
+  frames, level 0 on a suspended coroutine, and `getinfo` level 0 differ
+  from PUC.
 - `next` iteration order is stable per table state but not PUC's; per-call
   cost is O(n) (acceptable until tables move to an insertion-ordered map).
 

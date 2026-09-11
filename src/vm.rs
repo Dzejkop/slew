@@ -822,40 +822,90 @@ impl Lua {
         &mut self,
         th: &Thread,
         target: Option<ThreadId>,
-        f: Value,
+        f: Option<Value>,
         what: Value,
+        argno: usize,
     ) -> Result<Value, String> {
-        let what: Vec<u8> = match what {
-            Value::Nil => b"flnStu".to_vec(),
-            Value::Str(s) => self.strings.get(s).to_vec(),
-            _ => return Err("bad argument to 'getinfo' (string expected)".into()),
-        };
-        for &c in &what {
-            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L') {
-                return Err("bad argument 'what' to 'getinfo' (invalid option)".into());
-            }
-        }
+        const WHO: &str = "debug.getinfo";
         let t = self.new_table();
         let Value::Table(tid) = t else { unreachable!() };
         match f {
-            Value::Closure(cid) => {
+            Some(Value::Closure(cid)) => {
+                let what = self.debug_what(what, argno + 1, WHO)?;
                 let proto = self.closures[cid.0 as usize].proto.clone();
                 self.fill_lua_info(tid, &proto, Value::Closure(cid), -1, false, None, &what);
             }
-            Value::Native(_) => self.fill_native_info(tid, f, &what),
-            Value::Int(level) => {
+            Some(Value::Native(_)) => {
+                let what = self.debug_what(what, argno + 1, WHO)?;
+                self.fill_native_info(tid, f.unwrap(), &what);
+            }
+            _ => {
+                // Non-function: the argument is a stack level. PUC coerces it
+                // (rejecting fractions) before validating `what`.
+                let level = self.debug_check_int(f, argno, WHO)?;
+                let what = self.debug_what(what, argno + 1, WHO)?;
                 if !self.fill_level_info(tid, th, target, level, &what)? {
                     return Ok(Value::Nil);
                 }
             }
-            Value::Float(level) => {
-                if !self.fill_level_info(tid, th, target, level as i64, &what)? {
-                    return Ok(Value::Nil);
-                }
-            }
-            _ => return Err("bad argument to 'getinfo' (function or level expected)".into()),
         }
         Ok(t)
+    }
+
+    /// Parses `debug.getinfo`'s `what` option string, validating each letter.
+    fn debug_what(&self, what: Value, argno: usize, who: &str) -> Result<Vec<u8>, String> {
+        let bytes = match what {
+            Value::Nil => b"flnStu".to_vec(),
+            Value::Str(s) => self.strings.get(s).to_vec(),
+            other => {
+                return Err(format!(
+                    "bad argument #{argno} to '{who}' (string expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        for &c in &bytes {
+            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L') {
+                return Err(format!("bad argument #{argno} to '{who}' (invalid option)"));
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// `luaL_checkinteger`-style coercion for the debug APIs, with PUC's
+    /// argument-numbered errors. `None` means the argument was absent (which
+    /// PUC distinguishes from an explicit `nil`).
+    fn debug_check_int(&self, v: Option<Value>, argno: usize, who: &str) -> Result<i64, String> {
+        let Some(v) = v else {
+            return Err(format!(
+                "bad argument #{argno} to '{who}' (number expected, got no value)"
+            ));
+        };
+        let n = match v {
+            Value::Int(i) => return Ok(i),
+            Value::Float(f) => Value::Float(f),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(n) => n,
+                None => {
+                    return Err(format!(
+                        "bad argument #{argno} to '{who}' (number expected, got string)"
+                    ));
+                }
+            },
+            other => {
+                return Err(format!(
+                    "bad argument #{argno} to '{who}' (number expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        match n {
+            Value::Int(i) => Ok(i),
+            Value::Float(f) => crate::value::float_to_exact_int(f).ok_or_else(|| {
+                format!("bad argument #{argno} to '{who}' (number has no integer representation)")
+            }),
+            _ => unreachable!(),
+        }
     }
 
     fn fill_level_info(
@@ -1065,12 +1115,25 @@ impl Lua {
         th: &Thread,
         target: Option<ThreadId>,
         message: Value,
-        level: i64,
-    ) -> Value {
+        level: Option<Value>,
+        argno: usize,
+    ) -> Result<Value, String> {
         let (msg, has_msg) = match message {
             Value::Nil => (String::new(), false),
             Value::Str(s) => (self.strings.get_str_lossy(s).into_owned(), true),
-            other => return other,
+            // A non-string message is returned untouched; PUC skips level
+            // validation in that case.
+            other => return Ok(other),
+        };
+        let level = match level {
+            None | Some(Value::Nil) => {
+                if target.is_none() {
+                    1
+                } else {
+                    0
+                }
+            }
+            Some(v) => self.debug_check_int(Some(v), argno, "debug.traceback")?,
         };
         let current = target.is_none() || target == Some(self.current_thread);
         let frames: &[Frame] = match target {
@@ -1086,14 +1149,17 @@ impl Lua {
             out.push('\n');
         }
         out.push_str("stack traceback:");
+        // Level 0 is the running frame of `target`; for the current thread
+        // (no C-frame model) it behaves like level 1. A level past the stack
+        // shows no frames at all (PUC `luaL_traceback`).
         let first = if current {
-            frames.len().saturating_sub(level.max(1) as usize)
+            frames.len().checked_sub(level.max(1) as usize)
         } else {
-            frames.len().saturating_sub(1 + level.max(0) as usize)
+            frames.len().checked_sub(1 + level.max(0) as usize)
         };
-        if frames.is_empty() {
-            return self.new_string(out.as_bytes());
-        }
+        let Some(first) = first else {
+            return Ok(self.new_string(out.as_bytes()));
+        };
         for idx in (0..=first).rev() {
             let fr = &frames[idx];
             let line = fr
@@ -1121,11 +1187,10 @@ impl Lua {
                 None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
             }
         }
-        self.new_string(out.as_bytes())
+        Ok(self.new_string(out.as_bytes()))
     }
 
-    fn debug_getupvalue(&mut self, th: &Thread, f: Value, n: i64) -> Option<(String, Value)> {
-        let Value::Closure(cid) = f else { return None };
+    fn debug_getupvalue(&mut self, th: &Thread, cid: ClosId, n: i64) -> Option<(String, Value)> {
         let c = &self.closures[cid.0 as usize];
         if n < 1 || n as usize > c.upvals.len() {
             return None;
@@ -1141,8 +1206,13 @@ impl Lua {
         Some((name, val))
     }
 
-    fn debug_setupvalue(&mut self, th: &mut Thread, f: Value, n: i64, v: Value) -> Option<String> {
-        let Value::Closure(cid) = f else { return None };
+    fn debug_setupvalue(
+        &mut self,
+        th: &mut Thread,
+        cid: ClosId,
+        n: i64,
+        v: Value,
+    ) -> Option<String> {
         let c = &self.closures[cid.0 as usize];
         if n < 1 || n as usize > c.upvals.len() {
             return None;
@@ -1159,10 +1229,7 @@ impl Lua {
         Some(name)
     }
 
-    fn debug_upvalueid(&self, f: Value, n: i64) -> Value {
-        let Value::Closure(cid) = f else {
-            return Value::Nil;
-        };
+    fn debug_upvalueid(&self, cid: ClosId, n: i64) -> Value {
         let c = &self.closures[cid.0 as usize];
         if n < 1 || n as usize > c.upvals.len() {
             return Value::Nil;
@@ -1170,15 +1237,18 @@ impl Lua {
         Value::Int(c.upvals[n as usize - 1].0 as i64)
     }
 
-    fn debug_upvaluejoin(&mut self, f1: Value, n1: i64, f2: Value, n2: i64) -> Result<(), String> {
-        let (Value::Closure(c1), Value::Closure(c2)) = (f1, f2) else {
-            return Err("bad argument to 'upvaluejoin' (function expected)".into());
-        };
+    fn debug_upvaluejoin(
+        &mut self,
+        c1: ClosId,
+        n1: i64,
+        c2: ClosId,
+        n2: i64,
+    ) -> Result<(), String> {
         if n1 < 1 || n1 as usize > self.closures[c1.0 as usize].upvals.len() {
-            return Err("bad argument #2 to 'upvaluejoin' (invalid upvalue index)".into());
+            return Err("bad argument #2 to 'debug.upvaluejoin' (invalid upvalue index)".into());
         }
         if n2 < 1 || n2 as usize > self.closures[c2.0 as usize].upvals.len() {
-            return Err("bad argument #4 to 'upvaluejoin' (invalid upvalue index)".into());
+            return Err("bad argument #4 to 'debug.upvaluejoin' (invalid upvalue index)".into());
         }
         let uid = self.closures[c2.0 as usize].upvals[n2 as usize - 1];
         self.closures[c1.0 as usize].upvals[n1 as usize - 1] = uid;
@@ -2074,13 +2144,14 @@ impl Lua {
         shape: RetShape,
         native_caller: bool,
     ) -> Result<(), VmError> {
-        let arg = |th: &Thread, i: usize| -> Value {
+        let arg_opt = |th: &Thread, i: usize| -> Option<Value> {
             if i < argc {
-                th.stack[func_abs + 1 + i]
+                Some(th.stack[func_abs + 1 + i])
             } else {
-                Value::Nil
+                None
             }
         };
+        let arg = |th: &Thread, i: usize| -> Value { arg_opt(th, i).unwrap_or(Value::Nil) };
         match i {
             Intrinsic::Error => {
                 let v = arg(th, 0);
@@ -2237,79 +2308,136 @@ impl Lua {
                 Ok(())
             }
             Intrinsic::DebugGetinfo => {
-                let a0 = arg(th, 0);
+                let a0 = arg_opt(th, 0);
                 let (target, base) = match a0 {
-                    Value::Thread(t) => (Some(t), 1usize),
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
                     _ => (None, 0usize),
                 };
-                let f = arg(th, base);
+                let f = arg_opt(th, base);
                 let what = arg(th, base + 1);
                 let r = self
-                    .debug_getinfo(th, target, f, what)
+                    .debug_getinfo(th, target, f, what, base + 1)
                     .map_err(|m| self.rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
             Intrinsic::DebugTraceback => {
-                let a0 = arg(th, 0);
+                let a0 = arg_opt(th, 0);
                 let (target, base) = match a0 {
-                    Value::Thread(t) => (Some(t), 1usize),
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
                     _ => (None, 0usize),
                 };
                 let message = arg(th, base);
-                let level = match arg(th, base + 1) {
-                    Value::Int(l) => l,
-                    Value::Float(f) => f as i64,
-                    _ => {
-                        if target.is_some() {
-                            0
-                        } else {
-                            1
-                        }
-                    }
-                };
-                let r = self.debug_traceback(th, target, message, level);
+                let level = arg_opt(th, base + 1);
+                let r = self
+                    .debug_traceback(th, target, message, level, base + 2)
+                    .map_err(|m| self.rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
             Intrinsic::DebugGetupvalue => {
+                // PUC checks the index (arg #2) before the function (arg #1).
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.getupvalue")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let f = arg(th, 0);
-                let n = debug_index(arg(th, 1));
-                match self.debug_getupvalue(th, f, n) {
+                let Value::Closure(cid) = f else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
+                            f.type_name()
+                        ),
+                    ));
+                };
+                match self.debug_getupvalue(th, cid, n) {
                     Some((name, val)) => {
                         let nv = self.new_string(name.as_bytes());
                         place_shaped(th, ret_to, nres, shape, &[nv, val]);
                     }
-                    None => place_shaped(th, ret_to, nres, shape, &[Value::Nil]),
+                    // Out of range: PUC returns no values.
+                    None => place_shaped(th, ret_to, nres, shape, &[]),
                 }
                 Ok(())
             }
             Intrinsic::DebugSetupvalue => {
-                let f = arg(th, 0);
-                let n = debug_index(arg(th, 1));
+                // PUC checks the value (arg #3), then index (#2), then
+                // function (#1).
+                if arg_opt(th, 2).is_none() {
+                    return Err(self.rt_err(
+                        th,
+                        "bad argument #3 to 'debug.setupvalue' (value expected)".into(),
+                    ));
+                }
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.setupvalue")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let v = arg(th, 2);
-                match self.debug_setupvalue(th, f, n, v) {
+                let f = arg(th, 0);
+                let Value::Closure(cid) = f else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
+                            f.type_name()
+                        ),
+                    ));
+                };
+                match self.debug_setupvalue(th, cid, n, v) {
                     Some(name) => {
                         let nv = self.new_string(name.as_bytes());
                         place_shaped(th, ret_to, nres, shape, &[nv]);
                     }
-                    None => place_shaped(th, ret_to, nres, shape, &[Value::Nil]),
+                    None => place_shaped(th, ret_to, nres, shape, &[]),
                 }
                 Ok(())
             }
             Intrinsic::DebugUpvalueid => {
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvalueid")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let f = arg(th, 0);
-                let n = debug_index(arg(th, 1));
-                let r = self.debug_upvalueid(f, n);
+                let Value::Closure(cid) = f else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
+                            f.type_name()
+                        ),
+                    ));
+                };
+                let r = self.debug_upvalueid(cid, n);
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
             Intrinsic::DebugUpvaluejoin => {
+                let n1 = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let f1 = arg(th, 0);
-                let n1 = debug_index(arg(th, 1));
+                let Value::Closure(c1) = f1 else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'debug.upvaluejoin' (function expected, got {})",
+                            f1.type_name()
+                        ),
+                    ));
+                };
+                let n2 = self
+                    .debug_check_int(arg_opt(th, 3), 4, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let f2 = arg(th, 2);
-                let n2 = debug_index(arg(th, 3));
-                self.debug_upvaluejoin(f1, n1, f2, n2)
+                let Value::Closure(c2) = f2 else {
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #3 to 'debug.upvaluejoin' (function expected, got {})",
+                            f2.type_name()
+                        ),
+                    ));
+                };
+                self.debug_upvaluejoin(c1, n1, c2, n2)
                     .map_err(|m| self.rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[]);
                 Ok(())
@@ -3430,16 +3558,6 @@ enum LevelFrame {
         tailcall: bool,
         name: Option<(&'static str, Box<str>)>,
     },
-}
-
-/// `debug.getupvalue`/`setupvalue`/`upvalueid`/`upvaluejoin` coerce their
-/// index argument to an integer (`nil`/others become 0, which is invalid).
-fn debug_index(v: Value) -> i64 {
-    match v {
-        Value::Int(n) => n,
-        Value::Float(f) => f as i64,
-        _ => 0,
-    }
 }
 
 /// PUC's `luaO_chunkid`-style short source name, used by `debug.getinfo` and
