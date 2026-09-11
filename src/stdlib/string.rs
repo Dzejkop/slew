@@ -5,6 +5,7 @@ use crate::pattern::{self, Capture};
 use crate::value::{fmt_number, fmt_g, Value};
 use crate::vm::Lua;
 
+use super::string_pack::{n_pack, n_packsize, n_unpack};
 use super::{arg, set_field};
 
 pub fn install(lua: &mut Lua) {
@@ -22,6 +23,9 @@ pub fn install(lua: &mut Lua) {
         ("format", n_format),
         ("find", n_find),
         ("match", n_match),
+        ("pack", n_pack),
+        ("unpack", n_unpack),
+        ("packsize", n_packsize),
     ] {
         let v = lua.add_native(name, f);
         set_field(lua, st, name, v);
@@ -115,10 +119,16 @@ fn n_rep(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     if n <= 0 {
         return Ok(vec![lua.new_string(b"")]);
     }
-    let total = (s.len() + sep.len()) * n as usize;
-    if total > 64 * 1024 * 1024 {
+    // PUC errors when (len + seplen) * n exceeds MAXSIZE; compute the exact
+    // total (len*n + seplen*(n-1)) without overflowing the host usize.
+    let per = s.len().checked_add(sep.len());
+    let fits = per
+        .and_then(|p| p.checked_mul(n as usize))
+        .is_some_and(|t| t <= i32::MAX as usize);
+    if !fits {
         return Err("resulting string too large".into());
     }
+    let total = s.len() * n as usize + sep.len() * (n as usize - 1);
     let mut out = Vec::with_capacity(total);
     for i in 0..n {
         if i > 0 {
@@ -252,6 +262,7 @@ fn n_format(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             continue;
         }
         // parse spec: flags, width, .precision, conversion
+        let mut spec: Vec<u8> = vec![b'%'];
         let mut flags = Flags::default();
         while let Some(&c) = it.peek() {
             match c {
@@ -262,12 +273,14 @@ fn n_format(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
                 b'#' => flags.alt = true,
                 _ => break,
             }
+            spec.push(c);
             it.next();
         }
         let mut width = 0usize;
         while let Some(&c) = it.peek() {
             if c.is_ascii_digit() {
                 width = width * 10 + (c - b'0') as usize;
+                spec.push(c);
                 it.next();
             } else {
                 break;
@@ -275,11 +288,13 @@ fn n_format(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         }
         let mut precision: Option<usize> = None;
         if it.peek() == Some(&b'.') {
+            spec.push(b'.');
             it.next();
             let mut p = 0usize;
             while let Some(&c) = it.peek() {
                 if c.is_ascii_digit() {
                     p = p * 10 + (c - b'0') as usize;
+                    spec.push(c);
                     it.next();
                 } else {
                     break;
@@ -288,6 +303,16 @@ fn n_format(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             precision = Some(p);
         }
         let conv = it.next().ok_or("invalid conversion to 'format'")?;
+        spec.push(conv);
+        // PUC's `checkformat`: '%p' accepts only the '-' flag and no precision.
+        if conv == b'p'
+            && (flags.zero || flags.plus || flags.space || flags.alt || precision.is_some())
+        {
+            return Err(format!(
+                "invalid conversion specification: '{}'",
+                String::from_utf8_lossy(&spec)
+            ));
+        }
         let v = arg(args, argi);
         argi += 1;
         let piece = format_one(lua, conv, v, flags, width, precision, argi)?;
@@ -428,7 +453,10 @@ fn format_one(
             }
             format!("{}{}", sign_prefix(x.is_sign_negative(), flags), body).into_bytes()
         }
-        b'a' | b'A' => return Err("format '%a' is not supported".into()),
+        b'a' | b'A' => {
+            let x = want_float(v, argi)?;
+            format_hex_float(x, conv == b'A', precision, flags)
+        }
         b'p' => pointer_text(v).into_bytes(),
         b's' => {
             let mut s = match v {
@@ -487,4 +515,96 @@ fn pointer_text(v: Value) -> String {
         _ => return "(null)".to_string(),
     };
     format!("0x{tag:x}")
+}
+
+/// C's `%a`/`%A`: a hex float in the form `[-]0x<lead>.<frac>p<exp>`.
+/// A default precision keeps the exact 52-bit mantissa (trailing zeros
+/// trimmed, the fractional part omitted when zero), matching ISO C/glibc.
+fn format_hex_float(x: f64, upper: bool, precision: Option<usize>, flags: Flags) -> Vec<u8> {
+    if x.is_nan() {
+        let mut s = String::new();
+        if x.is_sign_negative() {
+            s.push('-');
+        }
+        s.push_str(if upper { "NAN" } else { "nan" });
+        return s.into_bytes();
+    }
+    if x.is_infinite() {
+        let mut s = String::from(sign_prefix(x.is_sign_negative(), flags));
+        s.push_str(if upper { "INF" } else { "inf" });
+        return s.into_bytes();
+    }
+    let mut s = String::from(sign_prefix(x.is_sign_negative(), flags));
+    s.push_str(if upper { "0X" } else { "0x" });
+    let bits = x.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let zero = raw_exp == 0 && frac == 0;
+    let mut lead: u64 = if raw_exp == 0 { 0 } else { 1 };
+    let exp: i64 = if zero {
+        0
+    } else if raw_exp == 0 {
+        -1022
+    } else {
+        raw_exp - 1023
+    };
+    let digits: String = if zero {
+        precision.map_or_else(String::new, |p| "0".repeat(p))
+    } else {
+        match precision {
+            None => {
+                let mut d = format!("{frac:013x}");
+                while d.ends_with('0') {
+                    d.pop();
+                }
+                d
+            }
+            Some(0) => {
+                // round the fraction into the leading digit
+                let half = 1u64 << 51;
+                if frac > half || (frac == half && lead & 1 == 1) {
+                    lead += 1;
+                }
+                String::new()
+            }
+            Some(p) if p <= 28 => {
+                let keep = p * 4;
+                let kept: u128 = if keep >= 52 {
+                    (frac as u128) << (keep - 52)
+                } else {
+                    let shift = 52 - keep;
+                    let k = frac >> shift;
+                    let rem = frac & ((1u64 << shift) - 1);
+                    let half = 1u64 << (shift - 1);
+                    let up = rem > half || (rem == half && (k & 1) == 1);
+                    let r = k as u128 + up as u128;
+                    if r >> keep != 0 {
+                        lead += 1;
+                        0
+                    } else {
+                        r
+                    }
+                };
+                format!("{kept:0width$x}", width = p)
+            }
+            Some(p) => {
+                // Excessive precision: exact digits plus zero padding.
+                let mut d = format!("{frac:013x}");
+                d.push_str(&"0".repeat(p.saturating_sub(13)));
+                d
+            }
+        }
+    };
+    s.push(char::from_digit(lead as u32, 16).unwrap());
+    if !digits.is_empty() {
+        s.push('.');
+        s.push_str(&digits);
+    }
+    s.push(if upper { 'P' } else { 'p' });
+    s.push(if exp < 0 { '-' } else { '+' });
+    s.push_str(&exp.abs().to_string());
+    if upper {
+        s = s.to_uppercase();
+    }
+    s.into_bytes()
 }

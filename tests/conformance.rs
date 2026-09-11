@@ -34,9 +34,6 @@ package.path = "?.lua;libs/?.lua"
 
 /// Test-only stand-in for the absent GC controls.
 const SHIM_GC: &str = "collectgarbage = function(...) return 0 end\n";
-/// Test-only stand-in for the absent `string.packsize` (value chosen so the
-/// suite's size-dependent guards run the portable branch).
-const SHIM_PACKSIZE: &str = "string.packsize = function(...) return 8 end\n";
 
 struct Case {
     file: &'static str,
@@ -50,15 +47,15 @@ const CASES: &[Case] = &[
     Case { file: "pm.lua", shims: "" },
     Case { file: "utf8.lua", shims: "" },
     Case { file: "sort.lua", shims: "" },
-    Case { file: "strings.lua", shims: SHIM_PACKSIZE },
+    Case { file: "strings.lua", shims: "" },
     Case { file: "math.lua", shims: SHIM_GC },
     Case { file: "verybig.lua", shims: "" },
     Case { file: "constructs.lua", shims: SHIM_GC },
     Case { file: "locals.lua", shims: SHIM_GC },
     Case { file: "goto.lua", shims: SHIM_GC },
-    Case { file: "calls.lua", shims: SHIM_PACKSIZE },
+    Case { file: "calls.lua", shims: "" },
     Case { file: "events.lua", shims: SHIM_GC },
-    Case { file: "bitwise.lua", shims: SHIM_PACKSIZE },
+    Case { file: "bitwise.lua", shims: "" },
     Case { file: "literals.lua", shims: "" },
     Case { file: "attrib.lua", shims: "" },
     Case { file: "coroutine.lua", shims: SHIM_GC },

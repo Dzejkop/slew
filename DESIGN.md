@@ -135,7 +135,6 @@ through a capability the embedder installs explicitly.
   honors `__pairs` and `ipairs` honors `__index` (PUC 5.4 semantics).
 - No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
   rarely needs them; resources should be host-managed.
-- `string.format` lacks `%a`.
 - Binary chunks are rejected: `string.dump` is absent and `load` refuses the
   `\x1bLua` signature.
 - `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not

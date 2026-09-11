@@ -175,6 +175,111 @@ fn string_format() {
     assert_eq!(eval("return string.format('%%')"), "%");
 }
 
+#[test]
+fn string_format_hex_float() {
+    assert_eq!(eval("return string.format('%a', 1.0)"), "0x1p+0");
+    assert_eq!(eval("return string.format('%a', 0.5)"), "0x1p-1");
+    assert_eq!(eval("return string.format('%a', 0.0)"), "0x0p+0");
+    assert_eq!(eval("return string.format('%a', -0.0)"), "-0x0p+0");
+    assert_eq!(eval("return string.format('%A', 12)"), "0X1.8P+3");
+    assert_eq!(eval("return string.format('%+.2A', 12)"), "+0X1.80P+3");
+    assert_eq!(eval("return string.format('%.4A', -12)"), "-0X1.8000P+3");
+    // full precision round-trips
+    assert_eq!(eval("return tonumber(string.format('%a', 0.1)) == 0.1"), "true");
+    assert_eq!(eval("return tonumber(string.format('%a', 1e30)) == 1e30"), "true");
+    assert_eq!(eval("return tonumber(string.format('%a', 1/3)) == 1/3"), "true");
+    assert_eq!(eval("return string.format('%a', 1/0)"), "inf");
+    assert_eq!(eval("return string.format('%A', -1/0)"), "-INF");
+}
+
+#[test]
+fn string_format_pointer_validation() {
+    // '%p' only accepts the '-' flag and no precision (PUC checkformat)
+    let e = run_err("return string.format('%+p', {})");
+    assert!(e.contains("invalid conversion specification"), "{e}");
+    let e = run_err("return string.format('%.3p', {})");
+    assert!(e.contains("invalid conversion specification"), "{e}");
+    let e = run_err("return string.format('%#p', {})");
+    assert!(e.contains("invalid conversion specification"), "{e}");
+    // widths and '-' flag remain valid
+    assert_eq!(eval("return #string.format('%90p', {})"), "90");
+    assert_eq!(eval("return #string.format('%-60p', {})"), "60");
+    assert_eq!(eval("return string.format('%p', nil)"), "(null)");
+}
+
+#[test]
+fn string_rep_overflow() {
+    assert_eq!(eval("return string.rep('teste', 0)"), "");
+    let e = run_err("return string.rep('ab', math.maxinteger)");
+    assert!(e.contains("resulting string too large"), "{e}");
+    let e = run_err("return string.rep('a', math.maxinteger)");
+    assert!(e.contains("resulting string too large"), "{e}");
+}
+
+// ---- string.pack / unpack / packsize ----
+
+#[test]
+fn string_pack_round_trips() {
+    assert_eq!(eval("return string.packsize('j')"), "8");
+    assert_eq!(eval("return string.packsize('n')"), "8");
+    assert_eq!(eval("return string.packsize('i4i4')"), "8");
+    // alignment: i1 followed by an 8-byte aligned integer
+    assert_eq!(eval("return string.packsize('i1i8')"), "16");
+    assert_eq!(eval("return string.packsize('!8i1d')"), "16");
+    assert_eq!(eval("return string.packsize('xx')"), "2");
+    assert_eq!(eval("return string.packsize('xxi4')"), "8");
+    assert_eq!(eval("return string.packsize('<i4>i4')"), "8");
+    let bytes = "return string.byte(string.pack('>i4', 0x01020304), 1, 4)";
+    assert_eq!(eval_multi(bytes), ["1", "2", "3", "4"]);
+    let bytes_le = "return string.byte(string.pack('<i4', 0x01020304), 1, 4)";
+    assert_eq!(eval_multi(bytes_le), ["4", "3", "2", "1"]);
+    assert_eq!(eval_multi("return string.unpack('i4', string.pack('i4', -42))"), ["-42", "5"]);
+    assert_eq!(eval_multi("return string.unpack('>i2', string.pack('>i2', -2))"), ["-2", "3"]);
+    assert_eq!(eval_multi("return string.unpack('J', string.pack('J', -1))"), ["-1", "9"]);
+    assert_eq!(eval("return string.unpack('z', string.pack('z', 'abc'))"), "abc");
+    assert_eq!(eval_multi("return string.unpack('z', string.pack('z', 'abc'))"), ["abc", "5"]);
+    assert_eq!(
+        eval_multi("return string.unpack('s1', string.pack('s1', 'hey'))"),
+        ["hey", "5"]
+    );
+    assert_eq!(
+        eval_multi("return string.unpack('i4i4', string.pack('i4i4', 7, 9), 1)"),
+        ["7", "9", "9"]
+    );
+    assert_eq!(eval("return math.type(string.unpack('i4', string.pack('i4', 7)))"), "integer");
+    assert_eq!(eval("return math.type(string.unpack('d', string.pack('d', 7)))"), "float");
+    assert_eq!(
+        eval("return string.unpack('d', string.pack('d', 1.5)) == 1.5"),
+        "true"
+    );
+    assert_eq!(
+        eval("return string.unpack('f', string.pack('f', 1.5)) == 1.5"),
+        "true"
+    );
+}
+
+#[test]
+fn string_pack_errors() {
+    assert!(run_err("return string.packsize('z')").contains("variable-length format"));
+    assert!(run_err("return string.packsize('s')").contains("variable-length format"));
+    assert!(run_err("return string.pack('b', 200)").contains("integer overflow"));
+    assert!(run_err("return string.pack('B', -1)").contains("unsigned overflow"));
+    assert!(run_err("return string.pack('c2', 'abc')").contains("string longer than given size"));
+    assert!(run_err("return string.pack('z', 'a\\0b')").contains("string contains zeros"));
+    assert!(run_err("return string.pack('s1', string.rep('a', 300))")
+        .contains("string length does not fit in given size"));
+    assert!(run_err("return string.unpack('i4', 'ab')").contains("data string too short"));
+    assert!(run_err("return string.unpack('z', 'abc')").contains("unfinished string"));
+    assert!(run_err("return string.unpack('i4', 'abcd', 9)")
+        .contains("initial position out of string"));
+    assert!(run_err("return string.unpack('i4', 'abcd', math.mininteger)")
+        .contains("initial position out of string"));
+    assert!(run_err("return string.packsize('i0')").contains("integral size (0) out of limits"));
+    assert!(run_err("return string.packsize('Q')").contains("invalid format option 'Q'"));
+    assert!(run_err("return string.packsize('c')").contains("missing size for format option 'c'"));
+    assert!(run_err("return string.packsize('Xz')").contains("invalid next option for option 'X'"));
+}
+
 // ---- table ----
 
 #[test]
@@ -441,6 +546,23 @@ fn math_basics() {
     assert_eq!(eval("return math.ult(-1, 0)"), "false"); // -1 as unsigned is huge
     assert_eq!(eval("return math.log(8, 2)"), "3.0");
     assert!(eval("return math.sin(0)") == "0.0");
+    assert_eq!(eval("return math.abs(math.deg(math.pi) - 180) < 1e-9"), "true");
+    assert_eq!(eval("return math.abs(math.rad(180) - math.pi) < 1e-9"), "true");
+    assert_eq!(eval("return math.deg(0)"), "0.0");
+    assert_eq!(eval("return math.rad(0)"), "0.0");
+}
+
+#[test]
+fn integer_representation_errors() {
+    // PUC 5.4: these are runtime errors (the chunk loads fine), matching
+    // math.lua's `checkcompt` helper which pcalls the loaded function.
+    assert_eq!(eval("return type(load('return 2 // 0'))"), "function");
+    assert!(run_err("return (load('return 2 // 0'))()").contains("attempt to divide by zero"));
+    assert!(run_err("return 2.3 >> 0").contains("number has no integer representation"));
+    assert!(run_err("return 2.3 ~ 0.0").contains("number has no integer representation"));
+    assert!(run_err("return 1 | 2.0^63").contains("number has no integer representation"));
+    assert!(run_err("return math.huge << 1").contains("number has no integer representation"));
+    assert!(run_err("return math.huge | math.huge").contains("number has no integer representation"));
 }
 
 #[test]

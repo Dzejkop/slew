@@ -22,6 +22,8 @@ pub fn install(lua: &mut Lua) {
         ("asin", n_asin),
         ("acos", n_acos),
         ("atan", n_atan),
+        ("deg", n_deg),
+        ("rad", n_rad),
         ("exp", n_exp),
         ("log", n_log),
         ("fmod", n_fmod),
@@ -121,6 +123,18 @@ fn n_atan(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         _ => num(args, 1, "atan")?,
     };
     Ok(vec![Value::Float(y.atan2(x))])
+}
+
+/// `math.deg`: radians → degrees (`x / (pi/180)`).
+fn n_deg(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+    Ok(vec![Value::Float(num(args, 0, "deg")? / RADIANS_PER_DEGREE)])
+}
+
+/// `math.rad`: degrees → radians (`x * (pi/180)`).
+fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+    Ok(vec![Value::Float(num(args, 0, "rad")? * RADIANS_PER_DEGREE)])
 }
 
 fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {

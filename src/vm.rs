@@ -2848,7 +2848,7 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
         IDiv => match (na, nb) {
             (Some(Value::Int(x)), Some(Value::Int(y))) => {
                 if y == 0 {
-                    return Err("attempt to perform 'n//0'".into());
+                    return Err("attempt to divide by zero".into());
                 }
                 let q = x.wrapping_div(y);
                 let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) { q - 1 } else { q };

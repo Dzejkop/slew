@@ -10,6 +10,7 @@
 
 mod math;
 mod string;
+mod string_pack;
 mod table;
 mod utf8;
 

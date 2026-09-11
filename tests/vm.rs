@@ -75,7 +75,7 @@ fn numbers_54_semantics() {
 
 #[test]
 fn integer_division_by_zero_errors() {
-    assert!(run_err("return 1 // 0").contains("n//0"));
+    assert!(run_err("return 1 // 0").contains("attempt to divide by zero"));
     assert!(run_err("return 1 % 0").contains("n%0"));
     assert!(run_err("return 1.5 & 2").contains("no integer representation"));
     assert!(run_err("return {} + 1").contains("arithmetic"));
