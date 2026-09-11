@@ -115,6 +115,12 @@ pub(crate) enum Intrinsic {
     /// The function returned by `coroutine.wrap`: resumes its thread,
     /// returns results bare, propagates errors.
     WrapResume(ThreadId),
+    /// Increment / decrement the thread's non-yieldable depth. The prelude
+    /// brackets a callback that PUC's C library invokes with `lua_call`
+    /// (non-yieldable), so `coroutine.yield` inside it errors with
+    /// "attempt to yield across a C-call boundary" and `isyieldable` is false.
+    EnterNonYieldable,
+    LeaveNonYieldable,
     IsYieldable,
     Running,
     CoroutineClose,
@@ -133,6 +139,7 @@ pub(crate) enum Intrinsic {
     DebugSetmetatable,
     DebugGetregistry,
     DebugGethook,
+    DebugSethook,
 }
 
 pub(crate) enum NativeKind {
@@ -215,6 +222,27 @@ enum Pending {
     /// After an xpcall message handler called at the error point returns,
     /// unwind the frames that were kept alive for it.
     UnwindAfterHandler { result_slot: usize },
+    /// Re-apply a return shape to results a nested protected call (pcall /
+    /// xpcall) already delivered at `ret_to`. PUC's `xpcall(pcall, ...)` and
+    /// `pcall(pcall, ...)` each add their own success flag on top of the
+    /// inner call's results; slew's intrinsics delegate to `protected_call`,
+    /// which stamps only the inner flag, so the outer one is applied here.
+    PrependShape {
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+    },
+    /// Emit the "return" hook for the frame that is about to be popped, then
+    /// let the following `FinishReturn` complete the return. Used when a
+    /// function with to-be-closed variables returns: closes run first, then
+    /// the hook, then the frame is popped.
+    ReturnHookFire,
+    /// Advance a deferred yield through its hook stages, then switch threads.
+    YieldStep,
+    /// Re-raise an error after the collected `__close` handlers have run. Used
+    /// when an error escapes a thread with no protection boundary: the closes
+    /// are staged on a synthetic frame, then the error propagates.
+    Reraise { err: Value },
 }
 
 struct LuaFrame {
@@ -243,7 +271,17 @@ struct LuaFrame {
     /// When this frame is a metamethod call (e.g. `__close`), the PUC
     /// `namewhat`/`name` to report for it (`("metamethod", "close")`).
     call_meta: Option<(&'static str, &'static str)>,
+    /// Last source line reported for a line hook (`-1` before the first).
+    last_line: i64,
+    /// This frame is a running debug hook: hooks are disabled while it (or
+    /// anything it calls) is on the stack, matching PUC's `allowhook`.
+    is_hook: bool,
 }
+
+/// Hook event bits for [`Thread::hook_mask`].
+const HOOK_CALL: u8 = 1;
+const HOOK_RETURN: u8 = 2;
+const HOOK_LINE: u8 = 4;
 
 /// A synthetic C-level frame: a VM boundary (pcall/xpcall/coroutine.close)
 /// reported by `debug.getinfo`/`traceback` with `what == "C"`. It has no
@@ -404,6 +442,11 @@ pub(crate) struct Thread {
     /// Top of the last multret sequence (absolute).
     top: usize,
     pub(crate) status: CoStatus,
+    /// Nesting depth of non-yieldable C-call boundaries currently active on
+    /// this thread (PUC's `nny`). While non-zero, `coroutine.yield` errors
+    /// and `coroutine.isyieldable()` is false. Reset/kept per thread, so a
+    /// coroutine created and resumed *inside* such a boundary is yieldable.
+    non_yieldable: u32,
     /// The thread that resumed this one.
     parent: Option<ThreadId>,
     /// Result-delivery info in the parent (set at each resume).
@@ -413,9 +456,40 @@ pub(crate) struct Thread {
     /// True for a root execution's thread. The main thread cannot yield;
     /// every coroutine created by `coroutine.create`/`wrap` can.
     is_main: bool,
+    // ---- debug hooks (`debug.sethook`) ----
+    /// Hook function, or `None` when no hook is set.
+    hook: Option<Value>,
+    /// Which events fire: bit 0 call, bit 1 return, bit 2 line.
+    hook_mask: u8,
+    /// Instruction interval for count events (0 disables them).
+    hook_count: i64,
+    /// Countdown to the next count event.
+    hook_counter: i64,
+    /// Non-zero while a coroutine body's start-of-execution call hook is
+    /// still owed (the body frame is pushed outside `do_call`).
+    pending_call_hook: bool,
+    /// A yield whose hook events (call/return) have not all fired yet.
+    yield_job: Option<YieldJob>,
     /// For a dead coroutine: the error it died with, returned once by
     /// `coroutine.close`. `Some(Nil)` means "died cleanly".
     close_error: Option<Value>,
+}
+
+/// Hook events to emit before a suspended yield completes. `coroutine.yield`
+/// is a C function, so it owes a "call" event when invoked and a "return"
+/// event when it yields; both run as ordinary hook frames, so the actual
+/// suspension is deferred through [`Pending::YieldStep`].
+struct YieldJob {
+    parent: ThreadId,
+    rr: ResumeRet,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    args: Vec<Value>,
+    /// The `coroutine.yield` native, for `debug.getinfo(2)` in hook events.
+    func: Value,
+    /// 0: fire call, 1: fire return, 2: perform the yield.
+    stage: u8,
 }
 
 /// A compiled script, reusable across executions.
@@ -610,6 +684,9 @@ pub struct Lua {
     /// An xpcall message handler running at the error point; see
     /// [`HandlerUnwind`].
     handler_unwind: Option<HandlerUnwind>,
+    /// Non-zero while [`Lua::fire_hook`] installs a hook frame: suppresses the
+    /// call hook that the hook invocation would otherwise emit.
+    hook_suppress: u32,
     /// Embedder-installed capability host. `None` means `io`/`os` are absent.
     pub(crate) host: Option<Box<dyn Host>>,
     /// The file userdata metatable (set when a host is installed).
@@ -767,6 +844,7 @@ impl Lua {
             print_job: None,
             format_job: None,
             handler_unwind: None,
+            hook_suppress: 0,
             host: None,
             file_meta: None,
             io_input: None,
@@ -849,6 +927,8 @@ impl Lua {
             varargs: Vec::new(),
             tailcall: false,
             call_meta: None,
+            last_line: -1,
+            is_hook: false,
         }));
         let tid = self.alloc_thread(th);
         // GC root for as long as the execution is live
@@ -1416,16 +1496,20 @@ impl Lua {
 
     /// C-boundary frame info: the same shape as a native function, but with
     /// the call-site name PUC reports (`name`/`namewhat`).
-    fn fill_c_info(
-        &mut self,
-        tid: TableId,
-        func: Value,
-        name: &'static str,
-        namewhat: &'static str,
-        what: &[u8],
-    ) {
+    fn fill_c_info(&mut self, tid: TableId, func: Value, name: &str, namewhat: &str, what: &[u8]) {
         self.fill_native_info(tid, func, what);
         if what.contains(&b'n') {
+            // A synthetic frame for a returning/called native carries no
+            // call-site name; derive it from the native itself (PUC names
+            // such functions, e.g. "sethook"/"yield").
+            let name = if name.is_empty() {
+                match func {
+                    Value::Native(n) => self.natives[n.0 as usize].name.clone(),
+                    _ => String::new(),
+                }
+            } else {
+                name.to_string()
+            };
             let nv = self.new_string(name.as_bytes());
             self.info_set(tid, "name", nv);
             let nw = self.new_string(namewhat.as_bytes());
@@ -1787,6 +1871,82 @@ impl Lua {
         self.metamethod(b, mm)
     }
 
+    // ---- debug hooks (`debug.sethook`) ----
+
+    /// Whether any hook event should fire right now: a hook is set and no
+    /// hook frame is currently on the stack (PUC's `allowhook`).
+    fn hook_any(&self, th: &Thread) -> bool {
+        th.hook.is_some()
+            && !th
+                .frames
+                .iter()
+                .any(|f| matches!(f, Frame::Lua(lf) if lf.is_hook))
+    }
+
+    /// Whether a specific event class (call/return/line) is enabled.
+    fn hook_on(&self, th: &Thread, bit: u8) -> bool {
+        self.hook_any(th) && th.hook_mask & bit != 0
+    }
+
+    /// Calls the current hook as an ordinary function, so it runs through the
+    /// regular (suspendable) machinery and can itself call `pcall` etc. An
+    /// optional synthetic C frame below it makes `debug.getinfo(2)` name a
+    /// native that is returning or being called (PUC keeps the C CallInfo).
+    fn fire_hook(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        event: &str,
+        line: i64,
+        synth: Option<Value>,
+    ) -> Result<(), VmError> {
+        let Some(hook) = th.hook else {
+            return Ok(());
+        };
+        if let Some(func) = synth {
+            let base = th.frames.last().map(|_| scratch_base(th)).unwrap_or(th.top);
+            th.frames.push(Frame::C(CFrame {
+                func,
+                name: "",
+                namewhat: "",
+                base,
+                pending: Vec::new(),
+                boundary: None,
+            }));
+        }
+        let ev = self.new_string(event.as_bytes());
+        let ln = if line < 0 {
+            Value::Nil
+        } else {
+            Value::Int(line)
+        };
+        let before = th.frames.len();
+        let scratch = scratch_base(th);
+        // Installing the hook frame must not itself trigger a call hook.
+        self.hook_suppress += 1;
+        let r = self.call_value(th, hook, &[ev, ln], scratch, 1, RetShape::Normal, fuel);
+        self.hook_suppress -= 1;
+        r?;
+        if th.frames.len() > before
+            && let Some(Frame::Lua(lf)) = th.frames.last_mut()
+        {
+            lf.is_hook = true;
+        }
+        Ok(())
+    }
+
+    /// Completes a deferred `coroutine.yield`: marks the thread suspended,
+    /// delivers its values to the resumer, and schedules the switch.
+    fn perform_yield(&mut self, th: &mut Thread, job: YieldJob) {
+        th.status = CoStatus::Suspended;
+        th.yield_ret = Some((job.ret_to, job.nres, job.shape));
+        let parent = job.parent;
+        let parent_th = &mut self.threads[parent.0 as usize];
+        parent_th.status = CoStatus::Running;
+        deliver_resume(parent_th, job.rr, true, &job.args);
+        self.switch_to = Some(parent);
+    }
+
     // ---- dispatch ----
 
     /// Drives execution starting at `start`, following coroutine switches,
@@ -1957,7 +2117,7 @@ impl Lua {
         let staged = th.frames.last().is_some_and(|f| {
             f.pending()
                 .iter()
-                .any(|p| matches!(p, Pending::DeliverError { .. }))
+                .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
         });
         if staged {
             self.fold_staged(th, &e, Vec::new());
@@ -2010,7 +2170,9 @@ impl Lua {
         let f = th.frames.last_mut().unwrap();
         for p in f.pending_mut().iter_mut() {
             match p {
-                Pending::CallClose { err, .. } | Pending::DeliverError { err, .. } => {
+                Pending::CallClose { err, .. }
+                | Pending::DeliverError { err, .. }
+                | Pending::Reraise { err } => {
                     *err = new_err;
                 }
                 _ => {}
@@ -2034,14 +2196,37 @@ impl Lua {
             let staged = th.frames.last().is_some_and(|f| {
                 f.pending()
                     .iter()
-                    .any(|p| matches!(p, Pending::DeliverError { .. }))
+                    .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
             });
             if staged {
                 self.fold_staged(th, &e, to_close);
                 return Ok(());
             }
             match th.frames.last() {
-                None => return Err(e),
+                None => {
+                    if to_close.is_empty() {
+                        return Err(e);
+                    }
+                    // The error escaped every frame: PUC still runs the
+                    // to-be-closed handlers before the thread dies. There is no
+                    // frame below to stage them on, so synthesize one, run the
+                    // closes, then re-raise the error.
+                    let errv = self.err_value(&e);
+                    th.frames.push(Frame::C(CFrame {
+                        func: Value::Nil,
+                        name: "",
+                        namewhat: "",
+                        base: th.top,
+                        pending: Vec::new(),
+                        boundary: None,
+                    }));
+                    let f = th.frames.last_mut().unwrap();
+                    f.pending_mut().push(Pending::Reraise { err: errv });
+                    for v in to_close.into_iter().rev() {
+                        f.pending_mut().push(Pending::CallClose { v, err: errv });
+                    }
+                    return Ok(());
+                }
                 Some(f) if f.is_protected() => break,
                 Some(_) => {
                     let f = th.frames.pop().unwrap();
@@ -2240,6 +2425,65 @@ impl Lua {
                     place_shaped(th, ret_to, nres, shape, &[sv]);
                 }
                 Pending::FormatStep => self.format_step(th, fuel)?,
+                Pending::PrependShape {
+                    ret_to,
+                    nres,
+                    shape,
+                } => {
+                    let count = if nres == 0 {
+                        th.top.saturating_sub(ret_to)
+                    } else {
+                        (nres - 1) as usize
+                    };
+                    let vals: Vec<Value> = th.stack[ret_to..ret_to + count].to_vec();
+                    place_shaped(th, ret_to, nres, shape, &vals);
+                }
+                Pending::ReturnHookFire => {
+                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                        self.fire_hook(th, fuel, "return", -1, None)?;
+                    }
+                }
+                Pending::Reraise { err } => {
+                    return Err(VmError {
+                        val: ErrVal::Val(err),
+                        line: 0,
+                        root_line: 0,
+                        source: None,
+                    });
+                }
+                Pending::YieldStep => {
+                    let mut job = th.yield_job.take().expect("yield job staged");
+                    let yield_fn = job.func;
+                    match job.stage {
+                        0 => {
+                            job.stage = 1;
+                            th.yield_job = Some(job);
+                            // re-arm below the hook frame so the next stage (or
+                            // the yield itself) runs once the hook returns
+                            th.frames
+                                .last_mut()
+                                .unwrap()
+                                .pending_mut()
+                                .push(Pending::YieldStep);
+                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                                self.fire_hook(th, fuel, "call", -1, Some(yield_fn))?;
+                            }
+                        }
+                        1 => {
+                            job.stage = 2;
+                            th.yield_job = Some(job);
+                            th.frames
+                                .last_mut()
+                                .unwrap()
+                                .pending_mut()
+                                .push(Pending::YieldStep);
+                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                                self.fire_hook(th, fuel, "return", -1, Some(yield_fn))?;
+                            }
+                        }
+                        _ => self.perform_yield(th, job),
+                    }
+                }
                 Pending::UnwindAfterHandler { result_slot } => {
                     if self.handler_unwind.take().is_some() {
                         let v = th.stack[result_slot];
@@ -2254,6 +2498,39 @@ impl Lua {
                 }
             }
             return Ok(Flow::Continue);
+        }
+        // Debug hooks that fire before the next instruction: the call hook an
+        // asynchronously-started coroutine body still owes, then count and
+        // line events. Each runs the hook as a frame, so this returns; the
+        // instruction is only fetched on the following dispatch.
+        if th.pending_call_hook {
+            th.pending_call_hook = false;
+            if self.hook_on(th, HOOK_CALL) {
+                self.fire_hook(th, fuel, "call", -1, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
+        if th.hook_count > 0 && self.hook_any(th) {
+            th.hook_counter -= 1;
+            if th.hook_counter <= 0 {
+                th.hook_counter = th.hook_count;
+                let line = line_of(th) as i64;
+                self.fire_hook(th, fuel, "count", line, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
+        if self.hook_on(th, HOOK_LINE) {
+            let line = line_of(th) as i64;
+            // Line 0 means "no line info" (e.g. a synthetic prologue
+            // instruction); PUC only reports real source lines.
+            if line > 0
+                && let Frame::Lua(lf) = th.frames.last_mut().unwrap()
+                && lf.last_line != line
+            {
+                lf.last_line = line;
+                self.fire_hook(th, fuel, "line", line, None)?;
+                return Ok(Flow::Continue);
+            }
         }
         let (instr, base) = {
             let f = th.frames.last_mut().unwrap().as_lua_mut();
@@ -2496,21 +2773,31 @@ impl Lua {
                     };
                     let f = th.frames.last_mut().unwrap().as_lua_mut();
                     f.pending.push(Pending::FinishReturn { start, count });
+                    // Fire the return hook after every __close handler has run
+                    // (PUC's order): the hook may even be *set* by one of them.
+                    f.pending.push(Pending::ReturnHookFire);
                     f.pending.push(Pending::CloseTbc {
                         from: 0,
                         err: Value::Nil,
                     });
                     return Ok(Flow::Continue);
                 }
-                let frame = th.frames.pop().unwrap();
-                let frame = frame.as_lua();
-                self.close_upvals(th, frame.base);
-                let start = frame.base + b as usize;
+                let frame_base = th.frames.last().unwrap().as_lua().base;
+                let start = frame_base + b as usize;
                 let count = if n == 0 {
                     th.top.saturating_sub(start)
                 } else {
                     (n - 1) as usize
                 };
+                if self.hook_on(th, HOOK_RETURN) {
+                    let f = th.frames.last_mut().unwrap().as_lua_mut();
+                    f.pending.push(Pending::FinishReturn { start, count });
+                    self.fire_hook(th, fuel, "return", -1, None)?;
+                    return Ok(Flow::Continue);
+                }
+                let frame = th.frames.pop().unwrap();
+                let frame = frame.as_lua();
+                self.close_upvals(th, frame.base);
                 if th.frames.is_empty() {
                     let vals = th.stack[start..start + count].to_vec();
                     th.stack.clear();
@@ -2697,7 +2984,13 @@ impl Lua {
                         varargs,
                         tailcall: false,
                         call_meta: None,
+                        last_line: -1,
+                        is_hook: false,
                     }));
+                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                        let callee = th.stack[func_abs];
+                        self.fire_hook(th, fuel, "call", -1, Some(callee))?;
+                    }
                     return Ok(());
                 }
                 Value::Native(nid) => {
@@ -2831,6 +3124,8 @@ impl Lua {
             varargs,
             tailcall: true,
             call_meta: None,
+            last_line: -1,
+            is_hook: false,
         }));
         Ok(())
     }
@@ -2850,6 +3145,7 @@ impl Lua {
     ) -> Result<(), VmError> {
         match self.natives[nid.0 as usize].kind {
             NativeKind::Plain(f) => {
+                let fv = th.stack[func_abs];
                 let args = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let res = f(self, &args).map_err(|message| VmError {
                     val: ErrVal::Msg(message),
@@ -2858,6 +3154,9 @@ impl Lua {
                     source: None,
                 })?;
                 place_shaped(th, ret_to, nres, shape, &res);
+                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                }
                 Ok(())
             }
             NativeKind::Intrinsic(i) => self.call_intrinsic(
@@ -3055,6 +3354,15 @@ impl Lua {
                     );
                 }
                 let pcall_fn = th.stack[func_abs];
+                if shape == RetShape::PrependTrue
+                    && let Some(f @ Frame::C(_)) = th.frames.last_mut()
+                {
+                    f.pending_mut().push(Pending::PrependShape {
+                        ret_to,
+                        nres,
+                        shape,
+                    });
+                }
                 self.protected_call(
                     th,
                     fuel,
@@ -3087,6 +3395,15 @@ impl Lua {
                 th.stack[wb] = f;
                 th.stack
                     .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
+                if shape == RetShape::PrependTrue
+                    && let Some(cf @ Frame::C(_)) = th.frames.last_mut()
+                {
+                    cf.pending_mut().push(Pending::PrependShape {
+                        ret_to,
+                        nres,
+                        shape,
+                    });
+                }
                 self.protected_call(
                     th,
                     fuel,
@@ -3121,30 +3438,72 @@ impl Lua {
                 self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, true)
             }
             Intrinsic::Yield => {
+                // Non-yieldable C boundary (e.g. inside a `table.sort`
+                // comparator or `string.gsub` replacement): PUC reports a
+                // cross-boundary yield, unless we are on the main thread, which
+                // reports "outside a coroutine" instead.
+                if th.non_yieldable > 0 && !th.is_main {
+                    return Err(self.rt_err(th, "attempt to yield across a C-call boundary".into()));
+                }
                 let Some(parent) = th.parent else {
                     return Err(self.rt_err(th, "attempt to yield from outside a coroutine".into()));
                 };
                 *fuel -= 3;
                 let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let rr = th.resume_ret.expect("resumed thread has resume_ret");
-                th.status = CoStatus::Suspended;
-                // the next resume's arguments become this yield call's results
-                th.yield_ret = Some((ret_to, nres, shape));
-                let parent_th = &mut self.threads[parent.0 as usize];
-                parent_th.status = CoStatus::Running;
-                deliver_resume(parent_th, rr, true, &args);
-                self.switch_to = Some(parent);
+                let yield_fn = th.stack[func_abs];
+                let want_call = self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL);
+                let want_ret = self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN);
+                let job = YieldJob {
+                    parent,
+                    rr,
+                    ret_to,
+                    nres,
+                    shape,
+                    args,
+                    func: yield_fn,
+                    stage: 0,
+                };
+                if want_call || want_ret {
+                    // `yield` is a C function: emit its call/return hook events
+                    // before the thread actually suspends. Each hook runs as a
+                    // frame, so the suspension is deferred through `YieldStep`.
+                    th.yield_job = Some(job);
+                    th.frames
+                        .last_mut()
+                        .unwrap()
+                        .pending_mut()
+                        .push(Pending::YieldStep);
+                    return Ok(());
+                }
+                self.perform_yield(th, job);
+                Ok(())
+            }
+            Intrinsic::EnterNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_add(1);
+                place_shaped(th, ret_to, nres, shape, &[]);
+                Ok(())
+            }
+            Intrinsic::LeaveNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_sub(1);
+                place_shaped(th, ret_to, nres, shape, &[]);
                 Ok(())
             }
             Intrinsic::IsYieldable => {
                 // Optional `co` argument: true for any coroutine (even a dead
-                // or never-started one), false for the main thread.
+                // or never-started one), false for the main thread or a thread
+                // currently inside a non-yieldable C boundary.
                 let r = match arg_opt(th, 0) {
-                    None => !th.is_main,
+                    None => !th.is_main && th.non_yieldable == 0,
                     // the running thread is taken out of the arena, so read
                     // its flag from the live `th`, not the placeholder
-                    Some(Value::Thread(t)) if t == self.current_thread => !th.is_main,
-                    Some(Value::Thread(t)) => !self.threads[t.0 as usize].is_main,
+                    Some(Value::Thread(t)) if t == self.current_thread => {
+                        !th.is_main && th.non_yieldable == 0
+                    }
+                    Some(Value::Thread(t)) => {
+                        let other = &self.threads[t.0 as usize];
+                        !other.is_main && other.non_yieldable == 0
+                    }
                     Some(v) => {
                         return Err(self.rt_err(
                             th,
@@ -3387,11 +3746,143 @@ impl Lua {
                 Ok(())
             }
             Intrinsic::DebugGethook => {
-                // No hooks are supported (tier c); report "no hook".
-                place_shaped(th, ret_to, nres, shape, &[Value::Nil]);
+                let target = match arg_opt(th, 0) {
+                    None | Some(Value::Nil) => None,
+                    Some(Value::Thread(t)) => Some(t),
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'gethook' (thread expected, got {})",
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let (hook, mask, count) = match target {
+                    Some(t) if t != self.current_thread => {
+                        let o = &self.threads[t.0 as usize];
+                        (o.hook.unwrap_or(Value::Nil), o.hook_mask, o.hook_count)
+                    }
+                    _ => (th.hook.unwrap_or(Value::Nil), th.hook_mask, th.hook_count),
+                };
+                // PUC returns a single `nil` (fail) when no hook is set,
+                // otherwise the hook, its mask string, and the count.
+                if hook == Value::Nil {
+                    place_shaped(th, ret_to, nres, shape, &[Value::Nil]);
+                    return Ok(());
+                }
+                let mut s = String::new();
+                if mask & HOOK_CALL != 0 {
+                    s.push('c');
+                }
+                if mask & HOOK_RETURN != 0 {
+                    s.push('r');
+                }
+                if mask & HOOK_LINE != 0 {
+                    s.push('l');
+                }
+                let sv = self.new_string(s.as_bytes());
+                place_shaped(th, ret_to, nres, shape, &[hook, sv, Value::Int(count)]);
+                Ok(())
+            }
+            Intrinsic::DebugSethook => {
+                // `debug.sethook([thread,] hook, mask [, count])`
+                let (target, base_index) = match arg_opt(th, 0) {
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let hook_opt = match arg(th, base_index) {
+                    Value::Nil => None,
+                    v @ (Value::Closure(_) | Value::Native(_)) => Some(v),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (function expected, got {})",
+                                base_index + 1,
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let mut bits = 0u8;
+                match arg_opt(th, base_index + 1) {
+                    None | Some(Value::Nil) => {}
+                    Some(Value::Str(sid)) => {
+                        for &c in self.strings.get(sid) {
+                            match c {
+                                b'c' => bits |= HOOK_CALL,
+                                b'r' => bits |= HOOK_RETURN,
+                                b'l' => bits |= HOOK_LINE,
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (string expected, got {})",
+                                base_index + 2,
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                }
+                let count = match arg_opt(th, base_index + 2) {
+                    None | Some(Value::Nil) => 0,
+                    Some(Value::Int(n)) => n,
+                    Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (number expected, got {})",
+                                base_index + 3,
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let apply = |t: &mut Thread| {
+                    t.hook = hook_opt;
+                    t.hook_mask = bits;
+                    t.hook_count = count.max(0);
+                    t.hook_counter = count.max(0);
+                };
+                match target {
+                    Some(t) if t != self.current_thread => {
+                        apply(&mut self.threads[t.0 as usize]);
+                    }
+                    _ => apply(th),
+                }
+                // `debug.sethook` is itself a C function: if a return hook is
+                // now active on this thread, its return fires the hook (and the
+                // hook it just set observes it). A clearing call has already
+                // removed the hook, so nothing fires.
+                let fv = th.stack[func_abs];
+                place_shaped(th, ret_to, nres, shape, &[]);
+                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                }
                 Ok(())
             }
         }
+    }
+
+    /// Number of resumers above `parent` in the live coroutine chain.
+    fn coroutine_depth(&self, parent: Option<ThreadId>) -> usize {
+        let mut depth = 0;
+        let mut cur = parent;
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > 1000 {
+                break;
+            }
+            cur = self.threads[p.0 as usize].parent;
+        }
+        depth
     }
 
     /// Shared by `coroutine.resume` and wrapped coroutines.
@@ -3418,6 +3909,12 @@ impl Lua {
         };
         if co == self.current_thread {
             return fail(self, th, "cannot resume non-suspended coroutine");
+        }
+        // PUC bounds the chain of nested resumes with its C-stack limit; the
+        // classic `function(a) coroutine.wrap(a)(a) end` loop must fail with
+        // "C stack overflow" rather than allocate coroutines without bound.
+        if self.coroutine_depth(th.parent) >= 190 {
+            return fail(self, th, "C stack overflow");
         }
         let status = self.threads[co.0 as usize].status;
         match status {
@@ -3477,7 +3974,12 @@ impl Lua {
                                 varargs,
                                 tailcall: false,
                                 call_meta: None,
+                                last_line: -1,
+                                is_hook: false,
                             }));
+                            // A hook set on this coroutine before it started
+                            // must see the body's "call" event.
+                            co_th.pending_call_hook = true;
                         }
                         Value::Native(nid) => {
                             let is_pcall = matches!(
@@ -5169,6 +5671,15 @@ impl Lua {
         if let Some(e) = th.close_error {
             work.push(e);
         }
+        if let Some(h) = th.hook {
+            work.push(h);
+        }
+        if let Some(job) = &th.yield_job {
+            work.push(job.func);
+            for &v in &job.args {
+                work.push(v);
+            }
+        }
         if let Some(p) = th.parent {
             work.push(Value::Thread(p));
         }
@@ -5281,6 +5792,7 @@ fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_l
                 }
             }
             Pending::CloseTbc { err, .. } => work.push(err),
+            Pending::Reraise { err } => work.push(err),
             // Return values staged above the register window must survive
             // while their `__close` handlers run.
             Pending::FinishReturn { start, count } => {
@@ -5301,7 +5813,10 @@ fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_l
             | Pending::PrintStep
             | Pending::FinishTostring { .. }
             | Pending::FormatStep
-            | Pending::UnwindAfterHandler { .. } => {}
+            | Pending::UnwindAfterHandler { .. }
+            | Pending::PrependShape { .. }
+            | Pending::ReturnHookFire
+            | Pending::YieldStep => {}
         }
     }
 }

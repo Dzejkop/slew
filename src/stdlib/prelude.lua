@@ -13,6 +13,31 @@ local next, select, tostring, rawget = next, select, tostring, rawget
 local raw_metatable = __slew_getmetatable
 __slew_getmetatable = nil
 
+-- Non-yieldable C-boundary bracket. PUC's C library invokes `table.sort`
+-- comparators and `string.gsub` function replacements through `lua_call`
+-- (no continuation), so a `coroutine.yield` inside them raises
+-- "attempt to yield across a C-call boundary" and `coroutine.isyieldable()`
+-- is false. The two private intrinsics bracket the callback; `pcall`
+-- guarantees the depth is restored even when the callback errors (the
+-- boundary yield error in particular), so the enclosing coroutine stays
+-- yieldable afterwards.
+local nyenter, nyleave = __slew_nyenter, __slew_nyleave
+__slew_nyenter = nil
+__slew_nyleave = nil
+
+local pack = table.pack
+local function call_non_yieldable(f, ...)
+  nyenter()
+  local r = pack(pcall(f, ...))
+  nyleave()
+  if not r[1] then error(r[2], 0) end
+  return unpack(r, 2, r.n)
+end
+
+local function nywrap(f)
+  return function(...) return call_non_yieldable(f, ...) end
+end
+
 -- ---- base functions that must call back into Lua -----------------------
 -- Natives cannot invoke metamethods, so `pairs` (`__pairs`) and `ipairs`
 -- (`__index`) live here and run through the VM. `print` is a native-backed
@@ -327,6 +352,9 @@ function string.gsub(s, pat, repl, maxn)
   if tr == 'number' then
     repl = tostring(repl)
     tr = 'string'
+  elseif tr == 'function' then
+    -- PUC invokes the replacement from C: yielding across it is an error.
+    repl = nywrap(repl)
   end
   local anchored = sub(pat, 1, 1) == '^'
   local out, pos, count = {}, 1, 0
@@ -405,7 +433,12 @@ function table.sort(t, cmp)
     if n >= 2147483647 then
       error("bad argument #1 to 'sort' (array too big)", 2)
     end
-    cmp = cmp or function(a, b) return a < b end
+    if cmp == nil then
+      cmp = function(a, b) return a < b end
+    else
+      -- PUC invokes a user comparator from C: yielding across it is an error.
+      cmp = nywrap(cmp)
+    end
     local function qs(lo, hi)
     while lo < hi do
       -- median-of-three pivot

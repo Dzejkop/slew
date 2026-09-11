@@ -37,6 +37,12 @@ pub fn install(lua: &mut Lua) {
     // must bypass it (PUC's `luaL_getmetafield`). The prelude captures this
     // and clears the global immediately.
     lua.register_native("__slew_getmetatable", n_raw_metatable);
+    // Non-yieldable C-boundary bracket for the prelude: PUC's C library calls
+    // `table.sort` comparators and `gsub` function replacements through
+    // `lua_call` (no continuation), so yielding inside them fails. The prelude
+    // captures these two and clears the globals immediately.
+    lua.register_intrinsic("__slew_nyenter", Intrinsic::EnterNonYieldable);
+    lua.register_intrinsic("__slew_nyleave", Intrinsic::LeaveNonYieldable);
     lua.register_native("next", n_next);
     // `pairs`/`ipairs` and `print` are defined in the prelude (they must call
     // metamethods, which natives cannot do).
@@ -90,7 +96,7 @@ pub(crate) fn install_host_libs(lua: &mut Lua) {
 fn install_debug(lua: &mut Lua) {
     let debug = lua.new_table();
     lua.set_global("debug", debug);
-    let entries: [(&str, Intrinsic); 10] = [
+    let entries: [(&str, Intrinsic); 11] = [
         ("getinfo", Intrinsic::DebugGetinfo),
         ("traceback", Intrinsic::DebugTraceback),
         ("getupvalue", Intrinsic::DebugGetupvalue),
@@ -100,9 +106,8 @@ fn install_debug(lua: &mut Lua) {
         ("getmetatable", Intrinsic::DebugGetmetatable),
         ("setmetatable", Intrinsic::DebugSetmetatable),
         ("getregistry", Intrinsic::DebugGetregistry),
-        // `gethook`/`sethook` are not implemented (tier c); `gethook`
-        // returns nil so "no hook" probes succeed.
         ("gethook", Intrinsic::DebugGethook),
+        ("sethook", Intrinsic::DebugSethook),
     ];
     for (name, i) in entries {
         let f = lua.add_native_kind(name, NativeKind::Intrinsic(i));

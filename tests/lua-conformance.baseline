@@ -11,7 +11,7 @@ strings.lua	ok
 math.lua	ok
 verybig.lua	ok
 constructs.lua	ok
-locals.lua	line:803
+locals.lua	ok
 goto.lua	ok
 calls.lua	ok
 events.lua	ok
@@ -19,4 +19,4 @@ bitwise.lua	ok
 tpack.lua	ok
 literals.lua	ok
 attrib.lua	ok
-coroutine.lua	line:289
+coroutine.lua	ok

@@ -547,3 +547,53 @@ assert(mid() == 'mid')
 return true";
     assert!(ok(src));
 }
+
+#[test]
+fn return_hook_names_the_returning_function() {
+    // A return hook set *inside* a `__close` handler fires for the C
+    // `debug.sethook` call, both `__close` metamethods, and the Lua function
+    // that is returning, in PUC's order and with `getinfo(2).name` resolved.
+    let src = "\
+local function func2close (f) return setmetatable({}, {__close = f}) end
+local trace = {}
+local function hook (event)
+  trace[#trace + 1] = event .. ' ' .. debug.getinfo(2).name
+end
+local function foo (...)
+  local x <close> = func2close(function () trace[#trace + 1] = 'x' end)
+  local y <close> = func2close(function () debug.sethook(hook, 'r') end)
+  return ...
+end
+local t = {foo(10, 20, 30)}
+debug.sethook()
+assert(t[1] == 10 and t[2] == 20 and t[3] == 30)
+assert(#trace == 5, table.concat(trace, ','))
+assert(trace[1] == 'return sethook', trace[1])
+assert(trace[2] == 'return close', trace[2])
+assert(trace[3] == 'x', trace[3])
+assert(trace[4] == 'return close', trace[4])
+assert(trace[5] == 'return foo', trace[5])
+return true";
+    assert!(ok(src));
+}
+
+#[test]
+fn sethook_call_line_return_and_gethook() {
+    // Call/line/return hooks on a coroutine, and `gethook`'s three results.
+    let src = "\
+local co = coroutine.create(function ()
+  coroutine.yield(10)
+  return 20
+end)
+local trace = {}
+local function dotrace (event) trace[#trace + 1] = event end
+debug.sethook(co, dotrace, 'clr')
+repeat until not coroutine.resume(co)
+assert(table.concat(trace, ',') == 'call,line,call,return,line,return',
+       table.concat(trace, ','))
+local h, m, c = debug.gethook(co)
+assert(h == dotrace and m == 'crl' and c == 0)
+assert(debug.gethook() == nil)
+return true";
+    assert!(ok(src));
+}

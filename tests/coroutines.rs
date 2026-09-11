@@ -567,3 +567,46 @@ fn pcall_as_coroutine_body_returns_results() {
         ["true", "true", "1", "2"]
     );
 }
+
+#[test]
+fn c_call_boundaries_are_not_yieldable() {
+    // PUC invokes `table.sort` comparators and `string.gsub` function
+    // replacements from C via `lua_call` (no continuation), so a yield inside
+    // them fails with a cross-boundary error while the enclosing coroutine
+    // stays yieldable afterwards.
+    let src = "\
+local co = coroutine.wrap(function ()
+  assert(not pcall(table.sort, {1, 2, 3}, coroutine.yield))
+  assert(coroutine.isyieldable())
+  coroutine.yield(20)
+  return 30
+end)
+assert(co() == 20)
+assert(co() == 30)
+local g = function (c)
+  assert(not coroutine.isyieldable())
+  return c .. c
+end
+local co2 = coroutine.wrap(function ()
+  assert(coroutine.isyieldable())
+  return string.gsub('a', '.', g)
+end)
+assert(co2() == 'aa')
+return true";
+    assert_eq!(eval(src), "true");
+}
+
+#[test]
+fn nested_protected_calls_prepend_each_success_flag() {
+    // Each `pcall`/`xpcall` adds its own success flag on top of its callee's
+    // results, including when the callee is itself a protected call.
+    let src = "\
+local a, b, v = xpcall(pcall, function (...) return ... end,
+                       function () return 20 end)
+assert(a == true and b == true and v == 20)
+local c, d, e = xpcall(pcall, function (...) return ... end,
+                       function () error('boom', 0) end)
+assert(c == true and d == false and e == 'boom')
+return true";
+    assert_eq!(eval(src), "true");
+}
