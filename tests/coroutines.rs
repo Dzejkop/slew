@@ -3,7 +3,9 @@
 use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..10_000 {
         match exec.step(lua, 100_000) {
@@ -30,7 +32,9 @@ fn eval_multi(src: &str) -> Vec<String> {
 
 fn run_err(src: &str) -> String {
     let mut lua = Lua::new();
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     loop {
         match exec.step(&mut lua, 100_000) {
@@ -183,8 +187,10 @@ fn yield_from_main_errors() {
     assert!(err.contains("outside a coroutine"), "got: {err}");
     assert_eq!(eval("return coroutine.isyieldable()"), "false");
     assert_eq!(
-        eval("local co = coroutine.create(function() return coroutine.isyieldable() end) \
-              local _, v = coroutine.resume(co) return v"),
+        eval(
+            "local co = coroutine.create(function() return coroutine.isyieldable() end) \
+              local _, v = coroutine.resume(co) return v"
+        ),
         "true"
     );
 }
@@ -356,15 +362,19 @@ fn close_receives_error_object_during_unwind() {
 
 #[test]
 fn close_false_and_nil_allowed() {
-    assert_eq!(eval("do local x <close> = nil local y <close> = false end return 'ok'"), "ok");
+    assert_eq!(
+        eval("do local x <close> = nil local y <close> = false end return 'ok'"),
+        "ok"
+    );
     let err = run_err("local x <close> = 42");
     assert!(err.contains("non-closable"), "got: {err}");
     let mut lua = Lua::new();
-    assert!(lua
-        .load("local a <close>, b <close> = nil, nil")
-        .unwrap_err()
-        .to_string()
-        .contains("multiple"));
+    assert!(
+        lua.load("local a <close>, b <close> = nil, nil")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple")
+    );
 }
 
 #[test]
@@ -404,4 +414,63 @@ fn close_suspends_correctly() {
             Step::Pending => {}
         }
     }
+}
+
+#[test]
+fn generic_for_closes_fourth_explist_value() {
+    // locals.lua: the generic-for explist may yield iterator, state, control
+    // and a fourth to-be-closed value; it must be closed on every exit path.
+    // Normal completion.
+    assert_eq!(
+        eval(
+            "local closed = 0 \
+             for k in next, {1, 2, 3}, nil, \
+                 setmetatable({}, {__close = function() closed = closed + 1 end}) do end \
+             return closed"
+        ),
+        "1"
+    );
+    // `break`.
+    assert_eq!(
+        eval(
+            "local closed = 0 \
+             for k in next, {1, 2, 3}, nil, \
+                 setmetatable({}, {__close = function() closed = closed + 1 end}) do break end \
+             return closed"
+        ),
+        "1"
+    );
+    // Error unwinding, with the original error preserved.
+    assert_eq!(
+        eval_multi(
+            "local closed = 0 \
+             local ok, err = pcall(function() \
+                 for k in next, {1, 2, 3}, nil, \
+                     setmetatable({}, {__close = function() closed = closed + 1 end}) do \
+                     error('boom', 0) \
+                 end \
+             end) \
+             return ok, err, closed"
+        ),
+        ["false", "boom", "1"]
+    );
+    // A closing value returned as the 4th result of a custom iterator factory
+    // (locals.lua's `open`), exercised across normal and broken loops.
+    assert_eq!(
+        eval_multi(
+            "local open = 0 \
+             local function iter(n) \
+                 local i = n \
+                 return function() i = i - 1; if i > 0 then return i end end, \
+                        nil, nil, \
+                        setmetatable({}, {__close = function() open = open + 1 end}) \
+             end \
+             local s = 0 \
+             for i in iter(10) do s = s + i end \
+             local b = 0 \
+             for i in iter(10) do if i < 5 then break end b = b + i end \
+             return s, b, open"
+        ),
+        ["45", "35", "2"]
+    );
 }

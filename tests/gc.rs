@@ -553,3 +553,77 @@ fn next_skips_collected_weak_entries() {
     assert_eq!(vals[0], Value::Bool(true));
     assert_eq!(vals[1], Value::Int(0));
 }
+
+#[test]
+fn next_survives_deleting_current_key_mid_iteration() {
+    let mut lua = Lua::new();
+    // Mirrors nextvar.lua's "erasing values": walk the whole hash part,
+    // clearing the current key and collecting on every step. Every entry must
+    // still be visited exactly once (the cursor must not be invalidated).
+    let vals = run(
+        &mut lua,
+        "local t = {}
+         for i = 1, 50 do t['k' .. i] = i end
+         local seen, n = {}, 0
+         for k, v in pairs(t) do
+           n = n + 1
+           seen[k] = true
+           assert(t[k] == v)
+           t[k] = nil
+           collectgarbage()
+           assert(t[k] == nil)
+         end
+         for i = 1, 50 do assert(seen['k' .. i]) end
+         return n, next(t) == nil",
+    );
+    assert_eq!(vals[0], Value::Int(50));
+    assert_eq!(vals[1], Value::Bool(true));
+}
+
+#[test]
+fn next_reports_current_key_after_prior_deletions() {
+    let mut lua = Lua::new();
+    // nextvar.lua's GC-of-deleted-keys case: after deleting every prior key,
+    // `next(t)` (from nil) must report the key the for-loop is currently on,
+    // even after collectgarbage collects those deleted keys.
+    let vals = run(
+        &mut lua,
+        "local t = {}
+         t[string.rep('a', 50)] = 'a'
+         t[string.rep('b', 50)] = 'b'
+         t[string.rep('c', 50)] = 'c'
+         local count, ok = 0, true
+         for k, v in pairs(t) do
+           count = count + 1
+           local k1 = next(t)          -- all previous keys were deleted
+           ok = ok and (k == k1)
+           t[k] = nil
+           collectgarbage('collect')
+         end
+         return count, ok, next(t) == nil",
+    );
+    assert_eq!(vals[0], Value::Int(3));
+    assert_eq!(vals[1], Value::Bool(true));
+    assert_eq!(vals[2], Value::Bool(true));
+}
+
+#[test]
+fn reinserting_visited_key_does_not_loop_forever() {
+    let mut lua = Lua::new();
+    // Deleting the current key and re-adding it with the same value must not
+    // make `pairs` revisit it: each key is seen once and the loop terminates.
+    let vals = run(
+        &mut lua,
+        "local t = {a = 1, b = 2, c = 3}
+         local n = 0
+         for k, v in pairs(t) do
+           n = n + 1
+           assert(n <= 10)         -- guard against an infinite traversal
+           t[k] = nil
+           t[k] = v
+           collectgarbage()
+         end
+         return n",
+    );
+    assert_eq!(vals[0], Value::Int(3));
+}

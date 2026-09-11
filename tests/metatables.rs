@@ -217,6 +217,56 @@ fn concat_len_call_metamethods() {
 }
 
 #[test]
+fn deep_call_metamethod_chains() {
+    // calls.lua builds 100+ nested `setmetatable({}, {__call = prev})` layers;
+    // resolving the chain must stay linear-ish and not overflow.
+    assert_eq!(
+        eval(
+            "local f = function() return 1023 end \
+             for i = 1, 150 do f = setmetatable({}, {__call = f}) end \
+             return f()"
+        ),
+        "1023"
+    );
+    // 1000 levels, invoked from inside coroutine.wrap (fresh stack, as
+    // upstream calls.lua does to avoid a preallocated frame).
+    assert_eq!(
+        eval(
+            "local f = function() return 7 end \
+             for i = 1, 1000 do f = setmetatable({}, {__call = f}) end \
+             return coroutine.wrap(function() return f() end)()"
+        ),
+        "7"
+    );
+    // Each __call layer prepends itself, so the base function sees one extra
+    // argument per link (calls.lua's `table.pack` chain).
+    assert_eq!(
+        eval_multi(
+            "local function tail(...) return select('#', ...) end \
+             local u = tail \
+             for i = 1, 20 do u = setmetatable({i}, {__call = u}) end \
+             return u('a', 'b', 'c')"
+        ),
+        ["23"]
+    );
+}
+
+#[test]
+fn cyclic_call_chain_errors_instead_of_hanging() {
+    // A self-referential __call chain must hit the chain cap and raise a
+    // catchable error, not spin forever (upstream PUC loops/overflows here).
+    assert_eq!(
+        eval(
+            "local t = {} \
+             setmetatable(t, {__call = t}) \
+             local ok, err = pcall(t) \
+             return tostring(ok) .. '/' .. tostring(type(err) == 'string' and err:find('chain too long') ~= nil)"
+        ),
+        "false/true"
+    );
+}
+
+#[test]
 fn tostring_metamethod() {
     assert_eq!(
         eval(

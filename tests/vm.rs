@@ -449,6 +449,52 @@ fn tables() {
 }
 
 #[test]
+fn multi_assignment_target_conflicts() {
+    // attrib.lua lines 483-494: assignment target prefixes (`a[i]`, `a[j]`,
+    // `a[i+j]`) must capture their pre-assignment object/key values before any
+    // store rewrites the locals they read.
+    assert_eq!(
+        eval(
+            "local a, i, j, b \
+             a = {'a', 'b'}; i = 1; j = 2; b = a \
+             i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i \
+             return tostring(i == 2 and b[1] == 1 and a == 1 and j == b and \
+                             b[2] == 2 and b[3] == 1)"
+        ),
+        "true"
+    );
+    // Same conflict through upvalues.
+    assert_eq!(
+        eval(
+            "local a, b = {}, nil \
+             local function foo() b, a.x, a = a, 10, 20 end \
+             foo() \
+             return tostring(a == 20 and b.x == 10)"
+        ),
+        "true"
+    );
+    // Full attrib.lua upvalue variant.
+    assert_eq!(
+        eval(
+            "local a, i, j, b \
+             a = {'a', 'b'}; i = 1; j = 2; b = a \
+             local function foo() \
+               i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i \
+             end \
+             foo() \
+             return tostring(i == 2 and b[1] == 1 and a == 1 and j == b and \
+                             b[2] == 2 and b[3] == 1)"
+        ),
+        "true"
+    );
+    // A target-indexed table and the assigned local may alias the same slot.
+    assert_eq!(
+        eval("local t = {} (function(a) t[a], a = 10, 20 end)(1) return t[1]"),
+        "10"
+    );
+}
+
+#[test]
 fn big_table_constructor_flushes() {
     // more than one SetList batch (50 per flush)
     let src = format!(

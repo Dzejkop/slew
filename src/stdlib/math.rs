@@ -236,11 +236,11 @@ fn to_f(v: Value) -> f64 {
 }
 
 fn n_max(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    minmax(args, "max", true)
+    minmax(args, "math.max", true)
 }
 
 fn n_min(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    minmax(args, "min", false)
+    minmax(args, "math.min", false)
 }
 
 fn n_ult(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {

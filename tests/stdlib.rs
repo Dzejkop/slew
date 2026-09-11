@@ -695,6 +695,42 @@ fn math_basics() {
 }
 
 #[test]
+fn math_max_min_no_args_and_ordering() {
+    // PUC math.lua lines 747-759: no args is "value expected" (named after
+    // the full `math.max`/`math.min`, not the bare function).
+    let emax = run_err("return math.max()");
+    assert!(emax.contains("value expected"), "got: {emax}");
+    assert!(emax.contains("math.max"), "got: {emax}");
+    let emin = run_err("return math.min()");
+    assert!(emin.contains("value expected"), "got: {emin}");
+    assert!(emin.contains("math.min"), "got: {emin}");
+
+    assert_eq!(eval("return math.max(3)"), "3");
+    assert_eq!(eval("return math.max(3, 5, 9, 1)"), "9");
+    assert_eq!(eval("return math.min(3)"), "3");
+    assert_eq!(eval("return math.min(3, 5, 9, 1)"), "1");
+    assert_eq!(eval("return math.min(3.2, 5.9, -9.2, 1.1)"), "-9.2");
+    assert_eq!(eval("return math.min(1.9, 1.7, 1.72)"), "1.7");
+    // Integer/float mixed ordering is exact (no f64 rounding).
+    assert_eq!(
+        eval("return math.max(math.maxinteger, 10e60) == 10e60"),
+        "true"
+    );
+    assert_eq!(
+        eval("return math.max(math.mininteger, math.mininteger + 1) == math.mininteger + 1"),
+        "true"
+    );
+    assert_eq!(
+        eval("return math.min(-10e60, math.mininteger) == -10e60"),
+        "true"
+    );
+    assert_eq!(
+        eval("return math.min(math.maxinteger, math.maxinteger - 1) == math.maxinteger - 1"),
+        "true"
+    );
+}
+
+#[test]
 fn integer_representation_errors() {
     // PUC 5.4: these are runtime errors (the chunk loads fine), matching
     // math.lua's `checkcompt` helper which pcalls the loaded function.
