@@ -855,7 +855,8 @@ impl Lua {
     /// Parses `debug.getinfo`'s `what` option string, validating each letter.
     fn debug_what(&self, what: Value, argno: usize, who: &str) -> Result<Vec<u8>, String> {
         let bytes = match what {
-            Value::Nil => b"flnStu".to_vec(),
+            // PUC 5.4's default option string; 'r' yields ftransfer/ntransfer.
+            Value::Nil => b"flnSrtu".to_vec(),
             Value::Str(s) => self.strings.get(s).to_vec(),
             other => {
                 return Err(format!(
@@ -865,7 +866,7 @@ impl Lua {
             }
         };
         for &c in &bytes {
-            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L') {
+            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L' | b'r') {
                 return Err(format!("bad argument #{argno} to '{who}' (invalid option)"));
             }
         }
@@ -1028,6 +1029,11 @@ impl Lua {
         if what.contains(&b't') {
             self.info_set(tid, "istailcall", Value::Bool(false));
         }
+        if what.contains(&b'r') {
+            // No hook/transfer model: like a plain PUC call, both are zero.
+            self.info_set(tid, "ftransfer", Value::Int(0));
+            self.info_set(tid, "ntransfer", Value::Int(0));
+        }
         if what.contains(&b'n') {
             self.info_set(tid, "name", Value::Nil);
             let nw = self.new_string(b"");
@@ -1078,6 +1084,12 @@ impl Lua {
         }
         if what.contains(&b't') {
             self.info_set(tid, "istailcall", Value::Bool(istailcall));
+        }
+        if what.contains(&b'r') {
+            // Transfers describe hook/call argument movement; slew has no
+            // hooks and never sets CIST_TRAN, so PUC reports zero here.
+            self.info_set(tid, "ftransfer", Value::Int(0));
+            self.info_set(tid, "ntransfer", Value::Int(0));
         }
         if what.contains(&b'n') {
             let namev = match &name {
@@ -1235,6 +1247,40 @@ impl Lua {
             return Value::Nil;
         }
         Value::Int(c.upvals[n as usize - 1].0 as i64)
+    }
+
+    /// PUC's `checkupval` for the upvalue APIs: the index has already been
+    /// coerced; a native (C) function is a valid function but has no
+    /// upvalues, so any index on it is "invalid upvalue index". `argf` and
+    /// `argnup` are 1-based argument positions for PUC's error wording.
+    fn debug_check_upval(
+        &self,
+        f: Value,
+        n: i64,
+        argf: usize,
+        argnup: usize,
+        who: &str,
+    ) -> Result<ClosId, String> {
+        let cid = match f {
+            Value::Closure(cid) => cid,
+            Value::Native(_) => {
+                return Err(format!(
+                    "bad argument #{argnup} to '{who}' (invalid upvalue index)"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "bad argument #{argf} to '{who}' (function expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        if n < 1 || n as usize > self.closures[cid.0 as usize].upvals.len() {
+            return Err(format!(
+                "bad argument #{argnup} to '{who}' (invalid upvalue index)"
+            ));
+        }
+        Ok(cid)
     }
 
     fn debug_upvaluejoin(
@@ -2341,22 +2387,27 @@ impl Lua {
                     .debug_check_int(arg_opt(th, 1), 2, "debug.getupvalue")
                     .map_err(|m| self.rt_err(th, m))?;
                 let f = arg(th, 0);
-                let Value::Closure(cid) = f else {
-                    return Err(self.rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
-                            f.type_name()
-                        ),
-                    ));
-                };
-                match self.debug_getupvalue(th, cid, n) {
-                    Some((name, val)) => {
-                        let nv = self.new_string(name.as_bytes());
-                        place_shaped(th, ret_to, nres, shape, &[nv, val]);
+                match f {
+                    Value::Closure(cid) => match self.debug_getupvalue(th, cid, n) {
+                        Some((name, val)) => {
+                            let nv = self.new_string(name.as_bytes());
+                            place_shaped(th, ret_to, nres, shape, &[nv, val]);
+                        }
+                        // Out of range: PUC returns no values.
+                        None => place_shaped(th, ret_to, nres, shape, &[]),
+                    },
+                    // A native is a C function: it is a valid function with no
+                    // upvalues, so `lua_getupvalue` returns NULL -> zero values.
+                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
                     }
-                    // Out of range: PUC returns no values.
-                    None => place_shaped(th, ret_to, nres, shape, &[]),
                 }
                 Ok(())
             }
@@ -2374,21 +2425,26 @@ impl Lua {
                     .map_err(|m| self.rt_err(th, m))?;
                 let v = arg(th, 2);
                 let f = arg(th, 0);
-                let Value::Closure(cid) = f else {
-                    return Err(self.rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
-                            f.type_name()
-                        ),
-                    ));
-                };
-                match self.debug_setupvalue(th, cid, n, v) {
-                    Some(name) => {
-                        let nv = self.new_string(name.as_bytes());
-                        place_shaped(th, ret_to, nres, shape, &[nv]);
+                match f {
+                    Value::Closure(cid) => match self.debug_setupvalue(th, cid, n, v) {
+                        Some(name) => {
+                            let nv = self.new_string(name.as_bytes());
+                            place_shaped(th, ret_to, nres, shape, &[nv]);
+                        }
+                        None => place_shaped(th, ret_to, nres, shape, &[]),
+                    },
+                    // Native (C) functions have no upvalues: `lua_setupvalue`
+                    // returns NULL, and the API reports zero values.
+                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
                     }
-                    None => place_shaped(th, ret_to, nres, shape, &[]),
                 }
                 Ok(())
             }
@@ -2397,46 +2453,41 @@ impl Lua {
                     .debug_check_int(arg_opt(th, 1), 2, "debug.upvalueid")
                     .map_err(|m| self.rt_err(th, m))?;
                 let f = arg(th, 0);
-                let Value::Closure(cid) = f else {
-                    return Err(self.rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
-                            f.type_name()
-                        ),
-                    ));
+                let r = match f {
+                    Value::Closure(cid) => self.debug_upvalueid(cid, n),
+                    // `lua_upvalueid` returns NULL for a C function (no
+                    // upvalues); PUC pushes fail (nil) as a single value.
+                    Value::Native(_) => Value::Nil,
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
                 };
-                let r = self.debug_upvalueid(cid, n);
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
             Intrinsic::DebugUpvaluejoin => {
+                // PUC's `checkupval` validates each (function, index) pair in
+                // order: index (#2/#4) then function (#1/#3) then upvalue
+                // existence. A native has no upvalues, so it fails the index
+                // check; a non-function fails the type check.
                 let n1 = self
                     .debug_check_int(arg_opt(th, 1), 2, "debug.upvaluejoin")
                     .map_err(|m| self.rt_err(th, m))?;
-                let f1 = arg(th, 0);
-                let Value::Closure(c1) = f1 else {
-                    return Err(self.rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'debug.upvaluejoin' (function expected, got {})",
-                            f1.type_name()
-                        ),
-                    ));
-                };
+                let c1 = self
+                    .debug_check_upval(arg(th, 0), n1, 1, 2, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
                 let n2 = self
                     .debug_check_int(arg_opt(th, 3), 4, "debug.upvaluejoin")
                     .map_err(|m| self.rt_err(th, m))?;
-                let f2 = arg(th, 2);
-                let Value::Closure(c2) = f2 else {
-                    return Err(self.rt_err(
-                        th,
-                        format!(
-                            "bad argument #3 to 'debug.upvaluejoin' (function expected, got {})",
-                            f2.type_name()
-                        ),
-                    ));
-                };
+                let c2 = self
+                    .debug_check_upval(arg(th, 2), n2, 3, 4, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
                 self.debug_upvaluejoin(c1, n1, c2, n2)
                     .map_err(|m| self.rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[]);

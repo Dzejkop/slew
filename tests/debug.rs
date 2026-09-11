@@ -132,6 +132,24 @@ return a == false and b == true";
 }
 
 #[test]
+fn getinfo_transfer_fields() {
+    // PUC 5.4's default `what` is "flnSrtu", so 'r' fields are present and
+    // zero for plain calls (transfers only describe hook/call movement).
+    let src = "\
+local i = debug.getinfo(1)
+assert(i.ftransfer == 0, tostring(i.ftransfer))
+assert(i.ntransfer == 0, tostring(i.ntransfer))
+local function f () return debug.getinfo(1, 'r') end
+local r = f()
+assert(r.ftransfer == 0 and r.ntransfer == 0)
+-- Requesting only 'S' omits them.
+assert(debug.getinfo(1, 'S').ftransfer == nil)
+assert(debug.getinfo(f, 'r').ftransfer == 0)
+return true";
+    assert!(ok(src));
+}
+
+#[test]
 fn getinfo_lastlinedefined_and_activelines() {
     // `lastlinedefined` is the line of the closing `end`, and the implicit
     // final RETURN puts that line into `activelines` (PUC).
@@ -265,6 +283,15 @@ assert(debug.setupvalue(f, 1, 42) == 'x')
 assert(f() == 42)
 assert(select('#', debug.setupvalue(f, 2, 1)) == 0)
 assert(select('#', debug.setupvalue(f, 0, 1)) == 0)
+-- Native (C) functions are valid functions, not type errors; they simply
+-- have no upvalues, so getupvalue/setupvalue report zero values and
+-- upvalueid pushes nil (PUC `checkupval`/`auxupvalue`).
+assert(debug.getupvalue(rawget, 1) == nil)
+assert(select('#', debug.getupvalue(rawget, 1)) == 0)
+assert(select('#', debug.getupvalue(rawget, 99)) == 0)
+assert(debug.setupvalue(rawget, 1, 1) == nil)
+assert(select('#', debug.setupvalue(rawget, 1, 1)) == 0)
+assert(debug.upvalueid(rawget, 1) == nil)
 return true";
     assert!(ok(src));
 }
