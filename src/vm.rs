@@ -183,6 +183,9 @@ enum Pending {
         err: Value,
         handler: Option<Value>,
     },
+    /// A message handler errored while handling an error: deliver PUC's
+    /// `false, "error in error handling"` at the protected call's slots.
+    DeliverErrErr { ret_to: usize, nres: u8 },
     /// Final step of a return that had to run `__close` handlers first.
     FinishReturn { start: usize, count: usize },
     /// Final step of a tail call into a native/intrinsic: the callee's
@@ -209,6 +212,9 @@ struct Frame {
     protected: bool,
     /// xpcall message handler.
     handler: Option<Value>,
+    /// This frame is an xpcall message handler: if it errors, PUC reports
+    /// `error in error handling` instead of propagating.
+    handler_guard: bool,
     pending: Vec<Pending>,
     /// Registers holding active to-be-closed variables (ascending).
     tbc: Vec<u8>,
@@ -632,6 +638,7 @@ impl Lua {
             shape: RetShape::Normal,
             protected: false,
             handler: None,
+            handler_guard: false,
             pending: Vec::new(),
             tbc: Vec::new(),
             varargs: Vec::new(),
@@ -1610,12 +1617,21 @@ impl Lua {
             // below an existing frame), but fail safe
             return Err(e);
         };
-        below.pending.push(Pending::DeliverError {
-            ret_to: pf.ret_to,
-            nres: pf.nres,
-            err: errv,
-            handler: pf.handler,
-        });
+        if pf.handler_guard {
+            // The error came from a message handler: PUC reports
+            // "error in error handling" rather than running another handler.
+            below.pending.push(Pending::DeliverErrErr {
+                ret_to: pf.ret_to,
+                nres: pf.nres,
+            });
+        } else {
+            below.pending.push(Pending::DeliverError {
+                ret_to: pf.ret_to,
+                nres: pf.nres,
+                err: errv,
+                handler: pf.handler,
+            });
+        }
         // outermost closes are pushed first so the innermost pops first
         for v in to_close.into_iter().rev() {
             below.pending.push(Pending::CallClose { v, err: errv });
@@ -1654,9 +1670,48 @@ impl Lua {
                         place_results(th, ret_to, nres, &[Value::Bool(false), err]);
                     }
                     Some(h) => {
-                        self.call_value(th, h, &[err], ret_to, nres, RetShape::PrependFalse, fuel)?;
+                        // Run the message handler under its own protection so
+                        // that an error *inside* it (e.g. a stack overflow
+                        // while it recurses) reports PUC's "error in error
+                        // handling" instead of escaping the xpcall.
+                        let before = th.frames.len();
+                        let wb = scratch_base(th);
+                        ensure_len(&mut th.stack, wb + 2);
+                        th.stack[wb] = h;
+                        th.stack[wb + 1] = err;
+                        let r = self.do_call(
+                            th,
+                            fuel,
+                            CallSpec {
+                                func_abs: wb,
+                                argc: 1,
+                                ret_to,
+                                nres,
+                                shape: RetShape::PrependFalse,
+                                protected: true,
+                                handler: None,
+                                native_caller: true,
+                            },
+                        );
+                        match r {
+                            Ok(()) => {
+                                if th.frames.len() > before
+                                    && let Some(f) = th.frames.last_mut()
+                                {
+                                    f.handler_guard = true;
+                                }
+                            }
+                            Err(_) => {
+                                let msg = self.new_string(b"error in error handling");
+                                place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
+                            }
+                        }
                     }
                 },
+                Pending::DeliverErrErr { ret_to, nres } => {
+                    let msg = self.new_string(b"error in error handling");
+                    place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
+                }
                 Pending::FinishReturn { start, count } => {
                     let frame = th.frames.pop().unwrap();
                     self.close_upvals(th, frame.base);
@@ -2119,6 +2174,7 @@ impl Lua {
                         shape,
                         protected,
                         handler,
+                        handler_guard: false,
                         pending: Vec::new(),
                         tbc: Vec::new(),
                         varargs,
@@ -2241,6 +2297,7 @@ impl Lua {
             shape,
             protected,
             handler,
+            handler_guard: false,
             pending: Vec::new(),
             tbc: Vec::new(),
             varargs,
@@ -2782,6 +2839,7 @@ impl Lua {
                                 shape: RetShape::Normal,
                                 protected: false,
                                 handler: None,
+                                handler_guard: false,
                                 pending: Vec::new(),
                                 tbc: Vec::new(),
                                 varargs,
@@ -4119,6 +4177,7 @@ impl Lua {
                     Pending::Concat { .. }
                     | Pending::FinishReturn { .. }
                     | Pending::TailReturn { .. }
+                    | Pending::DeliverErrErr { .. }
                     | Pending::CloseStep
                     | Pending::PrintStep => {}
                 }

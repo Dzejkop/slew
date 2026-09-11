@@ -468,11 +468,16 @@ fn n_tonumber(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 pub(crate) fn parse_number(bytes: &[u8]) -> Option<Value> {
     use crate::lexer::{Lexer, Token};
     let text = std::str::from_utf8(bytes).ok()?.trim();
-    let (negate, text) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest.trim_start()),
-        None => (false, text.strip_prefix('+').unwrap_or(text).trim_start()),
+    let (negate, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
-    let mut lx = Lexer::new(text.as_bytes());
+    // PUC's `strtod`/integer scanners allow no whitespace between a sign and
+    // the digits (`tonumber("+ 0.01")` is nil).
+    if body.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut lx = Lexer::new(body.as_bytes());
     let (tok, _) = lx.next_token().ok()?;
     let (end, _) = lx.next_token().ok()?;
     if end != Token::Eof {
@@ -480,9 +485,33 @@ pub(crate) fn parse_number(bytes: &[u8]) -> Option<Value> {
     }
     let v = match tok {
         Token::Int(i) => Value::Int(if negate { i.wrapping_neg() } else { i }),
-        Token::Float(f) => Value::Float(if negate { -f } else { f }),
+        Token::Float(f) => {
+            // A decimal integer that overflows `i64` lexes as a float. PUC,
+            // however, parses the sign together with the digits and lets the
+            // magnitude reach 2^63 before wrapping, so
+            // `tonumber("-9223372036854775808")` is LUA_MININTEGER, not a
+            // float. Only the signed minimum is rescued this way; anything
+            // larger is a genuine float numeral.
+            match (negate, decimal_digits(body)) {
+                (true, Some(m)) if m <= 1u128 << 63 => Value::Int((m as u64).wrapping_neg() as i64),
+                _ => Value::Float(if negate { -f } else { f }),
+            }
+        }
         _ => return None,
     };
+    Some(v)
+}
+
+/// If `s` is a non-empty run of ASCII digits, returns its value (saturating on
+/// overflow), used to detect decimal integers just past `i64::MAX`.
+fn decimal_digits(s: &str) -> Option<u128> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut v: u128 = 0;
+    for b in s.bytes() {
+        v = v.saturating_mul(10).saturating_add((b - b'0') as u128);
+    }
     Some(v)
 }
 

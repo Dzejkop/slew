@@ -389,22 +389,17 @@ function string.gsub(s, pat, repl, maxn)
 end
 
 function table.sort(t, cmp)
-  cmp = cmp or function(a, b) return a < b end
-  local function qs(lo, hi)
+  local n = math.tointeger(#t)
+  if n == nil then
+    error("bad argument #1 to 'sort' (object length is not an integer)", 2)
+  end
+  if n > 1 then
+    if n >= 2147483647 then
+      error("bad argument #1 to 'sort' (array too big)", 2)
+    end
+    cmp = cmp or function(a, b) return a < b end
+    local function qs(lo, hi)
     while lo < hi do
-      if hi - lo < 12 then
-        -- insertion sort for small ranges
-        for i = lo + 1, hi do
-          local v = t[i]
-          local j = i - 1
-          while j >= lo and cmp(v, t[j]) do
-            t[j+1] = t[j]
-            j = j - 1
-          end
-          t[j+1] = v
-        end
-        return
-      end
       -- median-of-three pivot
       local mid = (lo + hi) // 2
       if cmp(t[mid], t[lo]) then t[lo], t[mid] = t[mid], t[lo] end
@@ -435,8 +430,9 @@ function table.sort(t, cmp)
         hi = j
       end
     end
+    end
+    qs(1, n)
   end
-  qs(1, #t)
 end
 
 -- ---- package and require ------------------------------------------------

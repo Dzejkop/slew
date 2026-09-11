@@ -3,7 +3,7 @@
 //! profiles. Embedders wanting real entropy can call `math.randomseed(n)`
 //! with a seed of their choosing.
 
-use crate::value::{float_to_exact_int, Value};
+use crate::value::{Value, float_to_exact_int};
 use crate::vm::Lua;
 
 use super::{arg, set_field};
@@ -61,7 +61,10 @@ fn int(args: &[Value], i: usize, who: &str) -> Result<i64, String> {
     match arg(args, i) {
         Value::Int(n) => Ok(n),
         Value::Float(f) => float_to_exact_int(f).ok_or_else(|| {
-            format!("bad argument #{} to '{who}' (number has no integer representation)", i + 1)
+            format!(
+                "bad argument #{} to '{who}' (number has no integer representation)",
+                i + 1
+            )
         }),
         v => Err(format!(
             "bad argument #{} to '{who}' (number expected, got {})",
@@ -128,13 +131,17 @@ fn n_atan(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `math.deg`: radians → degrees (`x / (pi/180)`).
 fn n_deg(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
-    Ok(vec![Value::Float(num(args, 0, "deg")? / RADIANS_PER_DEGREE)])
+    Ok(vec![Value::Float(
+        num(args, 0, "deg")? / RADIANS_PER_DEGREE,
+    )])
 }
 
 /// `math.rad`: degrees → radians (`x * (pi/180)`).
 fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
-    Ok(vec![Value::Float(num(args, 0, "rad")? * RADIANS_PER_DEGREE)])
+    Ok(vec![Value::Float(
+        num(args, 0, "rad")? * RADIANS_PER_DEGREE,
+    )])
 }
 
 fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -173,13 +180,23 @@ fn n_fmod(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 fn n_modf(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "modf")?;
     let ip = x.trunc();
-    Ok(vec![to_int_result(ip), Value::Float(if x.is_infinite() { 0.0 } else { x - ip })])
+    Ok(vec![
+        to_int_result(ip),
+        Value::Float(if x.is_infinite() { 0.0 } else { x - ip }),
+    ])
 }
 
-fn n_tointeger(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tointeger(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         v @ Value::Int(_) => v,
         Value::Float(f) => float_to_exact_int(f).map_or(Value::Nil, Value::Int),
+        // `lua_tointegerx` coerces numeric strings, including below-`i64::MIN`
+        // decimals via the shared numeral parser.
+        Value::Str(id) => match super::parse_number(lua.strings.get(id)) {
+            Some(Value::Int(i)) => Value::Int(i),
+            Some(Value::Float(f)) => float_to_exact_int(f).map_or(Value::Nil, Value::Int),
+            _ => Value::Nil,
+        },
         _ => Value::Nil,
     }])
 }
@@ -194,7 +211,9 @@ fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn minmax(args: &[Value], who: &str, want_max: bool) -> Result<Vec<Value>, String> {
     if args.is_empty() {
-        return Err(format!("bad argument #1 to '{who}' (number expected, got no value)"));
+        return Err(format!(
+            "bad argument #1 to '{who}' (number expected, got no value)"
+        ));
     }
     let mut best = args[0];
     for (i, &v) in args.iter().enumerate() {
@@ -239,7 +258,9 @@ fn n_random(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     match (arg(args, 0), arg(args, 1)) {
         (Value::Nil, _) => {
             // float in [0, 1)
-            Ok(vec![Value::Float((r >> 11) as f64 * (1.0 / (1u64 << 53) as f64))])
+            Ok(vec![Value::Float(
+                (r >> 11) as f64 * (1.0 / (1u64 << 53) as f64),
+            )])
         }
         (_, Value::Nil) => {
             let m = int(args, 0, "random")?;
@@ -255,7 +276,11 @@ fn n_random(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
                 return Err("bad argument #2 to 'random' (interval is empty)".into());
             }
             let range = hi.wrapping_sub(lo) as u64;
-            let off = if range == u64::MAX { r } else { r % (range + 1) };
+            let off = if range == u64::MAX {
+                r
+            } else {
+                r % (range + 1)
+            };
             Ok(vec![Value::Int(lo.wrapping_add(off as i64))])
         }
     }
@@ -270,7 +295,7 @@ fn n_randomseed(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!(
                 "bad argument #1 to 'randomseed' (number expected, got {})",
                 v.type_name()
-            ))
+            ));
         }
     };
     lua.seed_random(seed);
