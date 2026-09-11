@@ -178,14 +178,21 @@ through a capability the embedder installs explicitly.
 - `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
   supported.
 - `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the
-  upvalue API, and the metatable bypass). Two deviations follow from the
+  upvalue API, and the metatable bypass). One deviation follows from the
   architecture: prelude stdlib functions (e.g. `pairs`, `ipairs`,
   `table.sort`) are Lua closures carrying an `_ENV` upvalue, so
   `debug.getinfo` reports `what == "Lua"` for them instead of `"C"` and
-  `debug.upvaluejoin` treats them like any closure; and
-  there is no C-frame model for `pcall`/`coroutine.yield`, so traceback's C
-  frames, level 0 on a suspended coroutine, and `getinfo` level 0 differ
-  from PUC.
+  `debug.upvaluejoin` treats them like any closure.
+- Synthetic C frames are modelled for the `pcall`/`xpcall` boundaries: they
+  occupy a level with `what == "C"`, `currentline == -1`, `source == "=[C]"`,
+  and `name` (`"pcall"`/`"xpcall"`), so `debug.getinfo`/`debug.traceback`
+  match PUC while a `__close` handler runs during unwinding. A
+  `coroutine.close` C frame is also modelled (PUC reports no frame for a
+  close handler it drives), giving `what == "C"` there. The
+  `coroutine.yield`/`resume` boundaries are *not* modelled, so level 0 of a
+  suspended coroutine still names the yielding Lua frame (where PUC reports
+  the C `yield` frame), and PUC's `metamethod 'close'` frame naming is not
+  yet implemented.
 - `next` iteration order is stable per table state but not PUC's; per-call
   cost is O(n) (acceptable until tables move to an insertion-ordered map).
 

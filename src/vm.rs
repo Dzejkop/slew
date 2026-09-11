@@ -202,7 +202,7 @@ enum Pending {
     PrintStep,
 }
 
-struct Frame {
+struct LuaFrame {
     closure: ClosId,
     proto: Rc<Proto>,
     pc: usize,
@@ -225,6 +225,82 @@ struct Frame {
     varargs: Vec<Value>,
     /// True if this frame was entered via a proper tail call.
     tailcall: bool,
+}
+
+/// A synthetic C-level frame: a VM boundary (pcall/xpcall/coroutine.close)
+/// reported by `debug.getinfo`/`traceback` with `what == "C"`. It has no
+/// bytecode to run; it exists only to occupy a level and to carry the
+/// `__close`/error-delivery continuations of the protected call it guards.
+struct CFrame {
+    /// The C function this frame reports (`getinfo(...).func`).
+    func: Value,
+    /// `getinfo(...).name` and `namewhat` (e.g. `"pcall"`/`"global"`).
+    name: &'static str,
+    namewhat: &'static str,
+    /// First stack slot safely above the caller's live data (scratch base at
+    /// push time); used while this frame is the innermost frame.
+    base: usize,
+    /// `__close`/error-delivery continuations staged on this boundary.
+    pending: Vec<Pending>,
+}
+
+enum Frame {
+    Lua(LuaFrame),
+    C(CFrame),
+}
+
+impl Frame {
+    fn as_lua(&self) -> &LuaFrame {
+        match self {
+            Frame::Lua(f) => f,
+            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+        }
+    }
+
+    fn as_lua_mut(&mut self) -> &mut LuaFrame {
+        match self {
+            Frame::Lua(f) => f,
+            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+        }
+    }
+
+    fn is_c(&self) -> bool {
+        matches!(self, Frame::C(_))
+    }
+
+    fn lua(&self) -> Option<&LuaFrame> {
+        match self {
+            Frame::Lua(f) => Some(f),
+            Frame::C(_) => None,
+        }
+    }
+
+    /// Whether this frame is an error-protection boundary. C frames are never
+    /// boundaries themselves; their protected callee carries the flag.
+    fn is_protected(&self) -> bool {
+        self.lua().is_some_and(|f| f.protected)
+    }
+
+    fn pending(&self) -> &[Pending] {
+        match self {
+            Frame::Lua(f) => &f.pending,
+            Frame::C(f) => &f.pending,
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut Vec<Pending> {
+        match self {
+            Frame::Lua(f) => &mut f.pending,
+            Frame::C(f) => &mut f.pending,
+        }
+    }
+}
+
+/// Description of a synthetic C frame to push at a protected-call boundary.
+struct CSpec {
+    name: &'static str,
+    namewhat: &'static str,
+    func: Value,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -478,6 +554,8 @@ pub struct Lua {
 /// been closed. Driven by [`Pending::CloseStep`].
 struct CloseJob {
     target: ThreadId,
+    /// The `coroutine.close` C function, for the synthetic close frame.
+    func: Value,
     /// Values to close, innermost-first.
     items: Vec<Value>,
     idx: usize,
@@ -659,7 +737,7 @@ impl Lua {
             ..Default::default()
         };
         th.stack.resize(chunk.proto.max_regs as usize, Value::Nil);
-        th.frames.push(Frame {
+        th.frames.push(Frame::Lua(LuaFrame {
             closure: cid,
             proto: chunk.proto.clone(),
             pc: 0,
@@ -674,7 +752,7 @@ impl Lua {
             tbc: Vec::new(),
             varargs: Vec::new(),
             tailcall: false,
-        });
+        }));
         let tid = self.alloc_thread(th);
         // GC root for as long as the execution is live
         self.exec_roots.insert(tid.0, tid.0);
@@ -1136,6 +1214,13 @@ impl Lua {
                 let func = self.debug_getinfo_fn();
                 self.fill_native_info(tid, func, what);
             }
+            LevelFrame::C {
+                func,
+                name,
+                namewhat,
+            } => {
+                self.fill_c_info(tid, func, name, namewhat, what);
+            }
             LevelFrame::Lua {
                 proto,
                 pc,
@@ -1192,29 +1277,58 @@ impl Lua {
             frames.len() - 1 - level
         };
         let fr = frames.get(idx)?;
-        let name = if idx > 0 {
-            let caller = &frames[idx - 1];
-            caller
-                .proto
-                .call_names
-                .get(caller.pc.wrapping_sub(1))
-                .cloned()
-                .flatten()
-        } else {
-            None
-        };
-        Some(LevelFrame::Lua {
-            proto: fr.proto.clone(),
-            pc: fr.pc,
-            closure: fr.closure,
-            tailcall: fr.tailcall,
-            name,
-        })
+        match fr {
+            Frame::C(cf) => Some(LevelFrame::C {
+                func: cf.func,
+                name: cf.name,
+                namewhat: cf.namewhat,
+            }),
+            Frame::Lua(lf) => {
+                let name = if idx > 0 {
+                    frames[idx - 1].lua().and_then(|caller| {
+                        caller
+                            .proto
+                            .call_names
+                            .get(caller.pc.wrapping_sub(1))
+                            .cloned()
+                            .flatten()
+                    })
+                } else {
+                    None
+                };
+                Some(LevelFrame::Lua {
+                    proto: lf.proto.clone(),
+                    pc: lf.pc,
+                    closure: lf.closure,
+                    tailcall: lf.tailcall,
+                    name,
+                })
+            }
+        }
     }
 
     fn info_set(&mut self, tid: TableId, name: &str, v: Value) {
         let k = self.new_string(name.as_bytes());
         self.tables[tid.0 as usize].set(k, v).unwrap();
+    }
+
+    /// C-boundary frame info: the same shape as a native function, but with
+    /// the call-site name PUC reports (`name`/`namewhat`).
+    fn fill_c_info(
+        &mut self,
+        tid: TableId,
+        func: Value,
+        name: &'static str,
+        namewhat: &'static str,
+        what: &[u8],
+    ) {
+        self.fill_native_info(tid, func, what);
+        if what.contains(&b'n') {
+            let nv = self.new_string(name.as_bytes());
+            self.info_set(tid, "name", nv);
+            let nw = self.new_string(namewhat.as_bytes());
+            self.info_set(tid, "namewhat", nw);
+        }
     }
 
     fn fill_native_info(&mut self, tid: TableId, func: Value, what: &[u8]) {
@@ -1371,9 +1485,9 @@ impl Lua {
             out.push('\n');
         }
         out.push_str("stack traceback:");
-        // Level 0 is the running frame of `target`; for the current thread
-        // (no C-frame model) it behaves like level 1. A level past the stack
-        // shows no frames at all (PUC `luaL_traceback`).
+        // Level 0 is the running frame of `target`; for the current thread it
+        // behaves like level 1. Synthetic C frames occupy their own level, as
+        // in PUC. A level past the stack shows no frames (PUC `luaL_traceback`).
         let first = if current {
             frames.len().checked_sub(level.max(1) as usize)
         } else {
@@ -1383,30 +1497,42 @@ impl Lua {
             return Ok(self.new_string(out.as_bytes()));
         };
         for idx in (0..=first).rev() {
-            let fr = &frames[idx];
-            let line = fr
-                .proto
-                .lines
-                .get(fr.pc.wrapping_sub(1))
-                .copied()
-                .unwrap_or(0);
-            let src = short_source(&fr.proto.source);
-            out.push_str(&format!("\n\t{src}:{line}: in "));
-            let name = if idx > 0 {
-                let caller = &frames[idx - 1];
-                caller
-                    .proto
-                    .call_names
-                    .get(caller.pc.wrapping_sub(1))
-                    .cloned()
-                    .flatten()
-            } else {
-                None
-            };
-            match name {
-                Some((nw, nm)) => out.push_str(&format!("function '{nm}' ({nw})")),
-                None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
-                None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
+            match &frames[idx] {
+                Frame::C(cf) => {
+                    out.push_str("\n\t[C]: in ");
+                    if cf.name.is_empty() {
+                        out.push('?');
+                    } else {
+                        out.push_str(&format!("function '{}'", cf.name));
+                    }
+                }
+                Frame::Lua(fr) => {
+                    let line = fr
+                        .proto
+                        .lines
+                        .get(fr.pc.wrapping_sub(1))
+                        .copied()
+                        .unwrap_or(0);
+                    let src = short_source(&fr.proto.source);
+                    out.push_str(&format!("\n\t{src}:{line}: in "));
+                    let name = if idx > 0 {
+                        frames[idx - 1].lua().and_then(|caller| {
+                            caller
+                                .proto
+                                .call_names
+                                .get(caller.pc.wrapping_sub(1))
+                                .cloned()
+                                .flatten()
+                        })
+                    } else {
+                        None
+                    };
+                    match name {
+                        Some((nw, nm)) => out.push_str(&format!("function '{nm}' ({nw})")),
+                        None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
+                        None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
+                    }
+                }
             }
         }
         Ok(self.new_string(out.as_bytes()))
@@ -1595,8 +1721,13 @@ impl Lua {
                         // errors the frames are already gone and the
                         // dispatcher's `root_line` stands)
                         if root_line.is_none() && th.parent.is_none() {
-                            root_line =
-                                Some(th.frames.first().map(frame_line).unwrap_or(e.root_line));
+                            root_line = Some(
+                                th.frames
+                                    .first()
+                                    .and_then(|f| f.lua())
+                                    .map(frame_line)
+                                    .unwrap_or(e.root_line),
+                            );
                         }
                         // error escaped this thread entirely; close its open
                         // upvalues (closures may outlive the thread) and kill it
@@ -1686,7 +1817,12 @@ impl Lua {
                     // capture the script's own call site before `recover`
                     // pops the frames it unwinds
                     if e.root_line == 0 {
-                        e.root_line = th.frames.first().map(frame_line).unwrap_or(0);
+                        e.root_line = th
+                            .frames
+                            .first()
+                            .and_then(|f| f.lua())
+                            .map(frame_line)
+                            .unwrap_or(0);
                     }
                     self.recover(th, e)?;
                 }
@@ -1713,14 +1849,14 @@ impl Lua {
             // newest error object to the remaining handlers and the final
             // delivery. Fold it in and resume.
             let staged = th.frames.last().is_some_and(|f| {
-                f.pending
+                f.pending()
                     .iter()
                     .any(|p| matches!(p, Pending::DeliverError { .. }))
             });
             if staged {
                 let new_err = self.err_value(&e);
                 let f = th.frames.last_mut().unwrap();
-                for p in f.pending.iter_mut() {
+                for p in f.pending_mut().iter_mut() {
                     match p {
                         Pending::CallClose { err, .. } | Pending::DeliverError { err, .. } => {
                             *err = new_err;
@@ -1732,23 +1868,26 @@ impl Lua {
                 // (nested inside the failing handler) close first, with the
                 // same newest error.
                 for v in to_close.into_iter().rev() {
-                    f.pending.push(Pending::CallClose { v, err: new_err });
+                    f.pending_mut().push(Pending::CallClose { v, err: new_err });
                 }
                 return Ok(());
             }
             match th.frames.last() {
                 None => return Err(e),
-                Some(f) if f.protected => break,
+                Some(f) if f.is_protected() => break,
                 Some(_) => {
                     let f = th.frames.pop().unwrap();
-                    for &r in f.tbc.iter().rev() {
-                        to_close.push(th.stack[f.base + r as usize]);
+                    if let Frame::Lua(lf) = &f {
+                        for &r in lf.tbc.iter().rev() {
+                            to_close.push(th.stack[lf.base + r as usize]);
+                        }
+                        self.close_upvals(th, lf.base);
                     }
-                    self.close_upvals(th, f.base);
                 }
             }
         }
         let pf = th.frames.pop().unwrap();
+        let pf = pf.as_lua();
         for &r in pf.tbc.iter().rev() {
             to_close.push(th.stack[pf.base + r as usize]);
         }
@@ -1762,12 +1901,12 @@ impl Lua {
         if pf.handler_guard {
             // The error came from a message handler: PUC reports
             // "error in error handling" rather than running another handler.
-            below.pending.push(Pending::DeliverErrErr {
+            below.pending_mut().push(Pending::DeliverErrErr {
                 ret_to: pf.ret_to,
                 nres: pf.nres,
             });
         } else {
-            below.pending.push(Pending::DeliverError {
+            below.pending_mut().push(Pending::DeliverError {
                 ret_to: pf.ret_to,
                 nres: pf.nres,
                 err: errv,
@@ -1776,7 +1915,9 @@ impl Lua {
         }
         // outermost closes are pushed first so the innermost pops first
         for v in to_close.into_iter().rev() {
-            below.pending.push(Pending::CallClose { v, err: errv });
+            below
+                .pending_mut()
+                .push(Pending::CallClose { v, err: errv });
         }
         Ok(())
     }
@@ -1788,10 +1929,19 @@ impl Lua {
         fuel: &mut i64,
     ) -> Result<Flow, VmError> {
         *fuel -= 1;
+        // A synthetic C frame whose continuations have all run is finished:
+        // pop it so the Lua frame below (owner of the protected call's result
+        // slots) resumes. C frames are only ever the innermost frame while
+        // they carry continuations.
+        while th.frames.last().is_some_and(|f| f.is_c())
+            && th.frames.last().unwrap().pending().is_empty()
+        {
+            th.frames.pop();
+        }
         // run continuations (e.g. a concat interrupted by a metamethod call,
         // staged __close handlers) before fetching the next instruction
-        if !th.frames.last().unwrap().pending.is_empty() {
-            let p = th.frames.last_mut().unwrap().pending.pop().unwrap();
+        if !th.frames.last().unwrap().pending().is_empty() {
+            let p = th.frames.last_mut().unwrap().pending_mut().pop().unwrap();
             match p {
                 Pending::Concat { dst, base, n } => self.concat_run(th, fuel, dst, base, n)?,
                 Pending::CloseTbc { from, err } => self.run_close_tbc(th, fuel, from, err)?,
@@ -1838,9 +1988,9 @@ impl Lua {
                         match r {
                             Ok(()) => {
                                 if th.frames.len() > before
-                                    && let Some(f) = th.frames.last_mut()
+                                    && let Some(Frame::Lua(lf)) = th.frames.last_mut()
                                 {
-                                    f.handler_guard = true;
+                                    lf.handler_guard = true;
                                 }
                             }
                             Err(_) => {
@@ -1856,6 +2006,7 @@ impl Lua {
                 }
                 Pending::FinishReturn { start, count } => {
                     let frame = th.frames.pop().unwrap();
+                    let frame = frame.as_lua();
                     self.close_upvals(th, frame.base);
                     if th.frames.is_empty() {
                         let vals = th.stack[start..start + count].to_vec();
@@ -1863,11 +2014,12 @@ impl Lua {
                         th.top = 0;
                         return Ok(Flow::Finished(vals));
                     }
-                    deliver_return(th, &frame, start, count);
+                    deliver_return(th, frame, start, count);
                 }
                 Pending::TailReturn { start } => {
                     let count = th.top.saturating_sub(start);
                     let frame = th.frames.pop().unwrap();
+                    let frame = frame.as_lua();
                     self.close_upvals(th, frame.base);
                     if th.frames.is_empty() {
                         let vals = th.stack[start..start + count].to_vec();
@@ -1875,7 +2027,7 @@ impl Lua {
                         th.top = 0;
                         return Ok(Flow::Finished(vals));
                     }
-                    deliver_return(th, &frame, start, count);
+                    deliver_return(th, frame, start, count);
                 }
                 Pending::CloseStep => self.close_step(th, fuel)?,
                 Pending::PrintStep => self.print_step(th, fuel)?,
@@ -1883,7 +2035,7 @@ impl Lua {
             return Ok(Flow::Continue);
         }
         let (instr, base) = {
-            let f = th.frames.last_mut().unwrap();
+            let f = th.frames.last_mut().unwrap().as_lua_mut();
             let i = f.proto.code[f.pc];
             f.pc += 1;
             (i, f.base)
@@ -1993,7 +2145,7 @@ impl Lua {
                                 } else {
                                     None
                                 };
-                                let f = th.frames.last().unwrap();
+                                let f = th.frames.last().unwrap().as_lua();
                                 match reg.and_then(|r| {
                                     name_for_register(
                                         &self.strings,
@@ -2072,7 +2224,7 @@ impl Lua {
                 )?;
             }
             Instr::TailCall { base: b, nargs } => {
-                let fb = th.frames.last().unwrap().base;
+                let fb = th.frames.last().unwrap().as_lua().base;
                 let func_abs = fb + b as usize;
                 let argc = if nargs == 0 {
                     th.top.saturating_sub(func_abs + 1)
@@ -2093,7 +2245,7 @@ impl Lua {
                         th.frames
                             .last_mut()
                             .unwrap()
-                            .pending
+                            .pending_mut()
                             .push(Pending::TailReturn { start: ret_slot });
                         self.call_native(
                             th,
@@ -2111,17 +2263,17 @@ impl Lua {
                 }
             }
             Instr::Return { base: b, n } => {
-                if !th.frames.last().unwrap().tbc.is_empty() {
+                if !th.frames.last().unwrap().as_lua().tbc.is_empty() {
                     // run __close handlers before completing the return;
                     // snapshot the value window now (closes may clobber top)
-                    let fb = th.frames.last().unwrap().base;
+                    let fb = th.frames.last().unwrap().as_lua().base;
                     let start = fb + b as usize;
                     let count = if n == 0 {
                         th.top.saturating_sub(start)
                     } else {
                         (n - 1) as usize
                     };
-                    let f = th.frames.last_mut().unwrap();
+                    let f = th.frames.last_mut().unwrap().as_lua_mut();
                     f.pending.push(Pending::FinishReturn { start, count });
                     f.pending.push(Pending::CloseTbc {
                         from: 0,
@@ -2130,6 +2282,7 @@ impl Lua {
                     return Ok(Flow::Continue);
                 }
                 let frame = th.frames.pop().unwrap();
+                let frame = frame.as_lua();
                 self.close_upvals(th, frame.base);
                 let start = frame.base + b as usize;
                 let count = if n == 0 {
@@ -2143,10 +2296,11 @@ impl Lua {
                     th.top = 0;
                     return Ok(Flow::Finished(vals));
                 }
-                deliver_return(th, &frame, start, count);
+                deliver_return(th, frame, start, count);
             }
             Instr::Vararg { dst, n } => {
-                let varargs = std::mem::take(&mut th.frames.last_mut().unwrap().varargs);
+                let varargs =
+                    std::mem::take(&mut th.frames.last_mut().unwrap().as_lua_mut().varargs);
                 let first = base + dst as usize;
                 if n == 0 {
                     ensure_len(&mut th.stack, first + varargs.len());
@@ -2159,11 +2313,11 @@ impl Lua {
                         th.stack[first + i] = varargs.get(i).copied().unwrap_or(Value::Nil);
                     }
                 }
-                th.frames.last_mut().unwrap().varargs = varargs;
+                th.frames.last_mut().unwrap().as_lua_mut().varargs = varargs;
             }
             Instr::Closure { dst, p } => {
                 *fuel -= 2;
-                let proto = th.frames.last().unwrap().proto.protos[p as usize].clone();
+                let proto = th.frames.last().unwrap().as_lua().proto.protos[p as usize].clone();
                 let mut ups = Vec::with_capacity(proto.upvals.len());
                 for d in &proto.upvals {
                     match *d {
@@ -2172,7 +2326,7 @@ impl Lua {
                             ups.push(self.find_or_create_open(tid, th, abs));
                         }
                         UpvalDesc::Upval(i) => {
-                            let cur = th.frames.last().unwrap().closure;
+                            let cur = th.frames.last().unwrap().as_lua().closure;
                             ups.push(self.closures[cur.0 as usize].upvals[i as usize]);
                         }
                     }
@@ -2190,7 +2344,7 @@ impl Lua {
                 match v {
                     Value::Nil | Value::Bool(false) => {}
                     _ if self.metamethod(v, Mm::Close) != Value::Nil => {
-                        th.frames.last_mut().unwrap().tbc.push(reg);
+                        th.frames.last_mut().unwrap().as_lua_mut().tbc.push(reg);
                     }
                     _ => {
                         return Err(self.rt_err(
@@ -2306,7 +2460,7 @@ impl Lua {
                     for i in argc..np {
                         th.stack[new_base + i] = Value::Nil;
                     }
-                    th.frames.push(Frame {
+                    th.frames.push(Frame::Lua(LuaFrame {
                         closure: cid,
                         proto,
                         pc: 0,
@@ -2321,7 +2475,7 @@ impl Lua {
                         tbc: Vec::new(),
                         varargs,
                         tailcall: false,
-                    });
+                    }));
                     return Ok(());
                 }
                 Value::Native(nid) => {
@@ -2408,7 +2562,7 @@ impl Lua {
         func_abs: usize,
         argc: usize,
     ) -> Result<(), VmError> {
-        let old = th.frames.last().unwrap();
+        let old = th.frames.last().unwrap().as_lua();
         let fb = old.base;
         let ret_to = old.ret_to;
         let nres = old.nres;
@@ -2439,7 +2593,7 @@ impl Lua {
             th.stack[new_base + i] = Value::Nil;
         }
         th.frames.pop();
-        th.frames.push(Frame {
+        th.frames.push(Frame::Lua(LuaFrame {
             closure: cid,
             proto,
             pc: 0,
@@ -2454,7 +2608,7 @@ impl Lua {
             tbc: Vec::new(),
             varargs,
             tailcall: true,
-        });
+        }));
         Ok(())
     }
 
@@ -2532,7 +2686,7 @@ impl Lua {
                 let val = match v {
                     Value::Str(s) if level > 0 && !native_caller => {
                         let fidx = th.frames.len().saturating_sub(level as usize);
-                        let (line, src) = match th.frames.get(fidx) {
+                        let (line, src) = match th.frames.get(fidx).and_then(|f| f.lua()) {
                             Some(f) => (
                                 f.proto
                                     .lines
@@ -2541,7 +2695,14 @@ impl Lua {
                                     .unwrap_or(0),
                                 f.proto.source.clone(),
                             ),
-                            None => (line_of(th), th.frames.last().unwrap().proto.source.clone()),
+                            None => (
+                                line_of(th),
+                                th.frames
+                                    .last()
+                                    .and_then(|f| f.lua())
+                                    .map(|f| f.proto.source.clone())
+                                    .unwrap_or_default(),
+                            ),
                         };
                         let msg = format!("{src}:{line}: {}", self.strings.get_str_lossy(s));
                         self.new_string(msg.as_bytes())
@@ -2571,7 +2732,10 @@ impl Lua {
                             let source = if native_caller {
                                 None
                             } else {
-                                th.frames.last().map(|f| f.proto.source.clone())
+                                th.frames
+                                    .last()
+                                    .and_then(|f| f.lua())
+                                    .map(|f| f.proto.source.clone())
                             };
                             Err(VmError {
                                 val: ErrVal::Msg("assertion failed!".into()),
@@ -2608,7 +2772,21 @@ impl Lua {
                         self.rt_err(th, "bad argument #1 to 'pcall' (value expected)".into())
                     );
                 }
-                self.protected_call(th, fuel, func_abs + 1, argc - 1, ret_to, nres, None)
+                let pcall_fn = th.stack[func_abs];
+                self.protected_call(
+                    th,
+                    fuel,
+                    func_abs + 1,
+                    argc - 1,
+                    ret_to,
+                    nres,
+                    None,
+                    Some(CSpec {
+                        name: "pcall",
+                        namewhat: "global",
+                        func: pcall_fn,
+                    }),
+                )
             }
             Intrinsic::Xpcall => {
                 if argc < 2 {
@@ -2620,13 +2798,27 @@ impl Lua {
                 // rebuild a contiguous window: [f, args...] (handler sits
                 // between f and the args in the original window)
                 let f = arg(th, 0);
+                let xpcall_fn = th.stack[func_abs];
                 let wb = scratch_base(th).max(func_abs + 1 + argc);
                 let n_args = argc - 2;
                 ensure_len(&mut th.stack, wb + 1 + n_args);
                 th.stack[wb] = f;
                 th.stack
                     .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
-                self.protected_call(th, fuel, wb, n_args, ret_to, nres, Some(handler))
+                self.protected_call(
+                    th,
+                    fuel,
+                    wb,
+                    n_args,
+                    ret_to,
+                    nres,
+                    Some(handler),
+                    Some(CSpec {
+                        name: "xpcall",
+                        namewhat: "global",
+                        func: xpcall_fn,
+                    }),
+                )
             }
             Intrinsic::Resume => {
                 let co = arg(th, 0);
@@ -2713,7 +2905,7 @@ impl Lua {
                 th.frames
                     .last_mut()
                     .unwrap()
-                    .pending
+                    .pending_mut()
                     .push(Pending::PrintStep);
                 Ok(())
             }
@@ -2731,7 +2923,8 @@ impl Lua {
                         ),
                     ));
                 };
-                self.begin_close(th, fuel, co, ret_to, nres, shape)
+                let close_fn = th.stack[func_abs];
+                self.begin_close(th, fuel, co, ret_to, nres, shape, close_fn)
             }
             Intrinsic::Running => {
                 let cur = Value::Thread(self.current_thread);
@@ -2986,7 +3179,7 @@ impl Lua {
                                 Vec::new()
                             };
                             co_th.status = CoStatus::Running;
-                            co_th.frames.push(Frame {
+                            co_th.frames.push(Frame::Lua(LuaFrame {
                                 closure: cid,
                                 proto,
                                 pc: 0,
@@ -3001,7 +3194,7 @@ impl Lua {
                                 tbc: Vec::new(),
                                 varargs,
                                 tailcall: false,
-                            });
+                            }));
                         }
                         Value::Native(nid) => {
                             // native coroutine body: cannot yield; run it to
@@ -3090,6 +3283,7 @@ impl Lua {
     /// Starts `coroutine.close(co)`. Dead-and-clean and to-be-closed-free
     /// coroutines resolve immediately; otherwise a [`CloseJob`] is installed
     /// and driven by [`Pending::CloseStep`].
+    #[allow(clippy::too_many_arguments)]
     fn begin_close(
         &mut self,
         th: &mut Thread,
@@ -3098,6 +3292,7 @@ impl Lua {
         ret_to: usize,
         nres: u8,
         shape: RetShape,
+        func: Value,
     ) -> Result<(), VmError> {
         // Closing the running/normal coroutine is an error (catchable with
         // pcall), not a `false, msg` result.
@@ -3120,6 +3315,7 @@ impl Lua {
                 {
                     let ct = &self.threads[co.0 as usize];
                     for f in ct.frames.iter().rev() {
+                        let Some(f) = f.lua() else { continue };
                         for &r in f.tbc.iter().rev() {
                             items.push(ct.stack[f.base + r as usize]);
                         }
@@ -3135,6 +3331,7 @@ impl Lua {
                 self.threads[co.0 as usize].status = CoStatus::Running;
                 self.close_job = Some(CloseJob {
                     target: co,
+                    func,
                     items,
                     idx: 0,
                     err: Value::Nil,
@@ -3148,7 +3345,7 @@ impl Lua {
                 th.frames
                     .last_mut()
                     .unwrap()
-                    .pending
+                    .pending_mut()
                     .push(Pending::CloseStep);
                 *fuel -= 1;
                 Ok(())
@@ -3178,7 +3375,7 @@ impl Lua {
                 th.frames
                     .last_mut()
                     .unwrap()
-                    .pending
+                    .pending_mut()
                     .push(Pending::CloseStep);
                 self.close_job = Some(job);
                 return Ok(());
@@ -3192,15 +3389,29 @@ impl Lua {
             ensure_len(&mut th.stack, result_slot + 2);
             job.result_slot = result_slot;
             job.awaiting = true;
+            let close_fn = job.func;
             th.frames
                 .last_mut()
                 .unwrap()
-                .pending
+                .pending_mut()
                 .push(Pending::CloseStep);
             self.close_job = Some(job);
             *fuel -= 1;
             // nres = 0 (multret) so an error's `false, err` pair both land.
-            return self.protected_call(th, fuel, scratch, 2, result_slot, 0, None);
+            return self.protected_call(
+                th,
+                fuel,
+                scratch,
+                2,
+                result_slot,
+                0,
+                None,
+                Some(CSpec {
+                    name: "coroutine.close",
+                    namewhat: "global",
+                    func: close_fn,
+                }),
+            );
         }
         // all handlers ran: kill the target and report
         self.finish_close(job.target);
@@ -3240,7 +3451,7 @@ impl Lua {
                 th.frames
                     .last_mut()
                     .unwrap()
-                    .pending
+                    .pending_mut()
                     .push(Pending::PrintStep);
                 self.print_job = Some(job);
                 // nres = 2 -> exactly one result
@@ -3291,7 +3502,21 @@ impl Lua {
         ret_to: usize,
         nres: u8,
         handler: Option<Value>,
+        c_frame: Option<CSpec>,
     ) -> Result<(), VmError> {
+        // Push the synthetic C frame *below* the protected callee: it is the
+        // boundary PUC keeps on the stack while `__close` handlers run during
+        // unwinding, so `debug.getinfo` sees it as the callee's caller.
+        if let Some(spec) = c_frame {
+            let base = scratch_base(th);
+            th.frames.push(Frame::C(CFrame {
+                func: spec.func,
+                name: spec.name,
+                namewhat: spec.namewhat,
+                base,
+                pending: Vec::new(),
+            }));
+        }
         let r = self.do_call(
             th,
             fuel,
@@ -3506,7 +3731,7 @@ impl Lua {
         err: Value,
     ) -> Result<(), VmError> {
         loop {
-            let f = th.frames.last_mut().unwrap();
+            let f = th.frames.last_mut().unwrap().as_lua_mut();
             match f.tbc.last() {
                 Some(&r) if r >= from => {
                     f.tbc.pop();
@@ -3518,7 +3743,7 @@ impl Lua {
                     th.frames
                         .last_mut()
                         .unwrap()
-                        .pending
+                        .pending_mut()
                         .push(Pending::CloseTbc { from, err });
                     let scratch = scratch_base(th);
                     return self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel);
@@ -3539,7 +3764,7 @@ impl Lua {
         b: u8,
         n: u8,
     ) -> Result<(), VmError> {
-        let base = th.frames.last().unwrap().base;
+        let base = th.frames.last().unwrap().as_lua().base;
         let first = base + b as usize;
         let mut n = n as usize;
         loop {
@@ -3590,7 +3815,7 @@ impl Lua {
                 )
             };
             if let Some(p) = pending {
-                th.frames.last_mut().unwrap().pending.push(p);
+                th.frames.last_mut().unwrap().pending_mut().push(p);
             }
             return self.call_value(th, mm, &[x, y], ret_abs, 2, RetShape::Normal, fuel);
         }
@@ -3795,7 +4020,7 @@ impl Lua {
     }
 
     fn frame_upval(&self, th: &Thread, up: u8) -> UpvalId {
-        let cur = th.frames.last().unwrap().closure;
+        let cur = th.frames.last().unwrap().as_lua().closure;
         self.closures[cur.0 as usize].upvals[up as usize]
     }
 
@@ -3847,7 +4072,11 @@ impl Lua {
     }
 
     fn rt_err(&self, th: &Thread, message: String) -> VmError {
-        let source = th.frames.last().map(|f| f.proto.source.clone());
+        let source = th
+            .frames
+            .last()
+            .and_then(|f| f.lua())
+            .map(|f| f.proto.source.clone());
         VmError {
             val: ErrVal::Msg(message),
             line: line_of(th),
@@ -3912,7 +4141,7 @@ impl Lua {
             let discard = scratch + 2;
             ensure_len(&mut th.stack, discard + 2);
             let frames_before = th.frames.len();
-            self.protected_call(th, fuel, scratch, 1, discard, 0, None)?;
+            self.protected_call(th, fuel, scratch, 1, discard, 0, None, None)?;
             // A Lua-closure handler pushes a frame that is still running when
             // `protected_call` returns, so hold the depth guard until it
             // unwinds. A native handler (e.g. the file `__gc`) runs to
@@ -3944,7 +4173,7 @@ impl Lua {
                     + th.frames.len() * 192
                     + th.frames
                         .iter()
-                        .map(|f| f.varargs.len() * 16)
+                        .map(|f| f.lua().map_or(0, |l| l.varargs.len() * 16))
                         .sum::<usize>();
             }
         }
@@ -4417,55 +4646,36 @@ impl Lua {
             // current instruction's extent are dead temporaries, and gaps left
             // by popped/tail-replaced frames stay unmarked.
             for f in &th.frames {
-                let end = (f.base + frame_reg_extent(f)).min(stack_len);
-                if f.base < end {
-                    work.extend_from_slice(&th.stack[f.base..end]);
-                }
-                work.push(Value::Closure(f.closure));
-                if let Some(h) = f.handler {
-                    work.push(h);
-                }
-                for &v in &f.varargs {
-                    work.push(v);
-                }
-                for p in &f.pending {
-                    match *p {
-                        Pending::CallClose { v, err } => {
+                match f {
+                    Frame::Lua(lf) => {
+                        let end = (lf.base + frame_reg_extent(lf)).min(stack_len);
+                        if lf.base < end {
+                            work.extend_from_slice(&th.stack[lf.base..end]);
+                        }
+                        work.push(Value::Closure(lf.closure));
+                        if let Some(h) = lf.handler {
+                            work.push(h);
+                        }
+                        for &v in &lf.varargs {
                             work.push(v);
-                            work.push(err);
                         }
-                        Pending::DeliverError { err, handler, .. } => {
-                            work.push(err);
-                            if let Some(h) = handler {
-                                work.push(h);
-                            }
-                        }
-                        Pending::CloseTbc { err, .. } => work.push(err),
-                        // Return values staged above the register window must
-                        // survive while their `__close` handlers run.
-                        Pending::FinishReturn { start, count } => {
-                            let end = (start + count).min(stack_len);
-                            if start < end {
-                                work.extend_from_slice(&th.stack[start..end]);
-                            }
-                        }
-                        Pending::TailReturn { start } => {
-                            let end = th.top.min(stack_len);
-                            if start < end {
-                                work.extend_from_slice(&th.stack[start..end]);
-                            }
-                        }
-                        Pending::Concat { .. }
-                        | Pending::DeliverErrErr { .. }
-                        | Pending::CloseStep
-                        | Pending::PrintStep => {}
+                        mark_pending(&lf.pending, th, work, stack_len);
+                    }
+                    Frame::C(cf) => {
+                        work.push(cf.func);
+                        mark_pending(&cf.pending, th, work, stack_len);
                     }
                 }
             }
             // A native/intrinsic call that triggered the collection may hold
             // open multret arguments above the top frame's window.
             if extra_top > 0 {
-                let start = th.frames.last().map(|f| f.base).unwrap_or(0);
+                let start = th
+                    .frames
+                    .last()
+                    .and_then(|f| f.lua())
+                    .map(|f| f.base)
+                    .unwrap_or(0);
                 let end = extra_top.min(stack_len);
                 if start < end {
                     work.extend_from_slice(&th.stack[start..end]);
@@ -4573,6 +4783,43 @@ struct Marks {
     upvals: Vec<bool>,
     threads: Vec<bool>,
     userdata: Vec<bool>,
+}
+
+/// Marks the values reachable only from a frame's staged continuations.
+fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_len: usize) {
+    for p in pending {
+        match *p {
+            Pending::CallClose { v, err } => {
+                work.push(v);
+                work.push(err);
+            }
+            Pending::DeliverError { err, handler, .. } => {
+                work.push(err);
+                if let Some(h) = handler {
+                    work.push(h);
+                }
+            }
+            Pending::CloseTbc { err, .. } => work.push(err),
+            // Return values staged above the register window must survive
+            // while their `__close` handlers run.
+            Pending::FinishReturn { start, count } => {
+                let end = (start + count).min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::TailReturn { start } => {
+                let end = th.top.min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::Concat { .. }
+            | Pending::DeliverErrErr { .. }
+            | Pending::CloseStep
+            | Pending::PrintStep => {}
+        }
+    }
 }
 
 fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
@@ -4685,7 +4932,7 @@ impl Execution {
     /// run next, for debuggers and tracers. `None` once it has finished.
     pub fn current_location(&self, lua: &Lua) -> Option<(String, u32)> {
         let th = lua.threads.get(self.current.0 as usize)?;
-        let f = th.frames.last()?;
+        let f = th.frames.iter().rev().find_map(|f| f.lua())?;
         let line = f.proto.lines.get(f.pc).copied().unwrap_or(0);
         Some((f.proto.source.to_string(), line))
     }
@@ -4693,10 +4940,15 @@ impl Execution {
 
 // ---- free helpers ----
 
-/// A resolved `debug.getinfo` level: either the running C function (current
-/// thread level 0) or a Lua frame's snapshot.
+/// A resolved `debug.getinfo` level: the running C function (current thread
+/// level 0), a synthetic C boundary frame, or a Lua frame's snapshot.
 enum LevelFrame {
     Native,
+    C {
+        func: Value,
+        name: &'static str,
+        namewhat: &'static str,
+    },
     Lua {
         proto: Rc<Proto>,
         pc: usize,
@@ -4793,21 +5045,26 @@ fn name_for_register(
 }
 
 fn kval(th: &Thread, k: u16) -> Value {
-    th.frames.last().unwrap().proto.consts[k as usize]
+    th.frames.last().unwrap().as_lua().proto.consts[k as usize]
 }
 
 fn jump(th: &mut Thread, off: i32) {
-    let f = th.frames.last_mut().unwrap();
+    let f = th.frames.last_mut().unwrap().as_lua_mut();
     f.pc = (f.pc as i64 + off as i64) as usize;
 }
 
 fn line_of(th: &Thread) -> u32 {
-    let Some(f) = th.frames.last() else { return 0 };
-    frame_line(f)
+    // When a synthetic C frame is innermost, report its caller's Lua line.
+    th.frames
+        .iter()
+        .rev()
+        .find_map(|f| f.lua())
+        .map(frame_line)
+        .unwrap_or(0)
 }
 
 /// Source line the frame's next instruction belongs to.
-fn frame_line(f: &Frame) -> u32 {
+fn frame_line(f: &LuaFrame) -> u32 {
     f.proto
         .lines
         .get(f.pc.wrapping_sub(1))
@@ -4825,7 +5082,7 @@ fn ensure_len(stack: &mut Vec<Value>, len: usize) {
 /// currently executing. `pc` points at the *next* instruction, so the live one
 /// is `pc - 1`. Slots at or above the returned extent are dead temporaries and
 /// must not be treated as roots.
-fn frame_reg_extent(f: &Frame) -> usize {
+fn frame_reg_extent(f: &LuaFrame) -> usize {
     if f.pc == 0 {
         // Frame pushed but not yet executing (or a chunk that has not run
         // yet): nothing above the declared window can be live.
@@ -4849,9 +5106,11 @@ fn frame_reg_extent(f: &Frame) -> usize {
 /// so repeated metamethod calls reuse the same scratch space instead of
 /// growing the stack.
 fn scratch_base(th: &Thread) -> usize {
-    let f = th.frames.last().unwrap();
-    let frame_top = f.base + f.proto.max_regs as usize;
-    frame_top.max(th.top)
+    match th.frames.last().unwrap() {
+        Frame::Lua(f) => (f.base + f.proto.max_regs as usize).max(th.top),
+        // A synthetic C frame keeps the scratch base recorded at push time.
+        Frame::C(c) => c.base.max(th.top),
+    }
 }
 
 fn is_concatable(v: Value) -> bool {
@@ -4896,7 +5155,7 @@ fn place_shaped(th: &mut Thread, ret_to: usize, nres: u8, shape: RetShape, res: 
 
 /// Delivers a returning Lua frame's values (in `stack[start..start+count]`)
 /// to its caller per the frame's shape and expected count.
-fn deliver_return(th: &mut Thread, frame: &Frame, start: usize, count: usize) {
+fn deliver_return(th: &mut Thread, frame: &LuaFrame, start: usize, count: usize) {
     let ret_to = frame.ret_to;
     match frame.shape {
         RetShape::Normal => {
