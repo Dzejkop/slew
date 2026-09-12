@@ -6,7 +6,10 @@ fn ok(src: &str) -> Block {
 }
 
 fn fails(src: &str) {
-    assert!(parse(src.as_bytes()).is_err(), "expected parse error: {src}");
+    assert!(
+        parse(src.as_bytes()).is_err(),
+        "expected parse error: {src}"
+    );
 }
 
 #[test]
@@ -31,7 +34,7 @@ fn statements() {
 #[test]
 fn expressions() {
     ok("x = nil or false or true and 1");
-    ok("x = -2 ^ 2");  // -(2^2)
+    ok("x = -2 ^ 2"); // -(2^2)
     ok("x = a .. b .. c");
     ok("x = 1 + 2 * 3 - 4 / 5 // 6 % 7");
     ok("x = a < b or a > c or a <= d or a >= e or a ~= f or a == g");
@@ -60,21 +63,45 @@ fn table_constructors() {
 fn operator_precedence_shape() {
     // 1 + 2 * 3 parses as 1 + (2 * 3)
     let b = ok("x = 1 + 2 * 3");
-    let Stmt::Assign { values, .. } = &b.stmts[0] else { panic!() };
-    let Expr::BinOp { op: BinOp::Add, rhs, .. } = &values[0] else {
+    let Stmt::Assign { values, .. } = &b.stmts[0] else {
+        panic!()
+    };
+    let Expr::BinOp {
+        op: BinOp::Add,
+        rhs,
+        ..
+    } = &values[0]
+    else {
         panic!("expected Add at root")
     };
     assert!(matches!(**rhs, Expr::BinOp { op: BinOp::Mul, .. }));
 
     // a .. b .. c is right-associative: a .. (b .. c)
     let b = ok("x = a .. b .. c");
-    let Stmt::Assign { values, .. } = &b.stmts[0] else { panic!() };
-    let Expr::BinOp { op: BinOp::Concat, rhs, .. } = &values[0] else { panic!() };
-    assert!(matches!(**rhs, Expr::BinOp { op: BinOp::Concat, .. }));
+    let Stmt::Assign { values, .. } = &b.stmts[0] else {
+        panic!()
+    };
+    let Expr::BinOp {
+        op: BinOp::Concat,
+        rhs,
+        ..
+    } = &values[0]
+    else {
+        panic!()
+    };
+    assert!(matches!(
+        **rhs,
+        Expr::BinOp {
+            op: BinOp::Concat,
+            ..
+        }
+    ));
 
     // -2 ^ 2 is -(2 ^ 2)
     let b = ok("x = -2 ^ 2");
-    let Stmt::Assign { values, .. } = &b.stmts[0] else { panic!() };
+    let Stmt::Assign { values, .. } = &b.stmts[0] else {
+        panic!()
+    };
     assert!(matches!(&values[0], Expr::UnOp { op: UnOp::Neg, .. }));
 }
 
@@ -82,7 +109,9 @@ fn operator_precedence_shape() {
 fn method_sugar() {
     // function a:m() end gets implicit self
     let b = ok("function a:m(x) end");
-    let Stmt::Function { body, .. } = &b.stmts[0] else { panic!() };
+    let Stmt::Function { body, .. } = &b.stmts[0] else {
+        panic!()
+    };
     assert_eq!(&*body.params[0], "self");
     assert_eq!(&*body.params[1], "x");
 }

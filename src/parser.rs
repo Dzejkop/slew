@@ -1,6 +1,6 @@
 //! Recursive-descent parser for the full Lua 5.4 grammar.
 
-use crate::ast::*;
+use crate::ast::{Attrib, BinOp, Block, Expr, FuncBody, Stmt, UnOp};
 use crate::lexer::{LexError, Lexer, Token};
 use std::fmt;
 
@@ -25,10 +25,16 @@ impl From<LexError> for ParseError {
     }
 }
 
+/// Parses a full chunk of Lua source into a [`Block`].
+///
+/// # Errors
+///
+/// Returns a [`ParseError`] if the source cannot be lexed or does not conform
+/// to the Lua 5.4 grammar, including trailing tokens after the chunk's block.
 pub fn parse(src: &[u8]) -> Result<Block, ParseError> {
     let mut p = Parser::new(src)?;
     let block = p.block()?;
-    p.expect_token(Token::Eof)?;
+    p.expect_token(&Token::Eof)?;
     Ok(block)
 }
 
@@ -40,7 +46,10 @@ struct Parser<'a> {
 
 /// (left, right) binding powers; right < left means right-associative.
 fn binop_prec(op: BinOp) -> (u8, u8) {
-    use BinOp::*;
+    use BinOp::{
+        Add, And, BAnd, BOr, BXor, Concat, Div, Eq, Ge, Gt, IDiv, Le, Lt, Mod, Mul, Ne, Or, Pow,
+        Shl, Shr, Sub,
+    };
     match op {
         Or => (1, 1),
         And => (2, 2),
@@ -124,8 +133,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_token(&mut self, tok: Token) -> Result<(), ParseError> {
-        if self.tok == tok {
+    fn expect_token(&mut self, tok: &Token) -> Result<(), ParseError> {
+        if self.tok == *tok {
             self.advance()?;
             Ok(())
         } else {
@@ -205,27 +214,27 @@ impl<'a> Parser<'a> {
             Token::DoubleColon => {
                 self.advance()?;
                 let name = self.expect_name()?;
-                self.expect_token(Token::DoubleColon)?;
+                self.expect_token(&Token::DoubleColon)?;
                 Ok(Stmt::Label(name, line))
             }
             Token::Do => {
                 self.advance()?;
                 let body = self.block()?;
-                self.expect_token(Token::End)?;
+                self.expect_token(&Token::End)?;
                 Ok(Stmt::Do(body))
             }
             Token::While => {
                 self.advance()?;
                 let cond = self.expr()?;
-                self.expect_token(Token::Do)?;
+                self.expect_token(&Token::Do)?;
                 let body = self.block()?;
-                self.expect_token(Token::End)?;
+                self.expect_token(&Token::End)?;
                 Ok(Stmt::While { cond, body })
             }
             Token::Repeat => {
                 self.advance()?;
                 let body = self.block()?;
-                self.expect_token(Token::Until)?;
+                self.expect_token(&Token::Until)?;
                 let cond = self.expr()?;
                 Ok(Stmt::Repeat { body, cond })
             }
@@ -242,7 +251,7 @@ impl<'a> Parser<'a> {
         loop {
             self.advance()?; // 'if' / 'elseif'
             let cond = self.expr()?;
-            self.expect_token(Token::Then)?;
+            self.expect_token(&Token::Then)?;
             let body = self.block()?;
             arms.push((cond, body));
             if self.tok != Token::Elseif {
@@ -254,7 +263,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect_token(Token::End)?;
+        self.expect_token(&Token::End)?;
         Ok(Stmt::If { arms, else_block })
     }
 
@@ -264,16 +273,16 @@ impl<'a> Parser<'a> {
         let first = self.expect_name()?;
         if self.check(&Token::Assign)? {
             let start = self.expr()?;
-            self.expect_token(Token::Comma)?;
+            self.expect_token(&Token::Comma)?;
             let end = self.expr()?;
             let step = if self.check(&Token::Comma)? {
                 Some(self.expr()?)
             } else {
                 None
             };
-            self.expect_token(Token::Do)?;
+            self.expect_token(&Token::Do)?;
             let body = self.block()?;
-            self.expect_token(Token::End)?;
+            self.expect_token(&Token::End)?;
             Ok(Stmt::NumericFor {
                 var: first,
                 start,
@@ -287,11 +296,11 @@ impl<'a> Parser<'a> {
             while self.check(&Token::Comma)? {
                 vars.push(self.expect_name()?);
             }
-            self.expect_token(Token::In)?;
+            self.expect_token(&Token::In)?;
             let exprs = self.expr_list()?;
-            self.expect_token(Token::Do)?;
+            self.expect_token(&Token::Do)?;
             let body = self.block()?;
-            self.expect_token(Token::End)?;
+            self.expect_token(&Token::End)?;
             Ok(Stmt::GenericFor {
                 vars,
                 exprs,
@@ -347,7 +356,7 @@ impl<'a> Parser<'a> {
             let name = self.expect_name()?;
             let attrib = if self.check(&Token::Lt)? {
                 let a = self.expect_name()?;
-                self.expect_token(Token::Gt)?;
+                self.expect_token(&Token::Gt)?;
                 match &*a {
                     "const" => Attrib::Const,
                     "close" => Attrib::Close,
@@ -387,7 +396,7 @@ impl<'a> Parser<'a> {
                     return self.err("syntax error: cannot assign to this expression");
                 }
             }
-            self.expect_token(Token::Assign)?;
+            self.expect_token(&Token::Assign)?;
             let values = self.expr_list()?;
             Ok(Stmt::Assign {
                 targets,
@@ -403,7 +412,7 @@ impl<'a> Parser<'a> {
     }
 
     fn func_body(&mut self, line: u32) -> Result<FuncBody, ParseError> {
-        self.expect_token(Token::LParen)?;
+        self.expect_token(&Token::LParen)?;
         let mut params = Vec::new();
         let mut is_vararg = false;
         if self.tok != Token::RParen {
@@ -422,10 +431,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.expect_token(Token::RParen)?;
+        self.expect_token(&Token::RParen)?;
         let body = self.block()?;
         let end_line = self.line; // line of the closing `end`
-        self.expect_token(Token::End)?;
+        self.expect_token(&Token::End)?;
         Ok(FuncBody {
             params,
             is_vararg,
@@ -553,7 +562,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// primaryexp { '.' Name | '[' exp ']' | ':' Name args | args }
+    /// `primaryexp { '.' Name | '[' exp ']' | ':' Name args | args }`
     fn suffixed_expr(&mut self) -> Result<Expr, ParseError> {
         let line = self.line;
         let mut e = match &self.tok {
@@ -561,7 +570,7 @@ impl<'a> Parser<'a> {
             Token::LParen => {
                 self.advance()?;
                 let inner = self.expr()?;
-                self.expect_token(Token::RParen)?;
+                self.expect_token(&Token::RParen)?;
                 Expr::Paren(Box::new(inner))
             }
             _ => return self.err(format!("unexpected symbol near {}", self.near())),
@@ -581,7 +590,7 @@ impl<'a> Parser<'a> {
                 Token::LBracket => {
                     self.advance()?;
                     let key = self.expr()?;
-                    self.expect_token(Token::RBracket)?;
+                    self.expect_token(&Token::RBracket)?;
                     e = Expr::Index {
                         obj: Box::new(e),
                         key: Box::new(key),
@@ -621,7 +630,7 @@ impl<'a> Parser<'a> {
                 } else {
                     self.expr_list()?
                 };
-                self.expect_token(Token::RParen)?;
+                self.expect_token(&Token::RParen)?;
                 Ok(args)
             }
             Token::Str(_) => {
@@ -637,7 +646,7 @@ impl<'a> Parser<'a> {
 
     fn table_constructor(&mut self) -> Result<Expr, ParseError> {
         let line = self.line;
-        self.expect_token(Token::LBrace)?;
+        self.expect_token(&Token::LBrace)?;
         let mut items = Vec::new();
         let mut pairs = Vec::new();
         while self.tok != Token::RBrace {
@@ -645,8 +654,8 @@ impl<'a> Parser<'a> {
                 Token::LBracket => {
                     self.advance()?;
                     let k = self.expr()?;
-                    self.expect_token(Token::RBracket)?;
-                    self.expect_token(Token::Assign)?;
+                    self.expect_token(&Token::RBracket)?;
+                    self.expect_token(&Token::Assign)?;
                     let v = self.expr()?;
                     pairs.push((k, v));
                 }
@@ -665,7 +674,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.expect_token(Token::RBrace)?;
+        self.expect_token(&Token::RBrace)?;
         Ok(Expr::Table { items, pairs, line })
     }
 

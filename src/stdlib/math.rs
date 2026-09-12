@@ -146,36 +146,35 @@ fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     )])
 }
 
+// `log2`/`log10` are selected only for the exact bases 2.0 and 10.0; an
+// epsilon comparison would change behavior for other bases.
+#[allow(clippy::float_cmp)]
 fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "log")?;
-    Ok(vec![Value::Float(match arg(args, 1) {
-        Value::Nil => x.ln(),
-        _ => {
-            let base = num(args, 1, "log")?;
-            if base == 2.0 {
-                x.log2()
-            } else if base == 10.0 {
-                x.log10()
-            } else {
-                x.ln() / base.ln()
-            }
+    Ok(vec![Value::Float(if arg(args, 1) == Value::Nil {
+        x.ln()
+    } else {
+        let base = num(args, 1, "log")?;
+        if base == 2.0 {
+            x.log2()
+        } else if base == 10.0 {
+            x.log10()
+        } else {
+            x.ln() / base.ln()
         }
     })])
 }
 
 fn n_fmod(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    match (arg(args, 0), arg(args, 1)) {
-        (Value::Int(a), Value::Int(b)) => {
-            if b == 0 {
-                return Err("bad argument #2 to 'fmod' (zero)".into());
-            }
-            Ok(vec![Value::Int(a.wrapping_rem(b))])
+    if let (Value::Int(a), Value::Int(b)) = (arg(args, 0), arg(args, 1)) {
+        if b == 0 {
+            return Err("bad argument #2 to 'fmod' (zero)".into());
         }
-        _ => {
-            let a = num(args, 0, "fmod")?;
-            let b = num(args, 1, "fmod")?;
-            Ok(vec![Value::Float(a % b)])
-        }
+        Ok(vec![Value::Int(a.wrapping_rem(b))])
+    } else {
+        let a = num(args, 0, "fmod")?;
+        let b = num(args, 1, "fmod")?;
+        Ok(vec![Value::Float(a % b)])
     }
 }
 
@@ -319,7 +318,7 @@ fn n_randomseed(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     // PUC. slew has no ambient time authority, so it reuses its fixed default;
     // either way the returned pair fully reproduces the state.
     let (n1, n2) = if arg(args, 0) == Value::Nil {
-        (0x536c65775f5f5f31u64, 0u64)
+        (0x536c_6577_5f5f_5f31_u64, 0u64)
     } else {
         let n1 = int(args, 0, "randomseed")? as u64;
         let n2 = match arg(args, 1) {

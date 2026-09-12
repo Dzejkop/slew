@@ -38,7 +38,9 @@ fn read_confined(root: &std::path::Path, path: &str) -> Result<Option<Vec<u8>>, 
         Err(e) => return Err(format!("cannot open {}: {e}", candidate.display())),
     };
     if !real.starts_with(&root) {
-        return Err(format!("access denied: '{path}' is outside the reader root"));
+        return Err(format!(
+            "access denied: '{path}' is outside the reader root"
+        ));
     }
     match std::fs::read(&real) {
         Ok(bytes) => Ok(Some(bytes)),

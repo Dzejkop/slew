@@ -10,7 +10,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..100_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -201,7 +201,7 @@ fn memory_limit_enforced() {
     let mut exec = lua.execute(&chunk);
     let err = loop {
         match exec.step(&mut lua, 1_000_000) {
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Ok(Step::Done(_)) => panic!("expected memory error"),
             Err(Error::Runtime(e)) => break e,
             Err(e) => panic!("unexpected: {e}"),

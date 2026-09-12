@@ -31,6 +31,7 @@ pub struct StrRef {
 impl StrRef {
     /// A reference to a string already known to be canonical (interned), so its
     /// object handle also identifies its content.
+    #[must_use]
     pub const fn interned(id: StrId) -> Self {
         StrRef {
             obj: id,
@@ -91,10 +92,12 @@ pub enum Value {
 }
 
 impl Value {
+    #[must_use]
     pub fn truthy(self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
+    #[must_use]
     pub fn type_name(self) -> &'static str {
         match self {
             Value::Nil => "nil",
@@ -156,12 +159,11 @@ impl Strings {
         }
         let rc: Rc<[u8]> = s.into();
         let obj = self.alloc(rc.clone(), false);
-        let content = match self.map.get(&rc) {
-            Some(&c) => c,
-            None => {
-                self.map.insert(rc, obj);
-                obj
-            }
+        let content = if let Some(&c) = self.map.get(&rc) {
+            c
+        } else {
+            self.map.insert(rc, obj);
+            obj
         };
         StrRef { obj, content }
     }
@@ -182,17 +184,14 @@ impl Strings {
     /// Allocates a fresh object slot holding `rc`.
     fn alloc(&mut self, rc: Rc<[u8]>, fixed: bool) -> StrId {
         self.bytes += rc.len();
-        match self.free.pop() {
-            Some(slot) => {
-                self.vec[slot as usize] = Some(rc);
-                self.fixed[slot as usize] = fixed;
-                StrId(slot)
-            }
-            None => {
-                self.vec.push(Some(rc));
-                self.fixed.push(fixed);
-                StrId(self.vec.len() as u32 - 1)
-            }
+        if let Some(slot) = self.free.pop() {
+            self.vec[slot as usize] = Some(rc);
+            self.fixed[slot as usize] = fixed;
+            StrId(slot)
+        } else {
+            self.vec.push(Some(rc));
+            self.fixed.push(fixed);
+            StrId(self.vec.len() as u32 - 1)
         }
     }
 
@@ -202,6 +201,9 @@ impl Strings {
     }
 
     /// Returns the bytes of a string, given either an object or content handle.
+    ///
+    /// # Panics
+    /// Panics if `id` is a stale [`StrId`] that no longer refers to a live string.
     pub fn get(&self, id: impl Into<StrId>) -> &[u8] {
         let id = id.into();
         self.vec[id.0 as usize].as_deref().expect("stale StrId")
@@ -211,19 +213,23 @@ impl Strings {
         String::from_utf8_lossy(self.get(id))
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.vec.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.vec.is_empty()
     }
 
+    #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
     /// Number of live (unswept) string objects.
+    #[must_use]
     pub fn live_count(&self) -> usize {
         self.vec.iter().filter(|slot| slot.is_some()).count()
     }
@@ -269,6 +275,10 @@ pub enum HKey {
 }
 
 /// Converts a value to a table key per Lua 5.4 rules.
+///
+/// # Errors
+/// Returns an error if `v` is [`Value::Nil`] or a NaN float, neither of which
+/// is a valid table key.
 pub fn to_key(v: Value) -> Result<HKey, &'static str> {
     Ok(match v {
         Value::Nil => return Err("table index is nil"),
@@ -293,8 +303,9 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
 }
 
 /// `Some(i)` iff `f` represents exactly the integer `i` (in i64 range).
+#[must_use]
 pub fn float_to_exact_int(f: f64) -> Option<i64> {
-    if f.fract() == 0.0 && (-9.223372036854776e18..9.223372036854776e18).contains(&f) {
+    if f.fract() == 0.0 && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&f) {
         Some(f as i64)
     } else {
         None
@@ -327,6 +338,7 @@ pub struct Table {
 }
 
 impl Table {
+    #[must_use]
     pub fn get(&self, key: Value) -> Value {
         let Ok(k) = to_key(key) else {
             return Value::Nil;
@@ -344,6 +356,10 @@ impl Table {
         self.hash.get(&k).copied().unwrap_or(Value::Nil)
     }
 
+    /// Sets `key` to `value`.
+    ///
+    /// # Errors
+    /// Returns an error if `key` is not a valid table key (nil or NaN).
     pub fn set(&mut self, key: Value, value: Value) -> Result<(), &'static str> {
         let k = to_key(key)?;
         if let HKey::Int(i) = k {
@@ -377,13 +393,14 @@ impl Table {
     }
 
     /// The `#` operator: a border of the table.
+    #[must_use]
     pub fn length(&self) -> i64 {
         let n = self.array.len();
         if n > 0 && self.array[n - 1] == Value::Nil {
             // binary search for a border within the array part
             let (mut i, mut j) = (0usize, n);
             while j - i > 1 {
-                let m = (i + j) / 2;
+                let m = usize::midpoint(i, j);
                 if self.array[m - 1] == Value::Nil {
                     j = m;
                 } else {
@@ -438,6 +455,7 @@ impl Table {
     }
 
     /// Rough heap footprint in bytes, for memory budgeting.
+    #[must_use]
     pub fn mem_estimate(&self) -> usize {
         64 + self.array.capacity() * 16
             + self.hash.capacity() * 48
@@ -453,6 +471,9 @@ impl Table {
     /// base library turns into an "invalid key to 'next'" error. A key that
     /// was removed is still locatable (its `order` slot is a tombstone), so
     /// deleting the current key mid-iteration is safe.
+    ///
+    /// # Errors
+    /// Returns [`InvalidKey`] when `key` was never in the table.
     pub fn next_after(&self, key: Option<HKey>) -> Result<Option<(Value, Value)>, InvalidKey> {
         let mut all = self.iter_keys();
         if let Some(prev) = key {
@@ -491,6 +512,7 @@ impl Table {
     }
 }
 
+#[must_use]
 pub fn key_to_value(k: HKey) -> Value {
     match k {
         HKey::Int(i) => Value::Int(i),
@@ -506,6 +528,11 @@ pub fn key_to_value(k: HKey) -> Value {
 }
 
 /// Formats a finite, non-zero float like C's `%.<prec>g`.
+///
+/// # Panics
+/// Panics if the internal scientific-notation formatting of `x` lacks an
+/// exponent, which cannot happen for the finite, non-zero floats reaching it.
+#[must_use]
 pub fn fmt_g(x: f64, prec: usize) -> String {
     if x.is_nan() {
         return "nan".into();
@@ -548,6 +575,7 @@ pub fn fmt_g(x: f64, prec: usize) -> String {
 
 /// Formats a float like Lua 5.4's `%.14g`, with the trailing `.0` added when
 /// the result would otherwise look like an integer.
+#[must_use]
 pub fn fmt_float(x: f64) -> String {
     if x == 0.0 {
         return "0.0".into();
@@ -560,6 +588,7 @@ pub fn fmt_float(x: f64) -> String {
 }
 
 /// Formats a number for `tostring`/concatenation.
+#[must_use]
 pub fn fmt_number(v: Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),

@@ -5,6 +5,8 @@
 //! it records a request ([`crate::Lua::take_exit_request`]) and raises a
 //! controlled error the embedder can observe.
 
+use std::fmt::Write as _;
+
 use crate::host::{DateParts, HostError};
 use crate::value::Value;
 use crate::vm::Lua;
@@ -33,7 +35,7 @@ pub(super) fn install(lua: &mut Lua) {
     set_field(lua, os, "exit", exit);
 }
 
-fn err_return(lua: &mut Lua, e: HostError) -> Vec<Value> {
+fn err_return(lua: &mut Lua, e: &HostError) -> Vec<Value> {
     let msg = lua.new_string(e.message.as_bytes());
     vec![Value::Nil, msg, Value::Int(e.errno as i64)]
 }
@@ -47,9 +49,8 @@ fn n_clock(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn table_field(lua: &Lua, t: Value, name: &str) -> Value {
-    let key = match lua.strings.lookup(name.as_bytes()) {
-        Some(id) => id,
-        None => return Value::Nil,
+    let Some(key) = lua.strings.lookup(name.as_bytes()) else {
+        return Value::Nil;
     };
     lua.table_get(t, Value::Str(key))
 }
@@ -176,43 +177,73 @@ fn strftime(p: &DateParts, fmt: &[u8]) -> Result<String, String> {
             b'A' => out.push_str(WDAY_FULL[wday]),
             b'b' | b'h' => out.push_str(MON_ABBR[(p.month - 1).clamp(0, 11) as usize]),
             b'B' => out.push_str(MON_FULL[(p.month - 1).clamp(0, 11) as usize]),
-            b'c' => out.push_str(&format!(
-                "{} {} {:2} {:02}:{:02}:{:02} {}",
-                WDAY_ABBR[wday],
-                MON_ABBR[(p.month - 1).clamp(0, 11) as usize],
-                p.day,
-                p.hour,
-                p.min,
-                p.sec,
-                p.year
-            )),
-            b'd' => out.push_str(&format!("{:02}", p.day)),
-            b'e' => out.push_str(&format!("{:2}", p.day)),
-            b'H' => out.push_str(&format!("{:02}", p.hour)),
+            b'c' => {
+                let _ = write!(
+                    out,
+                    "{} {} {:2} {:02}:{:02}:{:02} {}",
+                    WDAY_ABBR[wday],
+                    MON_ABBR[(p.month - 1).clamp(0, 11) as usize],
+                    p.day,
+                    p.hour,
+                    p.min,
+                    p.sec,
+                    p.year
+                );
+            }
+            b'd' => {
+                let _ = write!(out, "{:02}", p.day);
+            }
+            b'e' => {
+                let _ = write!(out, "{:2}", p.day);
+            }
+            b'H' => {
+                let _ = write!(out, "{:02}", p.hour);
+            }
             b'I' => {
                 let h = p.hour % 12;
-                out.push_str(&format!("{:02}", if h == 0 { 12 } else { h }));
+                let _ = write!(out, "{:02}", if h == 0 { 12 } else { h });
             }
-            b'j' => out.push_str(&format!("{:03}", p.yday)),
-            b'm' => out.push_str(&format!("{:02}", p.month)),
-            b'M' => out.push_str(&format!("{:02}", p.min)),
+            b'j' => {
+                let _ = write!(out, "{:03}", p.yday);
+            }
+            b'm' => {
+                let _ = write!(out, "{:02}", p.month);
+            }
+            b'M' => {
+                let _ = write!(out, "{:02}", p.min);
+            }
             b'p' => out.push_str(if p.hour < 12 { "AM" } else { "PM" }),
-            b'S' => out.push_str(&format!("{:02}", p.sec)),
-            b'U' => out.push_str(&format!("{:02}", (yday0 + 7 - p.wday.rem_euclid(7)) / 7)),
-            b'w' => out.push_str(&format!("{}", p.wday.rem_euclid(7))),
+            b'S' => {
+                let _ = write!(out, "{:02}", p.sec);
+            }
+            b'U' => {
+                let _ = write!(out, "{:02}", (yday0 + 7 - p.wday.rem_euclid(7)) / 7);
+            }
+            b'w' => {
+                let _ = write!(out, "{}", p.wday.rem_euclid(7));
+            }
             b'W' => {
                 let mon = (p.wday.rem_euclid(7) + 6) % 7;
-                out.push_str(&format!("{:02}", (yday0 + 7 - mon) / 7));
+                let _ = write!(out, "{:02}", (yday0 + 7 - mon) / 7);
             }
-            b'x' => out.push_str(&format!(
-                "{:02}/{:02}/{:02}",
-                p.month,
-                p.day,
-                p.year.rem_euclid(100)
-            )),
-            b'X' => out.push_str(&format!("{:02}:{:02}:{:02}", p.hour, p.min, p.sec)),
-            b'y' => out.push_str(&format!("{:02}", p.year.rem_euclid(100))),
-            b'Y' => out.push_str(&format!("{}", p.year)),
+            b'x' => {
+                let _ = write!(
+                    out,
+                    "{:02}/{:02}/{:02}",
+                    p.month,
+                    p.day,
+                    p.year.rem_euclid(100)
+                );
+            }
+            b'X' => {
+                let _ = write!(out, "{:02}:{:02}:{:02}", p.hour, p.min, p.sec);
+            }
+            b'y' => {
+                let _ = write!(out, "{:02}", p.year.rem_euclid(100));
+            }
+            b'Y' => {
+                let _ = write!(out, "{}", p.year);
+            }
             b'Z' => out.push_str("UTC"),
             b'%' => out.push('%'),
             _ => return Err(format!("invalid conversion specifier '%{}'", c as char)),
@@ -331,7 +362,7 @@ fn fs_call(
     };
     match result {
         Ok(()) => Ok(vec![Value::Bool(true)]),
-        Err(e) => Ok(err_return(lua, e)),
+        Err(e) => Ok(err_return(lua, &e)),
     }
 }
 
@@ -350,7 +381,7 @@ fn n_tmpname(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
     };
     match name {
         Ok(n) => Ok(vec![lua.new_string(n.as_bytes())]),
-        Err(e) => Ok(err_return(lua, e)),
+        Err(e) => Ok(err_return(lua, &e)),
     }
 }
 
@@ -383,8 +414,7 @@ fn n_setlocale(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn n_exit(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let code = match arg(args, 0) {
-        Value::Nil => 0,
-        Value::Bool(true) => 0,
+        Value::Nil | Value::Bool(true) => 0,
         Value::Bool(false) => 1,
         Value::Int(i) => i,
         Value::Float(f) => f as i64,

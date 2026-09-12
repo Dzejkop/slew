@@ -353,10 +353,10 @@ mod tests {
     #[test]
     fn encode_roundtrip() {
         let mut buf = Vec::new();
-        utf8_encode(0x10FFFF, &mut buf);
+        utf8_encode(0x0010_FFFF, &mut buf);
         assert_eq!(buf, vec![0xF4, 0x8F, 0xBF, 0xBF]);
         buf.clear();
-        utf8_encode(0x7FFFFFFF, &mut buf);
+        utf8_encode(0x7FFF_FFFF, &mut buf);
         assert_eq!(buf, vec![0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]);
     }
 

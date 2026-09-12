@@ -177,6 +177,7 @@ pub enum Expr {
 
 impl Expr {
     /// True for expressions that can produce multiple values in tail position.
+    #[must_use]
     pub fn is_multret(&self) -> bool {
         matches!(
             self,

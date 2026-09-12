@@ -31,9 +31,8 @@ pub(super) fn build_file_metatable(lua: &mut Lua) -> crate::value::TableId {
     }
 
     let meta = lua.new_table();
-    let meta_id = match meta {
-        Value::Table(id) => id,
-        _ => unreachable!(),
+    let Value::Table(meta_id) = meta else {
+        unreachable!()
     };
     let name = lua.new_string(b"FILE*");
     set_field(lua, meta, "__name", name);
@@ -97,7 +96,7 @@ pub(super) fn run_prelude(lua: &mut Lua) {
     loop {
         match exec.step(lua, 10_000_000) {
             Ok(crate::vm::Step::Done(_)) => break,
-            Ok(crate::vm::Step::Pending) => continue,
+            Ok(crate::vm::Step::Pending) => {}
             Err(e) => panic!("io prelude failed: {e}"),
         }
     }
@@ -116,7 +115,7 @@ pub(super) fn new_file(lua: &mut Lua, object: HostObject, meta: crate::value::Ta
 }
 
 /// `nil, "message", errno` return shape used by `io.open` etc.
-fn open_failure(lua: &mut Lua, e: HostError) -> Vec<Value> {
+fn open_failure(lua: &mut Lua, e: &HostError) -> Vec<Value> {
     let msg = lua.new_string(e.message.as_bytes());
     vec![Value::Nil, msg, Value::Int(e.errno as i64)]
 }
@@ -445,12 +444,11 @@ fn do_read(lua: &mut Lua, uid: UserdataId, fmts: &[Value]) -> Result<Vec<Value>,
         return Ok(results);
     }
     for &fmt in fmts {
-        match read_one(lua, uid, fmt)? {
-            Some(v) => results.push(v),
-            None => {
-                results.push(Value::Nil);
-                break;
-            }
+        if let Some(v) = read_one(lua, uid, fmt)? {
+            results.push(v);
+        } else {
+            results.push(Value::Nil);
+            break;
         }
     }
     Ok(results)
@@ -471,7 +469,7 @@ fn n_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         match v {
             Value::Str(id) => bytes.extend_from_slice(lua.strings.get(id)),
             Value::Int(_) | Value::Float(_) => {
-                bytes.extend_from_slice(crate::value::fmt_number(v).as_bytes())
+                bytes.extend_from_slice(crate::value::fmt_number(v).as_bytes());
             }
             other => {
                 return Err(format!(
@@ -483,7 +481,7 @@ fn n_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         }
     }
     if let Err(e) = write_handle(lua, uid, &bytes) {
-        return Ok(open_failure(lua, e));
+        return Ok(open_failure(lua, &e));
     }
     Ok(vec![args[0]])
 }
@@ -551,13 +549,18 @@ fn n_seek(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let result = match obj {
         HostObject::File(handle) => match lua.host.as_mut() {
             Some(h) => h.seek(handle, whence, offset),
-            None => return Ok(open_failure(lua, HostError::new("io library has no host"))),
+            None => return Ok(open_failure(lua, &HostError::new("io library has no host"))),
         },
-        _ => return Ok(open_failure(lua, HostError::new("cannot seek this stream"))),
+        _ => {
+            return Ok(open_failure(
+                lua,
+                &HostError::new("cannot seek this stream"),
+            ));
+        }
     };
     match result {
         Ok(pos) => Ok(vec![Value::Int(pos as i64)]),
-        Err(e) => Ok(open_failure(lua, e)),
+        Err(e) => Ok(open_failure(lua, &e)),
     }
 }
 
@@ -590,7 +593,7 @@ fn n_flush(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         && let Some(h) = lua.host.as_mut()
         && let Err(e) = h.flush(handle)
     {
-        return Ok(open_failure(lua, e));
+        return Ok(open_failure(lua, &e));
     }
     Ok(vec![args[0]])
 }
@@ -611,7 +614,7 @@ fn n_setvbuf(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         && let Some(h) = lua.host.as_mut()
         && let Err(e) = h.setvbuf(handle, &mode, size)
     {
-        return Ok(open_failure(lua, e));
+        return Ok(open_failure(lua, &e));
     }
     Ok(vec![args[0]])
 }
@@ -670,13 +673,13 @@ fn n_open(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let mode_str = String::from_utf8_lossy(&mode).into_owned();
     let file_meta = lua.file_meta.expect("file metatable");
     let Some(h) = lua.host.as_mut() else {
-        return Ok(open_failure(lua, HostError::new("io library has no host")));
+        return Ok(open_failure(lua, &HostError::new("io library has no host")));
     };
     match h.open(&path_str, &mode_str) {
         Ok(handle) => Ok(vec![new_file(lua, HostObject::File(handle), file_meta)]),
         Err(mut e) => {
             e.message = format!("{path_str}: {}", e.message);
-            Ok(open_failure(lua, e))
+            Ok(open_failure(lua, &e))
         }
     }
 }
@@ -704,7 +707,7 @@ fn n_io_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         match v {
             Value::Str(id) => bytes.extend_from_slice(lua.strings.get(id)),
             Value::Int(_) | Value::Float(_) => {
-                bytes.extend_from_slice(crate::value::fmt_number(v).as_bytes())
+                bytes.extend_from_slice(crate::value::fmt_number(v).as_bytes());
             }
             other => {
                 return Err(format!(
@@ -716,7 +719,7 @@ fn n_io_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         }
     }
     if let Err(e) = write_handle(lua, uid, &bytes) {
-        return Ok(open_failure(lua, e));
+        return Ok(open_failure(lua, &e));
     }
     Ok(vec![Value::Userdata(uid)])
 }
@@ -826,22 +829,22 @@ fn n_tmpfile(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
     let file_meta = lua.file_meta.expect("file metatable");
     let name = {
         let Some(h) = lua.host.as_mut() else {
-            return Ok(open_failure(lua, HostError::new("io library has no host")));
+            return Ok(open_failure(lua, &HostError::new("io library has no host")));
         };
         h.tmpname()
     };
     let name = match name {
         Ok(n) => n,
-        Err(e) => return Ok(open_failure(lua, e)),
+        Err(e) => return Ok(open_failure(lua, &e)),
     };
     let opened = {
         let Some(h) = lua.host.as_mut() else {
-            return Ok(open_failure(lua, HostError::new("io library has no host")));
+            return Ok(open_failure(lua, &HostError::new("io library has no host")));
         };
         h.open(&name, "w+")
     };
     match opened {
         Ok(handle) => Ok(vec![new_file(lua, HostObject::File(handle), file_meta)]),
-        Err(e) => Ok(open_failure(lua, e)),
+        Err(e) => Ok(open_failure(lua, &e)),
     }
 }

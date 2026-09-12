@@ -10,7 +10,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..10_000 {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -39,7 +39,7 @@ fn run_err(src: &str) -> String {
     loop {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => return e.to_string(),
         }
     }
@@ -270,7 +270,7 @@ fn coroutine_suspends_on_fuel_and_resumes() {
     loop {
         match exec.step(&mut lua, 1_000).unwrap() {
             Step::Done(vals) => {
-                assert_eq!(vals, vec![Value::Int(100000)]);
+                assert_eq!(vals, vec![Value::Int(100_000)]);
                 break;
             }
             Step::Pending => {

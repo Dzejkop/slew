@@ -38,6 +38,12 @@ enum CapLen {
 }
 
 /// Finds the first match of `pat` in `src` at or after `init` (0-based).
+///
+/// # Errors
+///
+/// Returns an error if the pattern is malformed, e.g. it has an unfinished
+/// capture, references an invalid capture index, or nests beyond the
+/// matcher's recursion limit.
 pub fn find(src: &[u8], pat: &[u8], init: usize) -> Result<Option<Match>, String> {
     if init > src.len() {
         return Ok(None);
@@ -46,7 +52,12 @@ pub fn find(src: &[u8], pat: &[u8], init: usize) -> Result<Option<Match>, String
         Some(b'^') => (true, 1),
         _ => (false, 0),
     };
-    let mut ms = MatchState { src, pat, caps: Vec::new(), depth: 0 };
+    let mut ms = MatchState {
+        src,
+        pat,
+        caps: Vec::new(),
+        depth: 0,
+    };
     let mut s = init;
     loop {
         ms.caps.clear();
@@ -61,7 +72,11 @@ pub fn find(src: &[u8], pat: &[u8], init: usize) -> Result<Option<Match>, String
                     CapLen::Unfinished => Err("unfinished capture".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Some(Match { start: s, end, captures }));
+            return Ok(Some(Match {
+                start: s,
+                end,
+                captures,
+            }));
         }
         if anchored || s >= src.len() {
             return Ok(None);
@@ -70,7 +85,7 @@ pub fn find(src: &[u8], pat: &[u8], init: usize) -> Result<Option<Match>, String
     }
 }
 
-impl<'a> MatchState<'a> {
+impl MatchState<'_> {
     /// Attempts to match `pat[p..]` at `src[s..]`; returns the end position.
     fn do_match(&mut self, mut s: usize, mut p: usize) -> Result<Option<usize>, String> {
         self.depth += 1;
@@ -100,16 +115,14 @@ impl<'a> MatchState<'a> {
                     return Ok(if *s == self.src.len() { Some(*s) } else { None });
                 }
                 L_ESC => match self.pat.get(*p + 1) {
-                    Some(b'b') => {
-                        match self.match_balance(*s, *p + 2)? {
-                            Some(ns) => {
-                                *s = ns;
-                                *p += 4;
-                                continue;
-                            }
-                            None => return Ok(None),
+                    Some(b'b') => match self.match_balance(*s, *p + 2)? {
+                        Some(ns) => {
+                            *s = ns;
+                            *p += 4;
+                            continue;
                         }
-                    }
+                        None => return Ok(None),
+                    },
                     Some(b'f') => {
                         *p += 2;
                         if self.pat.get(*p) != Some(&b'[') {
@@ -126,16 +139,14 @@ impl<'a> MatchState<'a> {
                         }
                         return Ok(None);
                     }
-                    Some(c @ b'0'..=b'9') => {
-                        match self.match_capture(*s, (c - b'0') as usize)? {
-                            Some(ns) => {
-                                *s = ns;
-                                *p += 2;
-                                continue;
-                            }
-                            None => return Ok(None),
+                    Some(c @ b'0'..=b'9') => match self.match_capture(*s, (c - b'0') as usize)? {
+                        Some(ns) => {
+                            *s = ns;
+                            *p += 2;
+                            continue;
                         }
-                    }
+                        None => return Ok(None),
+                    },
                     _ => {} // fall through to default single-char matching
                 },
                 _ => {}
@@ -145,15 +156,17 @@ impl<'a> MatchState<'a> {
             let matches = self.single_match(*s, *p, ep);
             match self.pat.get(ep) {
                 Some(b'?') => {
-                    if matches
-                        && let Some(r) = self.do_match(*s + 1, ep + 1)? {
-                            return Ok(Some(r));
-                        }
+                    if matches && let Some(r) = self.do_match(*s + 1, ep + 1)? {
+                        return Ok(Some(r));
+                    }
                     *p = ep + 1;
-                    continue;
                 }
                 Some(b'+') => {
-                    return if matches { self.max_expand(*s + 1, *p, ep) } else { Ok(None) };
+                    return if matches {
+                        self.max_expand(*s + 1, *p, ep)
+                    } else {
+                        Ok(None)
+                    };
                 }
                 Some(b'*') => return self.max_expand(*s, *p, ep),
                 Some(b'-') => return self.min_expand(*s, *p, ep),
@@ -168,12 +181,7 @@ impl<'a> MatchState<'a> {
         }
     }
 
-    fn start_capture(
-        &mut self,
-        s: usize,
-        p: usize,
-        what: CapLen,
-    ) -> Result<Option<usize>, String> {
+    fn start_capture(&mut self, s: usize, p: usize, what: CapLen) -> Result<Option<usize>, String> {
         if self.caps.len() >= MAX_CAPTURES {
             return Err("too many captures".into());
         }
@@ -200,10 +208,11 @@ impl<'a> MatchState<'a> {
     }
 
     fn match_capture(&mut self, s: usize, idx: usize) -> Result<Option<usize>, String> {
-        let idx = idx.checked_sub(1).ok_or_else(|| "invalid capture index %0".to_string())?;
-        let (start, len) = match self.caps.get(idx) {
-            Some(&(start, CapLen::Len(l))) => (start, l),
-            _ => return Err(format!("invalid capture index %{}", idx + 1)),
+        let idx = idx
+            .checked_sub(1)
+            .ok_or_else(|| "invalid capture index %0".to_string())?;
+        let Some(&(start, CapLen::Len(len))) = self.caps.get(idx) else {
+            return Err(format!("invalid capture index %{}", idx + 1));
         };
         let cap = &self.src[start..start + len];
         if self.src[s..].starts_with(cap) {
@@ -304,7 +313,9 @@ impl<'a> MatchState<'a> {
     }
 
     fn single_match(&self, s: usize, p: usize, ep: usize) -> bool {
-        let Some(&c) = self.src.get(s) else { return false };
+        let Some(&c) = self.src.get(s) else {
+            return false;
+        };
         match self.pat[p] {
             b'.' => true,
             L_ESC => match_class(c, self.pat[p + 1]),
@@ -369,7 +380,9 @@ mod tests {
     use super::*;
 
     fn f(s: &str, p: &str) -> Option<(usize, usize)> {
-        find(s.as_bytes(), p.as_bytes(), 0).unwrap().map(|m| (m.start, m.end))
+        find(s.as_bytes(), p.as_bytes(), 0)
+            .unwrap()
+            .map(|m| (m.start, m.end))
     }
 
     fn cap(s: &str, p: &str, i: usize) -> String {
@@ -434,7 +447,9 @@ mod tests {
 
     #[test]
     fn date_pattern() {
-        let m = find(b"today is 2026-06-10!", b"(%d+)-(%d+)-(%d+)", 0).unwrap().unwrap();
+        let m = find(b"today is 2026-06-10!", b"(%d+)-(%d+)-(%d+)", 0)
+            .unwrap()
+            .unwrap();
         assert_eq!((m.start, m.end), (9, 19));
         assert_eq!(m.captures.len(), 3);
     }

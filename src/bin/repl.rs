@@ -8,8 +8,8 @@ use std::borrow::Cow;
 use std::io::{IsTerminal, Read};
 
 use reedline::{
-    DefaultHinter, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal,
-    ValidationResult, Validator,
+    DefaultHinter, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, ValidationResult,
+    Validator,
 };
 use slew::{Execution, Lua, Step, Value};
 
@@ -49,7 +49,7 @@ fn run_script(name: &str, src: &[u8]) {
     loop {
         match exec.step(&mut lua, 10_000_000) {
             Ok(Step::Done(_)) => return,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => {
                 eprintln!("slew: {e}");
                 std::process::exit(1);
@@ -99,9 +99,8 @@ fn repl() {
                 let exec = lua.execute(&chunk);
                 suspended = drive(&mut lua, exec, fuel);
             }
-            Ok(Signal::CtrlC) => continue,
             Ok(Signal::CtrlD) => break,
-            Ok(_) => continue, // Signal is non-exhaustive
+            Ok(_) => {} // Signal is non-exhaustive
             Err(e) => {
                 eprintln!("input error: {e}");
                 break;
@@ -115,8 +114,11 @@ fn drive(lua: &mut Lua, mut exec: Execution, fuel: u64) -> Option<Execution> {
     match exec.step(lua, fuel) {
         Ok(Step::Done(vals)) => {
             if !vals.is_empty() {
-                let line =
-                    vals.iter().map(|v| repr(lua, *v)).collect::<Vec<_>>().join("\t");
+                let line = vals
+                    .iter()
+                    .map(|v| repr(lua, *v))
+                    .collect::<Vec<_>>()
+                    .join("\t");
                 println!("{line}");
             }
             None
@@ -260,14 +262,20 @@ mod tests {
         assert!(drive(&mut lua, exec, 1_000).is_none());
         assert_eq!(lua.get_global("answer"), Value::Int(42));
         // runaway input suspends instead of hanging; :more resumes it
-        let chunk = lua.load_named("repl", "n = 0 while true do n = n + 1 end").unwrap();
+        let chunk = lua
+            .load_named("repl", "n = 0 while true do n = n + 1 end")
+            .unwrap();
         let exec = lua.execute(&chunk);
         let suspended = drive(&mut lua, exec, 5_000);
         assert!(suspended.is_some());
-        let Value::Int(n1) = lua.get_global("n") else { panic!() };
+        let Value::Int(n1) = lua.get_global("n") else {
+            panic!()
+        };
         let still = drive(&mut lua, suspended.unwrap(), 5_000);
         assert!(still.is_some());
-        let Value::Int(n2) = lua.get_global("n") else { panic!() };
+        let Value::Int(n2) = lua.get_global("n") else {
+            panic!()
+        };
         assert!(n2 > n1, "resume must make progress");
         // abandoning releases the execution
         still.unwrap().abort(&mut lua);

@@ -14,7 +14,7 @@ fn eval(lua: &mut Lua, src: &str) -> String {
                 assert!(!vals.is_empty(), "no result: {src}");
                 return lua.display_value(vals[0]);
             }
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -30,7 +30,7 @@ fn run_ok(lua: &mut Lua, src: &str) {
     for _ in 0..10_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => return,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -257,8 +257,7 @@ fn searchpath_reports_tried_files() {
 fn searchpath_finds_first_match() {
     let mut lua = Lua::new();
     lua.set_file_reader(|path| match path {
-        "a/b" => Ok(Some(Vec::new())),
-        "z/a/b.lua" => Ok(Some(Vec::new())),
+        "a/b" | "z/a/b.lua" => Ok(Some(Vec::new())),
         _ => Ok(None),
     });
     assert_eq!(

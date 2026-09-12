@@ -14,7 +14,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..100_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\n{src}"),
         }
     }
@@ -103,7 +103,7 @@ fn exit_is_a_controlled_request() {
     loop {
         match exec.step(&mut lua, 1_000_000) {
             Ok(Step::Done(_)) => panic!("os.exit should raise"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(_) => break,
         }
     }

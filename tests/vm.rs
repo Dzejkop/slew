@@ -10,7 +10,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..1000 {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -40,7 +40,7 @@ fn run_err(src: &str) -> String {
     loop {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => return e.to_string(),
         }
     }
@@ -922,7 +922,7 @@ fn runtime_error_reports_root_line() {
     let err = loop {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => break e,
         }
     };

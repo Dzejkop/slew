@@ -164,7 +164,7 @@ fn write_proto(w: &mut Writer, lua: &Lua, p: &Proto) {
 
     w.u32(p.code.len() as u32);
     for ins in &p.code {
-        write_instr(w, ins);
+        write_instr(w, *ins);
     }
 
     w.u32(p.lines.len() as u32);
@@ -240,8 +240,8 @@ fn write_const(w: &mut Writer, lua: &Lua, v: Value) {
     }
 }
 
-fn write_instr(w: &mut Writer, ins: &Instr) {
-    match *ins {
+fn write_instr(w: &mut Writer, ins: Instr) {
+    match ins {
         Instr::LoadK { dst, k } => {
             w.u8(0);
             w.u8(dst);
@@ -438,7 +438,6 @@ fn cmp_index(op: CmpOp) -> u8 {
 
 fn namewhat_index(what: &str) -> u8 {
     match what {
-        "global" => 0,
         "local" => 1,
         "upvalue" => 2,
         "method" => 3,

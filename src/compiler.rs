@@ -5,8 +5,8 @@
 //! live locals and released after each statement. Call windows (callee +
 //! args) are built from consecutive temporaries so the VM can splice frames.
 
-use crate::ast::*;
-use crate::bytecode::*;
+use crate::ast::{Attrib, BinOp, Block, Expr, FuncBody, Stmt, UnOp};
+use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
 use crate::value::{Strings, Value};
 use std::collections::HashMap;
 use std::fmt;
@@ -24,6 +24,19 @@ impl fmt::Display for CompileError {
     }
 }
 
+/// Compiles a parsed [`Block`] into a [`Proto`].
+///
+/// # Errors
+///
+/// Returns a [`CompileError`] if the block is not valid Lua, e.g. it assigns
+/// to a `<const>` local, uses `break` outside a loop, or contains an
+/// unresolved `goto`.
+///
+/// # Panics
+///
+/// Panics if the compiler's function stack is empty when the main chunk is
+/// popped; this cannot happen because the main chunk is pushed before
+/// compilation begins.
 pub fn compile(
     block: &Block,
     strings: &mut Strings,
@@ -227,7 +240,7 @@ fn enc(n: Option<usize>) -> u8 {
     n.map_or(0, |c| c as u8 + 1)
 }
 
-impl<'h> Compiler<'h> {
+impl Compiler<'_> {
     fn fs(&mut self) -> &mut FuncState {
         self.funcs.last_mut().unwrap()
     }
@@ -269,7 +282,7 @@ impl<'h> Compiler<'h> {
         let off = target as i32 - (idx as i32 + 1);
         match &mut self.fs().code[idx] {
             Instr::Jump { off: o } | Instr::Test { off: o, .. } | Instr::ForPrep { off: o, .. } => {
-                *o = off
+                *o = off;
             }
             other => unreachable!("patching non-jump {other:?}"),
         }
@@ -638,7 +651,7 @@ impl<'h> Compiler<'h> {
                 let tmp = self.alloc_reg()?;
                 self.function_to_reg(body, "function".to_string(), tmp)?;
                 let t = self.target_of(target)?;
-                self.store(t, tmp)?;
+                self.store(&t, tmp)?;
             }
             Stmt::Assign {
                 targets,
@@ -654,7 +667,7 @@ impl<'h> Compiler<'h> {
                 let base = self.fs().free_reg;
                 self.explist_to(values, targets.len())?;
                 for (i, t) in resolved.into_iter().enumerate() {
-                    self.store(t, base + i as u8)?;
+                    self.store(&t, base + i as u8)?;
                 }
                 // Drop the target-prefix temporaries: the collector scans the
                 // whole stack (including dead slots), so leaving a captured
@@ -748,12 +761,11 @@ impl<'h> Compiler<'h> {
                 let r1 = self.alloc_reg()?;
                 self.expr_to_reg(end, r1)?;
                 let r2 = self.alloc_reg()?;
-                match step {
-                    Some(e) => self.expr_to_reg(e, r2)?,
-                    None => {
-                        let k = self.const_idx(CKey::Int(1), Value::Int(1))?;
-                        self.emit(Instr::LoadK { dst: r2, k });
-                    }
+                if let Some(e) = step {
+                    self.expr_to_reg(e, r2)?;
+                } else {
+                    let k = self.const_idx(CKey::Int(1), Value::Int(1))?;
+                    self.emit(Instr::LoadK { dst: r2, k });
                 }
                 // hidden control registers are pseudo-locals (names can't collide)
                 self.declare_local("(for state)".into(), r0, Attrib::None);
@@ -961,32 +973,44 @@ impl<'h> Compiler<'h> {
         }
     }
 
-    fn store(&mut self, t: Target, src: u8) -> Result<(), CompileError> {
+    fn store(&mut self, t: &Target, src: u8) -> Result<(), CompileError> {
         match t {
             Target::Local(reg) => {
-                if reg != src {
-                    self.emit(Instr::Move { dst: reg, src });
+                if *reg != src {
+                    self.emit(Instr::Move { dst: *reg, src });
                 }
             }
             Target::Upval(up) => {
-                self.emit(Instr::SetUpval { up, src });
+                self.emit(Instr::SetUpval { up: *up, src });
             }
             Target::Global(k) => match self.env_loc() {
                 EnvLoc::Local(r) => {
-                    self.emit(Instr::SetField { obj: r, k, src });
+                    self.emit(Instr::SetField { obj: r, k: *k, src });
                 }
                 EnvLoc::Upval(up) => {
                     let tmp = self.alloc_reg()?;
                     self.emit(Instr::GetUpval { dst: tmp, up });
-                    self.emit(Instr::SetField { obj: tmp, k, src });
+                    self.emit(Instr::SetField {
+                        obj: tmp,
+                        k: *k,
+                        src,
+                    });
                     self.fs().free_reg -= 1;
                 }
             },
             Target::Index { obj, key } => {
-                self.emit(Instr::SetIndex { obj, key, src });
+                self.emit(Instr::SetIndex {
+                    obj: *obj,
+                    key: *key,
+                    src,
+                });
             }
             Target::Field { obj, k } => {
-                self.emit(Instr::SetField { obj, k, src });
+                self.emit(Instr::SetField {
+                    obj: *obj,
+                    k: *k,
+                    src,
+                });
             }
         }
         Ok(())

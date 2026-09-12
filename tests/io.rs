@@ -21,7 +21,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..100_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -34,7 +34,7 @@ fn run_err(lua: &mut Lua, src: &str) -> String {
     loop {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => return e.to_string(),
         }
     }
@@ -358,7 +358,7 @@ fn huge_read_count_is_catchable_error() {
 #[test]
 fn rawlen_userdata_error_has_argument_context() {
     let mut lua = with_host();
-    let msg = run_err(&mut lua, r#"return rawlen(io.stdin)"#);
+    let msg = run_err(&mut lua, r"return rawlen(io.stdin)");
     assert!(
         msg.contains("bad argument #1 to 'rawlen'") && msg.contains("table or string expected"),
         "got: {msg}"
@@ -455,14 +455,14 @@ fn native_file_finalizers_drain_on_collectgarbage() {
     lua.set_host(host);
 
     let src = format!(
-        r#"
+        r"
         local function make()
           local t = {{}}
           for i = 1, {N} do t[i] = assert(io.open('mock_' .. i, 'w')) end
         end
         make()
         for _ = 1, {N} * 2 do collectgarbage() end
-        "#
+        "
     );
     run(&mut lua, &src);
     assert!(

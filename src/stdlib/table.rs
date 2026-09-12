@@ -64,12 +64,12 @@ fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         let v = lua.tables[t].get(Value::Int(pos + 1));
         lua.tables[t]
             .set(Value::Int(pos), v)
-            .map_err(|e| e.to_string())?;
+            .map_err(std::string::ToString::to_string)?;
         pos += 1;
     }
     lua.tables[t]
         .set(Value::Int(pos), Value::Nil)
-        .map_err(|e| e.to_string())?;
+        .map_err(std::string::ToString::to_string)?;
     Ok(vec![removed])
 }
 
@@ -113,12 +113,12 @@ fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     for (i, v) in args.iter().enumerate() {
         lua.tables[id.0 as usize]
             .set(Value::Int(i as i64 + 1), *v)
-            .map_err(|e| e.to_string())?;
+            .map_err(std::string::ToString::to_string)?;
     }
     let n = lua.new_string(b"n");
     lua.tables[id.0 as usize]
         .set(n, Value::Int(args.len() as i64))
-        .map_err(|e| e.to_string())?;
+        .map_err(std::string::ToString::to_string)?;
     Ok(vec![t])
 }
 

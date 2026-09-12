@@ -191,6 +191,7 @@ fn keyword(s: &str) -> Option<Token> {
 }
 
 impl<'a> Lexer<'a> {
+    #[must_use]
     pub fn new(src: &'a [u8]) -> Self {
         Lexer {
             src,
@@ -284,7 +285,7 @@ impl<'a> Lexer<'a> {
     fn read_long_string(&mut self, level: usize) -> Result<Box<[u8]>, LexError> {
         // first newline is skipped
         if let Some(b'\n' | b'\r') = self.peek() {
-            self.newline()
+            self.newline();
         }
         let mut out = Vec::new();
         loop {
@@ -539,6 +540,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lexes the next token, returning it with the line it started on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LexError`] on malformed input, e.g. an unterminated string
+    /// or long bracket, or a malformed number or escape sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an identifier byte range is not valid UTF-8; the range is
+    /// built only from ASCII alphanumerics and `_`, so it always is.
     pub fn next_token(&mut self) -> Result<(Token, u32), LexError> {
         self.skip_whitespace_and_comments()?;
         let line = self.line;
@@ -778,7 +790,7 @@ mod tests {
         loop {
             match l.next_token() {
                 Ok((Token::Eof, _)) => panic!("expected lex error: {src:?}"),
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(e) => return e.message,
             }
         }
@@ -820,13 +832,13 @@ mod tests {
         assert_eq!(lex("3"), vec![Token::Int(3)]);
         assert_eq!(lex("345"), vec![Token::Int(345)]);
         assert_eq!(lex("0xff"), vec![Token::Int(255)]);
-        assert_eq!(lex("0xBEBADA"), vec![Token::Int(0xBEBADA)]);
+        assert_eq!(lex("0xBEBADA"), vec![Token::Int(0x00BE_BADA)]);
         assert_eq!(lex("3.0"), vec![Token::Float(3.0)]);
         assert_eq!(lex("3.1416"), vec![Token::Float(3.1416)]);
         assert_eq!(lex("314.16e-2"), vec![Token::Float(3.1416)]);
         assert_eq!(lex("0.31416E1"), vec![Token::Float(3.1416)]);
         assert_eq!(lex("34e1"), vec![Token::Float(340.0)]);
-        assert_eq!(lex("0x0.1E"), vec![Token::Float(0.1171875)]);
+        assert_eq!(lex("0x0.1E"), vec![Token::Float(0.117_187_5)]);
         assert_eq!(lex("0xA23p-4"), vec![Token::Float(162.1875)]);
         assert_eq!(
             lex("0X1.921FB54442D18P+1"),
@@ -835,7 +847,7 @@ mod tests {
         // decimal overflow -> float; hex overflow -> wraps
         assert_eq!(
             lex("9223372036854775808"),
-            vec![Token::Float(9.223372036854776e18)]
+            vec![Token::Float(9.223_372_036_854_776e18)]
         );
         assert_eq!(lex("0xFFFFFFFFFFFFFFFF"), vec![Token::Int(-1)]);
         assert_eq!(lex(".5"), vec![Token::Float(0.5)]);
@@ -848,7 +860,7 @@ mod tests {
             vec![Token::Str(b"hello".to_vec().into())]
         );
         assert_eq!(
-            lex(r#"'a\n\t\\\'b'"#),
+            lex(r"'a\n\t\\\'b'"),
             vec![Token::Str(b"a\n\t\\'b".to_vec().into())]
         );
         assert_eq!(

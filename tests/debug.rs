@@ -11,7 +11,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..10_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }

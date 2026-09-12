@@ -11,7 +11,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..10_000 {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -40,7 +40,7 @@ fn run_err(src: &str) -> String {
     loop {
         match exec.step(&mut lua, 1_000_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => return e.to_string(),
         }
     }
@@ -504,7 +504,7 @@ fn table_concat_pack_unpack() {
     );
     assert!(run_err("return table.unpack({}, 0, (1 << 31) - 1)").contains("too many results"));
     // empty ranges still return nothing
-    assert!(eval("return select('#', table.unpack({}, 10, 6))") == "0");
+    assert_eq!(eval("return select('#', table.unpack({}, 10, 6))"), "0");
 }
 
 #[test]
@@ -767,7 +767,7 @@ fn math_basics() {
     assert_eq!(eval("return math.maxinteger"), i64::MAX.to_string());
     assert_eq!(eval("return math.ult(-1, 0)"), "false"); // -1 as unsigned is huge
     assert_eq!(eval("return math.log(8, 2)"), "3.0");
-    assert!(eval("return math.sin(0)") == "0.0");
+    assert_eq!(eval("return math.sin(0)"), "0.0");
     assert_eq!(
         eval("return math.abs(math.deg(math.pi) - 180) < 1e-9"),
         "true"
@@ -859,7 +859,7 @@ fn math_random_matches_puc_xoshiro() {
     // 0x7a7040a5a323c9d6 (asserted by upstream math.lua).
     assert_eq!(
         eval("math.randomseed(1007) return math.random(0)"),
-        (0x7a7040a5a323c9d6u64 as i64).to_string()
+        (0x7a70_40a5_a323_c9d6_u64 as i64).to_string()
     );
     // One seed word defaults the second to 0; both reseed identically.
     assert_eq!(

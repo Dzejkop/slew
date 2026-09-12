@@ -19,6 +19,7 @@ use crate::value::{
     float_to_exact_int, fmt_number,
 };
 use std::fmt;
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 /// Default cap on call-frame depth; a deliberately bounded execution profile
@@ -398,7 +399,7 @@ fn annotate_metamethod_error(e: &mut VmError, name: &str) {
     if let ErrVal::Msg(m) = &mut e.val
         && !m.contains("(metamethod '")
     {
-        m.push_str(&format!(" (metamethod '{name}')"));
+        let _ = write!(m, " (metamethod '{name}')");
     }
 }
 
@@ -777,6 +778,7 @@ impl Default for Lua {
 }
 
 impl Lua {
+    #[must_use]
     pub fn new() -> Self {
         let mut strings = Strings::default();
         let mm_names = MM_NAMES
@@ -851,7 +853,7 @@ impl Lua {
             io_output: None,
             exit_request: None,
         };
-        lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
+        lua.seed_random(0x536c_6577_5f5f_5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
         lua
     }
@@ -887,11 +889,19 @@ impl Lua {
     }
 
     /// Parses and compiles a script. No code runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source fails to parse or compile.
     pub fn load(&mut self, src: impl AsRef<[u8]>) -> Result<Chunk, Error> {
         self.load_named("chunk", src)
     }
 
     /// Like [`Lua::load`] with an explicit chunk name for error messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source fails to parse or compile.
     pub fn load_named(&mut self, name: &str, src: impl AsRef<[u8]>) -> Result<Chunk, Error> {
         let block = parse(src.as_ref())?;
         let proto = compile(&block, &mut self.strings, name)?;
@@ -997,6 +1007,10 @@ impl Lua {
     }
 
     /// Registers a native function as a global.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the global table rejects the new entry.
     pub fn register_native(&mut self, name: &str, f: NativeFn) -> Value {
         let v = self.add_native(name, f);
         let k = self.new_string(name.as_bytes());
@@ -1015,17 +1029,14 @@ impl Lua {
             name: name.into(),
             kind,
         };
-        let id = match self.natives_free.pop() {
-            Some(i) => {
-                self.natives[i as usize] = n;
-                self.natives_live[i as usize] = true;
-                NativeId(i)
-            }
-            None => {
-                self.natives.push(n);
-                self.natives_live.push(true);
-                NativeId(self.natives.len() as u32 - 1)
-            }
+        let id = if let Some(i) = self.natives_free.pop() {
+            self.natives[i as usize] = n;
+            self.natives_live[i as usize] = true;
+            NativeId(i)
+        } else {
+            self.natives.push(n);
+            self.natives_live.push(true);
+            NativeId(self.natives.len() as u32 - 1)
         };
         Value::Native(id)
     }
@@ -1044,17 +1055,14 @@ impl Lua {
 
     pub fn new_table(&mut self) -> Value {
         self.allocs_since_gc += 1;
-        let id = match self.tables_free.pop() {
-            Some(i) => {
-                self.tables[i as usize] = Table::default();
-                self.tables_live[i as usize] = true;
-                TableId(i)
-            }
-            None => {
-                self.tables.push(Table::default());
-                self.tables_live.push(true);
-                TableId(self.tables.len() as u32 - 1)
-            }
+        let id = if let Some(i) = self.tables_free.pop() {
+            self.tables[i as usize] = Table::default();
+            self.tables_live[i as usize] = true;
+            TableId(i)
+        } else {
+            self.tables.push(Table::default());
+            self.tables_live.push(true);
+            TableId(self.tables.len() as u32 - 1)
         };
         Value::Table(id)
     }
@@ -1063,21 +1071,19 @@ impl Lua {
     /// caller; GC liveness is tracked like any other arena object.
     pub(crate) fn alloc_userdata(&mut self, u: Userdata) -> UserdataId {
         self.allocs_since_gc += 1;
-        match self.userdata_free.pop() {
-            Some(i) => {
-                self.userdata[i as usize] = u;
-                self.userdata_live[i as usize] = true;
-                UserdataId(i)
-            }
-            None => {
-                self.userdata.push(u);
-                self.userdata_live.push(true);
-                UserdataId(self.userdata.len() as u32 - 1)
-            }
+        if let Some(i) = self.userdata_free.pop() {
+            self.userdata[i as usize] = u;
+            self.userdata_live[i as usize] = true;
+            UserdataId(i)
+        } else {
+            self.userdata.push(u);
+            self.userdata_live.push(true);
+            UserdataId(self.userdata.len() as u32 - 1)
         }
     }
 
     /// True when a capability host has been installed (`io`/`os` exist).
+    #[must_use]
     pub fn has_host(&self) -> bool {
         self.host.is_some()
     }
@@ -1118,33 +1124,27 @@ impl Lua {
 
     pub(crate) fn alloc_closure(&mut self, c: LuaClosure) -> ClosId {
         self.allocs_since_gc += 1;
-        match self.closures_free.pop() {
-            Some(i) => {
-                self.closures[i as usize] = c;
-                self.closures_live[i as usize] = true;
-                ClosId(i)
-            }
-            None => {
-                self.closures.push(c);
-                self.closures_live.push(true);
-                ClosId(self.closures.len() as u32 - 1)
-            }
+        if let Some(i) = self.closures_free.pop() {
+            self.closures[i as usize] = c;
+            self.closures_live[i as usize] = true;
+            ClosId(i)
+        } else {
+            self.closures.push(c);
+            self.closures_live.push(true);
+            ClosId(self.closures.len() as u32 - 1)
         }
     }
 
     fn alloc_thread(&mut self, th: Thread) -> ThreadId {
         self.allocs_since_gc += 1;
-        match self.threads_free.pop() {
-            Some(i) => {
-                self.threads[i as usize] = th;
-                self.threads_live[i as usize] = true;
-                ThreadId(i)
-            }
-            None => {
-                self.threads.push(th);
-                self.threads_live.push(true);
-                ThreadId(self.threads.len() as u32 - 1)
-            }
+        if let Some(i) = self.threads_free.pop() {
+            self.threads[i as usize] = th;
+            self.threads_live[i as usize] = true;
+            ThreadId(i)
+        } else {
+            self.threads.push(th);
+            self.threads_live.push(true);
+            ThreadId(self.threads.len() as u32 - 1)
         }
     }
 
@@ -1159,20 +1159,18 @@ impl Lua {
 
     fn new_upval(&mut self, u: Upval) -> UpvalId {
         self.allocs_since_gc += 1;
-        match self.upvals_free.pop() {
-            Some(i) => {
-                self.upvals[i as usize] = u;
-                self.upvals_live[i as usize] = true;
-                UpvalId(i)
-            }
-            None => {
-                self.upvals.push(u);
-                self.upvals_live.push(true);
-                UpvalId(self.upvals.len() as u32 - 1)
-            }
+        if let Some(i) = self.upvals_free.pop() {
+            self.upvals[i as usize] = u;
+            self.upvals_live[i as usize] = true;
+            UpvalId(i)
+        } else {
+            self.upvals.push(u);
+            self.upvals_live.push(true);
+            UpvalId(self.upvals.len() as u32 - 1)
         }
     }
 
+    #[must_use]
     pub fn get_global(&self, name: &str) -> Value {
         match self.strings.lookup(name.as_bytes()) {
             Some(id) => self.tables[self.globals.0 as usize].get(Value::Str(id)),
@@ -1180,12 +1178,18 @@ impl Lua {
         }
     }
 
+    /// Sets a global variable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the global table rejects the new entry.
     pub fn set_global(&mut self, name: &str, v: Value) {
         let k = self.new_string(name.as_bytes());
         self.tables[self.globals.0 as usize].set(k, v).unwrap();
     }
 
     /// Raw table read (no metamethods).
+    #[must_use]
     pub fn table_get(&self, t: Value, k: Value) -> Value {
         match t {
             Value::Table(id) => self.tables[id.0 as usize].get(k),
@@ -1193,6 +1197,7 @@ impl Lua {
         }
     }
 
+    #[must_use]
     pub fn str_bytes(&self, v: Value) -> Option<&[u8]> {
         match v {
             Value::Str(id) => Some(self.strings.get(id)),
@@ -1235,6 +1240,7 @@ impl Lua {
 
     /// Human-readable rendering of a value (like raw `tostring`, lossy for
     /// non-UTF-8 strings; does not invoke `__tostring`).
+    #[must_use]
     pub fn display_value(&self, v: Value) -> String {
         match v {
             Value::Nil => "nil".into(),
@@ -1251,6 +1257,7 @@ impl Lua {
 
     // ---- metatables ----
 
+    #[must_use]
     pub fn get_metatable(&self, v: Value) -> Option<TableId> {
         match v {
             Value::Table(t) => self.tables[t.0 as usize].metatable,
@@ -1648,13 +1655,7 @@ impl Lua {
             other => return Ok(other),
         };
         let level = match level {
-            None | Some(Value::Nil) => {
-                if target.is_none() {
-                    1
-                } else {
-                    0
-                }
-            }
+            None | Some(Value::Nil) => i64::from(target.is_none()),
             Some(v) => self.debug_check_int(Some(v), argno, "debug.traceback")?,
         };
         let current = target.is_none() || target == Some(self.current_thread);
@@ -1687,11 +1688,11 @@ impl Lua {
                 Frame::C(cf) => {
                     out.push_str("\n\t[C]: in ");
                     if cf.namewhat == "metamethod" {
-                        out.push_str(&format!("metamethod '{}'", cf.name));
+                        let _ = write!(out, "metamethod '{}'", cf.name);
                     } else if cf.name.is_empty() {
                         out.push('?');
                     } else {
-                        out.push_str(&format!("function '{}'", cf.name));
+                        let _ = write!(out, "function '{}'", cf.name);
                     }
                 }
                 Frame::Lua(fr) => {
@@ -1702,7 +1703,7 @@ impl Lua {
                         .copied()
                         .unwrap_or(0);
                     let src = short_source(&fr.proto.source);
-                    out.push_str(&format!("\n\t{src}:{line}: in "));
+                    let _ = write!(out, "\n\t{src}:{line}: in ");
                     let name: Option<(&'static str, Box<str>)> = fr
                         .call_meta
                         .map(|(nw, nm)| (nw, Box::from(nm)))
@@ -1722,11 +1723,15 @@ impl Lua {
                         });
                     match name {
                         Some(("metamethod", nm)) => {
-                            out.push_str(&format!("metamethod '{nm}'"));
+                            let _ = write!(out, "metamethod '{nm}'");
                         }
-                        Some((nw, nm)) => out.push_str(&format!("function '{nm}' ({nw})")),
+                        Some((nw, nm)) => {
+                            let _ = write!(out, "function '{nm}' ({nw})");
+                        }
                         None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
-                        None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
+                        None => {
+                            let _ = write!(out, "function <{src}:{}>", fr.proto.linedefined);
+                        }
                     }
                 }
             }
@@ -1743,8 +1748,7 @@ impl Lua {
             .proto
             .upval_names
             .get(n as usize - 1)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "(...)".to_string());
+            .map_or_else(|| "(...)".to_string(), std::string::ToString::to_string);
         let uid = c.upvals[n as usize - 1];
         let val = self.read_upval(self.current_thread, th, uid);
         Some((name, val))
@@ -1765,8 +1769,7 @@ impl Lua {
             .proto
             .upval_names
             .get(n as usize - 1)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "(...)".to_string());
+            .map_or_else(|| "(...)".to_string(), std::string::ToString::to_string);
         let uid = c.upvals[n as usize - 1];
         let tid = self.current_thread;
         self.write_upval(tid, th, uid, v);
@@ -1875,7 +1878,7 @@ impl Lua {
 
     /// Whether any hook event should fire right now: a hook is set and no
     /// hook frame is currently on the stack (PUC's `allowhook`).
-    fn hook_any(&self, th: &Thread) -> bool {
+    fn hook_any(th: &Thread) -> bool {
         th.hook.is_some()
             && !th
                 .frames
@@ -1884,14 +1887,14 @@ impl Lua {
     }
 
     /// Whether a specific event class (call/return/line) is enabled.
-    fn hook_on(&self, th: &Thread, bit: u8) -> bool {
-        self.hook_any(th) && th.hook_mask & bit != 0
+    fn hook_on(th: &Thread, bit: u8) -> bool {
+        Self::hook_any(th) && th.hook_mask & bit != 0
     }
 
     /// Calls the current hook as an ordinary function, so it runs through the
     /// regular (suspendable) machinery and can itself call `pcall` etc. An
     /// optional synthetic C frame below it makes `debug.getinfo(2)` name a
-    /// native that is returning or being called (PUC keeps the C CallInfo).
+    /// native that is returning or being called (PUC keeps the C `CallInfo`).
     fn fire_hook(
         &mut self,
         th: &mut Thread,
@@ -1904,7 +1907,7 @@ impl Lua {
             return Ok(());
         };
         if let Some(func) = synth {
-            let base = th.frames.last().map(|_| scratch_base(th)).unwrap_or(th.top);
+            let base = th.frames.last().map_or(th.top, |_| scratch_base(th));
             th.frames.push(Frame::C(CFrame {
                 func,
                 name: "",
@@ -1937,7 +1940,7 @@ impl Lua {
 
     /// Completes a deferred `coroutine.yield`: marks the thread suspended,
     /// delivers its values to the resumer, and schedules the switch.
-    fn perform_yield(&mut self, th: &mut Thread, job: YieldJob) {
+    fn perform_yield(&mut self, th: &mut Thread, job: &YieldJob) {
         th.status = CoStatus::Suspended;
         th.yield_ret = Some((job.ret_to, job.nres, job.shape));
         let parent = job.parent;
@@ -1997,8 +2000,7 @@ impl Lua {
                                 th.frames
                                     .first()
                                     .and_then(|f| f.lua())
-                                    .map(frame_line)
-                                    .unwrap_or(e.root_line),
+                                    .map_or(e.root_line, frame_line),
                             );
                         }
                         // error escaped this thread entirely; close its open
@@ -2015,7 +2017,7 @@ impl Lua {
                         match parent {
                             None => {
                                 let root_line = root_line.unwrap_or(e.line);
-                                return Err(self.materialize_error(e, root_line));
+                                return Err(self.materialize_error(&e, root_line));
                             }
                             Some(p) => {
                                 cur = p;
@@ -2029,7 +2031,6 @@ impl Lua {
                                         Ok(()) => break,
                                         Err(e2) => {
                                             e = e2;
-                                            continue;
                                         }
                                     }
                                 } else {
@@ -2045,8 +2046,8 @@ impl Lua {
         }
     }
 
-    fn materialize_error(&mut self, e: VmError, root_line: u32) -> RuntimeError {
-        let value = self.err_value(&e);
+    fn materialize_error(&mut self, e: &VmError, root_line: u32) -> RuntimeError {
+        let value = self.err_value(e);
         RuntimeError {
             message: self.display_value(value),
             value,
@@ -2093,8 +2094,7 @@ impl Lua {
                             .frames
                             .first()
                             .and_then(|f| f.lua())
-                            .map(frame_line)
-                            .unwrap_or(0);
+                            .map_or(0, frame_line);
                     }
                     self.recover(th, fuel, e)?;
                 }
@@ -2139,7 +2139,7 @@ impl Lua {
         // from a directly-invoked `__close` metamethod and no `__close`
         // handlers remain: PUC calls the handler at the error site, so
         // `debug.traceback` shows the close frame as `metamethod 'close'`.
-        if let Some(idx) = th.frames.iter().rposition(|f| f.is_protected()) {
+        if let Some(idx) = th.frames.iter().rposition(Frame::is_protected) {
             let (handler, guard) = frame_boundary(&th.frames[idx]);
             if let Some(h) = handler
                 && !guard
@@ -2297,7 +2297,7 @@ impl Lua {
         // pop it so the Lua frame below (owner of the protected call's result
         // slots) resumes. C frames are only ever the innermost frame while
         // they carry continuations.
-        while th.frames.last().is_some_and(|f| f.is_c())
+        while th.frames.last().is_some_and(Frame::is_c)
             && th.frames.last().unwrap().pending().is_empty()
         {
             th.frames.pop();
@@ -2348,7 +2348,7 @@ impl Lua {
                         let r = self.do_call(
                             th,
                             fuel,
-                            CallSpec {
+                            &CallSpec {
                                 func_abs: wb,
                                 argc: 1,
                                 ret_to,
@@ -2359,18 +2359,15 @@ impl Lua {
                                 native_caller: true,
                             },
                         );
-                        match r {
-                            Ok(()) => {
-                                if th.frames.len() > before
-                                    && let Some(Frame::Lua(lf)) = th.frames.last_mut()
-                                {
-                                    lf.handler_guard = true;
-                                }
+                        if let Ok(()) = r {
+                            if th.frames.len() > before
+                                && let Some(Frame::Lua(lf)) = th.frames.last_mut()
+                            {
+                                lf.handler_guard = true;
                             }
-                            Err(_) => {
-                                let msg = self.new_string(b"error in error handling");
-                                place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
-                            }
+                        } else {
+                            let msg = self.new_string(b"error in error handling");
+                            place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
                         }
                     }
                 },
@@ -2419,7 +2416,10 @@ impl Lua {
                             self.new_string(s.as_bytes())
                         }
                         _ => {
-                            return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                            return Err(Self::rt_err(
+                                th,
+                                "'__tostring' must return a string".into(),
+                            ));
                         }
                     };
                     place_shaped(th, ret_to, nres, shape, &[sv]);
@@ -2439,7 +2439,7 @@ impl Lua {
                     place_shaped(th, ret_to, nres, shape, &vals);
                 }
                 Pending::ReturnHookFire => {
-                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                    if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
                         self.fire_hook(th, fuel, "return", -1, None)?;
                     }
                 }
@@ -2465,7 +2465,7 @@ impl Lua {
                                 .unwrap()
                                 .pending_mut()
                                 .push(Pending::YieldStep);
-                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                            if self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL) {
                                 self.fire_hook(th, fuel, "call", -1, Some(yield_fn))?;
                             }
                         }
@@ -2477,11 +2477,11 @@ impl Lua {
                                 .unwrap()
                                 .pending_mut()
                                 .push(Pending::YieldStep);
-                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                            if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
                                 self.fire_hook(th, fuel, "return", -1, Some(yield_fn))?;
                             }
                         }
-                        _ => self.perform_yield(th, job),
+                        _ => self.perform_yield(th, &job),
                     }
                 }
                 Pending::UnwindAfterHandler { result_slot } => {
@@ -2505,12 +2505,12 @@ impl Lua {
         // instruction is only fetched on the following dispatch.
         if th.pending_call_hook {
             th.pending_call_hook = false;
-            if self.hook_on(th, HOOK_CALL) {
+            if Self::hook_on(th, HOOK_CALL) {
                 self.fire_hook(th, fuel, "call", -1, None)?;
                 return Ok(Flow::Continue);
             }
         }
-        if th.hook_count > 0 && self.hook_any(th) {
+        if th.hook_count > 0 && Self::hook_any(th) {
             th.hook_counter -= 1;
             if th.hook_counter <= 0 {
                 th.hook_counter = th.hook_count;
@@ -2519,7 +2519,7 @@ impl Lua {
                 return Ok(Flow::Continue);
             }
         }
-        if self.hook_on(th, HOOK_LINE) {
+        if Self::hook_on(th, HOOK_LINE) {
             let line = line_of(th) as i64;
             // Line 0 means "no line info" (e.g. a synthetic prologue
             // instruction); PUC only reports real source lines.
@@ -2599,9 +2599,8 @@ impl Lua {
                 n,
                 start,
             } => {
-                let t = match th.stack[base + obj as usize] {
-                    Value::Table(t) => t,
-                    _ => unreachable!("SetList on non-table"),
+                let Value::Table(t) = th.stack[base + obj as usize] else {
+                    unreachable!("SetList on non-table")
                 };
                 let first = base + b as usize;
                 let count = if n == 0 {
@@ -2614,7 +2613,7 @@ impl Lua {
                     let v = th.stack[first + i];
                     self.tables[t.0 as usize]
                         .set(Value::Int(start as i64 + i as i64), v)
-                        .map_err(|m| self.rt_err(th, m.to_string()))?;
+                        .map_err(|m| Self::rt_err(th, m.to_string()))?;
                 }
             }
             Instr::Arith { op, dst, lhs, rhs } => {
@@ -2660,7 +2659,7 @@ impl Lua {
                             } else {
                                 msg
                             };
-                            return Err(self.rt_err(th, msg));
+                            return Err(Self::rt_err(th, msg));
                         }
                         self.call_value(
                             th,
@@ -2709,7 +2708,7 @@ impl Lua {
                 self.do_call(
                     th,
                     fuel,
-                    CallSpec {
+                    &CallSpec {
                         func_abs,
                         argc,
                         ret_to: func_abs,
@@ -2789,7 +2788,7 @@ impl Lua {
                 } else {
                     (n - 1) as usize
                 };
-                if self.hook_on(th, HOOK_RETURN) {
+                if Self::hook_on(th, HOOK_RETURN) {
                     let f = th.frames.last_mut().unwrap().as_lua_mut();
                     f.pending.push(Pending::FinishReturn { start, count });
                     self.fire_hook(th, fuel, "return", -1, None)?;
@@ -2859,9 +2858,10 @@ impl Lua {
                             Value::Str(id) => self.strings.get_str_lossy(id).into_owned(),
                             _ => "?".to_string(),
                         };
-                        return Err(
-                            self.rt_err(th, format!("variable '{vname}' got a non-closable value"))
-                        );
+                        return Err(Self::rt_err(
+                            th,
+                            format!("variable '{vname}' got a non-closable value"),
+                        ));
                     }
                 }
             }
@@ -2924,7 +2924,7 @@ impl Lua {
         self.do_call(
             th,
             fuel,
-            CallSpec {
+            &CallSpec {
                 func_abs: wb,
                 argc: args.len(),
                 ret_to,
@@ -2937,7 +2937,7 @@ impl Lua {
         )
     }
 
-    fn do_call(&mut self, th: &mut Thread, fuel: &mut i64, spec: CallSpec) -> Result<(), VmError> {
+    fn do_call(&mut self, th: &mut Thread, fuel: &mut i64, spec: &CallSpec) -> Result<(), VmError> {
         *fuel -= 2;
         let CallSpec {
             mut func_abs,
@@ -2948,14 +2948,15 @@ impl Lua {
             protected,
             handler,
             native_caller,
-        } = spec;
+        } = *spec;
         for _ in 0..MAX_META_CHAIN {
             match th.stack[func_abs] {
                 Value::Closure(cid) => {
                     if th.frames.len() >= MAX_CALL_DEPTH {
-                        return Err(
-                            self.rt_err(th, "stack overflow (too many nested calls)".into())
-                        );
+                        return Err(Self::rt_err(
+                            th,
+                            "stack overflow (too many nested calls)".into(),
+                        ));
                     }
                     let proto = self.closures[cid.0 as usize].proto.clone();
                     let new_base = func_abs + 1;
@@ -2987,7 +2988,7 @@ impl Lua {
                         last_line: -1,
                         is_hook: false,
                     }));
-                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                    if self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL) {
                         let callee = th.stack[func_abs];
                         self.fire_hook(th, fuel, "call", -1, Some(callee))?;
                     }
@@ -3010,8 +3011,10 @@ impl Lua {
                     // __call: f(args...) becomes mm(f, args...)
                     let mm = self.metamethod(other, Mm::Call);
                     if mm == Value::Nil {
-                        return Err(self
-                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
+                        return Err(Self::rt_err(
+                            th,
+                            format!("attempt to call a {} value", other.type_name()),
+                        ));
                     }
                     // Prepend `mm`, keeping the window pinned at the frame's
                     // scratch base. Repeated chases then shift in place (the
@@ -3027,7 +3030,7 @@ impl Lua {
                 }
             }
         }
-        Err(self.rt_err(th, "'__call' chain too long".into()))
+        Err(Self::rt_err(th, "'__call' chain too long".into()))
     }
 
     /// Resolves the callee at `func_abs`, chasing `__call` metamethod
@@ -3046,8 +3049,10 @@ impl Lua {
                     // __call: f(args...) becomes mm(f, args...)
                     let mm = self.metamethod(other, Mm::Call);
                     if mm == Value::Nil {
-                        return Err(self
-                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
+                        return Err(Self::rt_err(
+                            th,
+                            format!("attempt to call a {} value", other.type_name()),
+                        ));
                     }
                     // Prepend `mm`, keeping the window pinned at the frame's
                     // scratch base. Repeated chases then shift in place (the
@@ -3063,7 +3068,7 @@ impl Lua {
                 }
             }
         }
-        Err(self.rt_err(th, "'__call' chain too long".into()))
+        Err(Self::rt_err(th, "'__call' chain too long".into()))
     }
 
     /// Replaces the current frame with a call to `cid`, moving the callee and
@@ -3154,7 +3159,7 @@ impl Lua {
                     source: None,
                 })?;
                 place_shaped(th, ret_to, nres, shape, &res);
-                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
                     self.fire_hook(th, fuel, "return", -1, Some(fv))?;
                 }
                 Ok(())
@@ -3198,7 +3203,6 @@ impl Lua {
             Intrinsic::Error => {
                 let v = arg(th, 0);
                 let level = match arg(th, 1) {
-                    Value::Nil => 1,
                     Value::Int(l) => l,
                     Value::Float(f) => f as i64,
                     _ => 1,
@@ -3240,9 +3244,10 @@ impl Lua {
             }
             Intrinsic::Assert => {
                 if argc == 0 {
-                    return Err(
-                        self.rt_err(th, "bad argument #1 to 'assert' (value expected)".into())
-                    );
+                    return Err(Self::rt_err(
+                        th,
+                        "bad argument #1 to 'assert' (value expected)".into(),
+                    ));
                 }
                 if arg(th, 0).truthy() {
                     let res = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
@@ -3305,7 +3310,7 @@ impl Lua {
             Intrinsic::Format => {
                 let nargs = argc;
                 let fmt = if nargs == 0 {
-                    return Err(self.rt_err(
+                    return Err(Self::rt_err(
                         th,
                         "bad argument #1 to 'format' (string expected, got no value)".into(),
                     ));
@@ -3316,7 +3321,7 @@ impl Lua {
                             crate::value::fmt_number(v).into_bytes()
                         }
                         other => {
-                            return Err(self.rt_err(
+                            return Err(Self::rt_err(
                                 th,
                                 format!(
                                     "bad argument #1 to 'format' (string expected, got {})",
@@ -3349,9 +3354,10 @@ impl Lua {
             }
             Intrinsic::Pcall => {
                 if argc == 0 {
-                    return Err(
-                        self.rt_err(th, "bad argument #1 to 'pcall' (value expected)".into())
-                    );
+                    return Err(Self::rt_err(
+                        th,
+                        "bad argument #1 to 'pcall' (value expected)".into(),
+                    ));
                 }
                 let pcall_fn = th.stack[func_abs];
                 if shape == RetShape::PrependTrue
@@ -3380,9 +3386,10 @@ impl Lua {
             }
             Intrinsic::Xpcall => {
                 if argc < 2 {
-                    return Err(
-                        self.rt_err(th, "bad argument #2 to 'xpcall' (value expected)".into())
-                    );
+                    return Err(Self::rt_err(
+                        th,
+                        "bad argument #2 to 'xpcall' (value expected)".into(),
+                    ));
                 }
                 let handler = arg(th, 1);
                 // rebuild a contiguous window: [f, args...] (handler sits
@@ -3422,7 +3429,7 @@ impl Lua {
             Intrinsic::Resume => {
                 let co = arg(th, 0);
                 let Value::Thread(co) = co else {
-                    return Err(self.rt_err(
+                    return Err(Self::rt_err(
                         th,
                         format!(
                             "bad argument #1 to 'resume' (coroutine expected, got {})",
@@ -3443,17 +3450,23 @@ impl Lua {
                 // cross-boundary yield, unless we are on the main thread, which
                 // reports "outside a coroutine" instead.
                 if th.non_yieldable > 0 && !th.is_main {
-                    return Err(self.rt_err(th, "attempt to yield across a C-call boundary".into()));
+                    return Err(Self::rt_err(
+                        th,
+                        "attempt to yield across a C-call boundary".into(),
+                    ));
                 }
                 let Some(parent) = th.parent else {
-                    return Err(self.rt_err(th, "attempt to yield from outside a coroutine".into()));
+                    return Err(Self::rt_err(
+                        th,
+                        "attempt to yield from outside a coroutine".into(),
+                    ));
                 };
                 *fuel -= 3;
                 let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let rr = th.resume_ret.expect("resumed thread has resume_ret");
                 let yield_fn = th.stack[func_abs];
-                let want_call = self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL);
-                let want_ret = self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN);
+                let want_call = self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL);
+                let want_ret = self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN);
                 let job = YieldJob {
                     parent,
                     rr,
@@ -3476,7 +3489,7 @@ impl Lua {
                         .push(Pending::YieldStep);
                     return Ok(());
                 }
-                self.perform_yield(th, job);
+                self.perform_yield(th, &job);
                 Ok(())
             }
             Intrinsic::EnterNonYieldable => {
@@ -3505,7 +3518,7 @@ impl Lua {
                         !other.is_main && other.non_yieldable == 0
                     }
                     Some(v) => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #1 to 'isyieldable' (thread expected, got {})",
@@ -3527,7 +3540,7 @@ impl Lua {
                         (argc > 1).then(|| arg(th, 1)),
                         func_abs + 1 + argc,
                     )
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &r);
                 Ok(())
             }
@@ -3557,7 +3570,7 @@ impl Lua {
                         Some(v) => v.type_name().to_string(),
                         None => "no value".to_string(),
                     };
-                    return Err(self.rt_err(
+                    return Err(Self::rt_err(
                         th,
                         format!(
                             "bad argument #1 to 'coroutine.close' (thread expected, got {got})"
@@ -3583,7 +3596,7 @@ impl Lua {
                 let what = arg(th, base + 1);
                 let r = self
                     .debug_getinfo(th, target, f, what, base + 1)
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
@@ -3597,7 +3610,7 @@ impl Lua {
                 let level = arg_opt(th, base + 1);
                 let r = self
                     .debug_traceback(th, target, message, level, base + 2)
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[r]);
                 Ok(())
             }
@@ -3605,7 +3618,7 @@ impl Lua {
                 // PUC checks the index (arg #2) before the function (arg #1).
                 let n = self
                     .debug_check_int(arg_opt(th, 1), 2, "debug.getupvalue")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let f = arg(th, 0);
                 match f {
                     Value::Closure(cid) => match self.debug_getupvalue(th, cid, n) {
@@ -3620,7 +3633,7 @@ impl Lua {
                     // upvalues, so `lua_getupvalue` returns NULL -> zero values.
                     Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
                     other => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
@@ -3635,14 +3648,14 @@ impl Lua {
                 // PUC checks the value (arg #3), then index (#2), then
                 // function (#1).
                 if arg_opt(th, 2).is_none() {
-                    return Err(self.rt_err(
+                    return Err(Self::rt_err(
                         th,
                         "bad argument #3 to 'debug.setupvalue' (value expected)".into(),
                     ));
                 }
                 let n = self
                     .debug_check_int(arg_opt(th, 1), 2, "debug.setupvalue")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let v = arg(th, 2);
                 let f = arg(th, 0);
                 match f {
@@ -3657,7 +3670,7 @@ impl Lua {
                     // returns NULL, and the API reports zero values.
                     Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
                     other => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
@@ -3671,7 +3684,7 @@ impl Lua {
             Intrinsic::DebugUpvalueid => {
                 let n = self
                     .debug_check_int(arg_opt(th, 1), 2, "debug.upvalueid")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let f = arg(th, 0);
                 let r = match f {
                     Value::Closure(cid) => self.debug_upvalueid(cid, n),
@@ -3679,7 +3692,7 @@ impl Lua {
                     // upvalues); PUC pushes fail (nil) as a single value.
                     Value::Native(_) => Value::Nil,
                     other => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
@@ -3698,18 +3711,18 @@ impl Lua {
                 // check; a non-function fails the type check.
                 let n1 = self
                     .debug_check_int(arg_opt(th, 1), 2, "debug.upvaluejoin")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let c1 = self
                     .debug_check_upval(arg(th, 0), n1, 1, 2, "debug.upvaluejoin")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let n2 = self
                     .debug_check_int(arg_opt(th, 3), 4, "debug.upvaluejoin")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 let c2 = self
                     .debug_check_upval(arg(th, 2), n2, 3, 4, "debug.upvaluejoin")
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 self.debug_upvaluejoin(c1, n1, c2, n2)
-                    .map_err(|m| self.rt_err(th, m))?;
+                    .map_err(|m| Self::rt_err(th, m))?;
                 place_shaped(th, ret_to, nres, shape, &[]);
                 Ok(())
             }
@@ -3728,7 +3741,7 @@ impl Lua {
                     Value::Nil => None,
                     Value::Table(t) => Some(t),
                     other => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
@@ -3750,7 +3763,7 @@ impl Lua {
                     None | Some(Value::Nil) => None,
                     Some(Value::Thread(t)) => Some(t),
                     Some(v) => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #1 to 'gethook' (thread expected, got {})",
@@ -3796,7 +3809,7 @@ impl Lua {
                     Value::Nil => None,
                     v @ (Value::Closure(_) | Value::Native(_)) => Some(v),
                     other => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #{} to 'sethook' (function expected, got {})",
@@ -3820,7 +3833,7 @@ impl Lua {
                         }
                     }
                     Some(v) => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #{} to 'sethook' (string expected, got {})",
@@ -3835,7 +3848,7 @@ impl Lua {
                     Some(Value::Int(n)) => n,
                     Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
                     Some(v) => {
-                        return Err(self.rt_err(
+                        return Err(Self::rt_err(
                             th,
                             format!(
                                 "bad argument #{} to 'sethook' (number expected, got {})",
@@ -3863,7 +3876,7 @@ impl Lua {
                 // removed the hook, so nothing fires.
                 let fv = th.stack[func_abs];
                 place_shaped(th, ret_to, nres, shape, &[]);
-                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
                     self.fire_hook(th, fuel, "return", -1, Some(fv))?;
                 }
                 Ok(())
@@ -3900,7 +3913,7 @@ impl Lua {
     ) -> Result<(), VmError> {
         let fail = |me: &mut Self, th: &mut Thread, msg: &str| -> Result<(), VmError> {
             if wrap {
-                Err(me.rt_err(th, msg.into()))
+                Err(Self::rt_err(th, msg.into()))
             } else {
                 let m = me.new_string(msg.as_bytes());
                 place_shaped(th, ret_to, nres, shape, &[Value::Bool(false), m]);
@@ -3948,7 +3961,7 @@ impl Lua {
                                 &mut co_th.stack,
                                 1 + (proto.max_regs as usize).max(args.len()),
                             );
-                            co_th.stack[1..1 + args.len()].copy_from_slice(args);
+                            co_th.stack[1..=args.len()].copy_from_slice(args);
                             for i in args.len()..np {
                                 co_th.stack[1 + i] = Value::Nil;
                             }
@@ -4106,12 +4119,12 @@ impl Lua {
                                 return match kind_result {
                                     Ok(res) => {
                                         let mut all = Vec::with_capacity(res.len() + 1);
-                                        if !wrap {
+                                        if wrap {
+                                            place_shaped(th, ret_to, nres, shape, &res);
+                                        } else {
                                             all.push(Value::Bool(true));
                                             all.extend_from_slice(&res);
                                             place_shaped(th, ret_to, nres, shape, &all);
-                                        } else {
-                                            place_shaped(th, ret_to, nres, shape, &res);
                                         }
                                         Ok(())
                                     }
@@ -4155,11 +4168,11 @@ impl Lua {
         // Closing the running/normal coroutine is an error (catchable with
         // pcall), not a `false, msg` result.
         if co == self.current_thread {
-            return Err(self.rt_err(th, "cannot close a running coroutine".into()));
+            return Err(Self::rt_err(th, "cannot close a running coroutine".into()));
         }
         match self.threads[co.0 as usize].status {
-            CoStatus::Running => Err(self.rt_err(th, "cannot close a running coroutine".into())),
-            CoStatus::Normal => Err(self.rt_err(th, "cannot close a normal coroutine".into())),
+            CoStatus::Running => Err(Self::rt_err(th, "cannot close a running coroutine".into())),
+            CoStatus::Normal => Err(Self::rt_err(th, "cannot close a normal coroutine".into())),
             CoStatus::Dead => {
                 let err = self.threads[co.0 as usize].close_error.take();
                 match err {
@@ -4289,12 +4302,11 @@ impl Lua {
         if job.awaiting {
             job.awaiting = false;
             let v = th.stack[job.result_slot];
-            match v {
-                Value::Str(s) => job.out.push(self.strings.get(s).to_vec()),
-                _ => {
-                    self.print_job = Some(job);
-                    return Err(self.rt_err(th, "'__tostring' must return a string".into()));
-                }
+            if let Value::Str(s) = v {
+                job.out.push(self.strings.get(s).to_vec());
+            } else {
+                self.print_job = Some(job);
+                return Err(Self::rt_err(th, "'__tostring' must return a string".into()));
             }
         }
         while job.idx < job.items.len() {
@@ -4350,12 +4362,12 @@ impl Lua {
                 Value::Int(_) | Value::Float(_) => crate::value::fmt_number(v).into_bytes(),
                 _ => {
                     self.format_job = Some(job);
-                    return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                    return Err(Self::rt_err(th, "'__tostring' must return a string".into()));
                 }
             };
             let (spec, arg, argi) = job.saved.take().expect("saved spec while awaiting");
             let piece = crate::stdlib::string::render_spec(self, &spec, arg, argi, Some(bytes))
-                .map_err(|m| self.rt_err(th, m))?;
+                .map_err(|m| Self::rt_err(th, m))?;
             job.out.extend_from_slice(&piece);
         }
         while job.pos < job.fmt.len() {
@@ -4374,10 +4386,13 @@ impl Lua {
             if job.arg > job.args.len() {
                 let arg = job.arg;
                 self.format_job = Some(job);
-                return Err(self.rt_err(th, format!("bad argument #{arg} to 'format' (no value)")));
+                return Err(Self::rt_err(
+                    th,
+                    format!("bad argument #{arg} to 'format' (no value)"),
+                ));
             }
             let Some(spec) = crate::stdlib::string::parse_spec(&job.fmt, job.pos)
-                .map_err(|m| self.rt_err(th, m))?
+                .map_err(|m| Self::rt_err(th, m))?
             else {
                 break;
             };
@@ -4402,7 +4417,7 @@ impl Lua {
                 }
             }
             let piece = crate::stdlib::string::render_spec(self, &spec, v, job.arg, None)
-                .map_err(|m| self.rt_err(th, m))?;
+                .map_err(|m| Self::rt_err(th, m))?;
             job.out.extend_from_slice(&piece);
         }
         let sv = self.new_string(&job.out);
@@ -4443,7 +4458,7 @@ impl Lua {
         // boundary PUC keeps on the stack while `__close` handlers run during
         // unwinding, so `debug.getinfo` sees it as the callee's caller.
         if let Some(spec) = c_frame {
-            let base = th.frames.last().map(|_| scratch_base(th)).unwrap_or(th.top);
+            let base = th.frames.last().map_or(th.top, |_| scratch_base(th));
             // A native callee has no Lua frame to carry the protection flag,
             // so this C frame is itself the boundary for any continuation it
             // later stages (e.g. `pcall(tostring, v)` calling `__tostring`).
@@ -4464,7 +4479,7 @@ impl Lua {
         let r = self.do_call(
             th,
             fuel,
-            CallSpec {
+            &CallSpec {
                 func_abs: f_abs,
                 argc,
                 ret_to,
@@ -4522,26 +4537,25 @@ impl Lua {
     ) -> Result<Option<Value>, VmError> {
         let mut cur = o;
         for _ in 0..MAX_META_CHAIN {
-            let mm = match cur {
-                Value::Table(t) => {
-                    let raw = self.tables[t.0 as usize].get(k);
-                    if raw != Value::Nil {
-                        return Ok(Some(raw));
-                    }
-                    let mm = self.metamethod(cur, Mm::Index);
-                    if mm == Value::Nil {
-                        return Ok(Some(Value::Nil));
-                    }
-                    mm
+            let mm = if let Value::Table(t) = cur {
+                let raw = self.tables[t.0 as usize].get(k);
+                if raw != Value::Nil {
+                    return Ok(Some(raw));
                 }
-                _ => {
-                    let mm = self.metamethod(cur, Mm::Index);
-                    if mm == Value::Nil {
-                        return Err(self
-                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
-                    }
-                    mm
+                let mm = self.metamethod(cur, Mm::Index);
+                if mm == Value::Nil {
+                    return Ok(Some(Value::Nil));
                 }
+                mm
+            } else {
+                let mm = self.metamethod(cur, Mm::Index);
+                if mm == Value::Nil {
+                    return Err(Self::rt_err(
+                        th,
+                        format!("attempt to index a {} value", cur.type_name()),
+                    ));
+                }
+                mm
             };
             match mm {
                 Value::Closure(_) | Value::Native(_) => {
@@ -4551,7 +4565,10 @@ impl Lua {
                 _ => cur = mm,
             }
         }
-        Err(self.rt_err(th, "'__index' chain too long; possible loop".into()))
+        Err(Self::rt_err(
+            th,
+            "'__index' chain too long; possible loop".into(),
+        ))
     }
 
     /// `o[k] = v` honoring `__newindex` chains.
@@ -4565,31 +4582,30 @@ impl Lua {
     ) -> Result<(), VmError> {
         let mut cur = o;
         for _ in 0..MAX_META_CHAIN {
-            let mm = match cur {
-                Value::Table(t) => {
-                    if self.tables[t.0 as usize].get(k) != Value::Nil {
-                        self.tables[t.0 as usize]
-                            .set(k, v)
-                            .map_err(|m| self.rt_err(th, m.to_string()))?;
-                        return Ok(());
-                    }
-                    let mm = self.metamethod(cur, Mm::NewIndex);
-                    if mm == Value::Nil {
-                        self.tables[t.0 as usize]
-                            .set(k, v)
-                            .map_err(|m| self.rt_err(th, m.to_string()))?;
-                        return Ok(());
-                    }
-                    mm
+            let mm = if let Value::Table(t) = cur {
+                if self.tables[t.0 as usize].get(k) != Value::Nil {
+                    self.tables[t.0 as usize]
+                        .set(k, v)
+                        .map_err(|m| Self::rt_err(th, m.to_string()))?;
+                    return Ok(());
                 }
-                _ => {
-                    let mm = self.metamethod(cur, Mm::NewIndex);
-                    if mm == Value::Nil {
-                        return Err(self
-                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
-                    }
-                    mm
+                let mm = self.metamethod(cur, Mm::NewIndex);
+                if mm == Value::Nil {
+                    self.tables[t.0 as usize]
+                        .set(k, v)
+                        .map_err(|m| Self::rt_err(th, m.to_string()))?;
+                    return Ok(());
                 }
+                mm
+            } else {
+                let mm = self.metamethod(cur, Mm::NewIndex);
+                if mm == Value::Nil {
+                    return Err(Self::rt_err(
+                        th,
+                        format!("attempt to index a {} value", cur.type_name()),
+                    ));
+                }
+                mm
             };
             match mm {
                 Value::Closure(_) | Value::Native(_) => {
@@ -4601,7 +4617,10 @@ impl Lua {
                 _ => cur = mm,
             }
         }
-        Err(self.rt_err(th, "'__newindex' chain too long; possible loop".into()))
+        Err(Self::rt_err(
+            th,
+            "'__newindex' chain too long; possible loop".into(),
+        ))
     }
 
     fn compare(
@@ -4640,25 +4659,22 @@ impl Lua {
             }
             CmpOp::Lt | CmpOp::Le => {
                 let or_equal = op == CmpOp::Le;
-                match self.less_than(a, b, or_equal) {
-                    Some(r) => {
-                        th.stack[dst_abs] = Value::Bool(r);
-                        Ok(())
+                if let Some(r) = self.less_than(a, b, or_equal) {
+                    th.stack[dst_abs] = Value::Bool(r);
+                    Ok(())
+                } else {
+                    let mm = self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
+                    if mm == Value::Nil {
+                        return Err(Self::rt_err(
+                            th,
+                            format!(
+                                "attempt to compare {} with {}",
+                                a.type_name(),
+                                b.type_name()
+                            ),
+                        ));
                     }
-                    None => {
-                        let mm = self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
-                        if mm == Value::Nil {
-                            return Err(self.rt_err(
-                                th,
-                                format!(
-                                    "attempt to compare {} with {}",
-                                    a.type_name(),
-                                    b.type_name()
-                                ),
-                            ));
-                        }
-                        self.call_value(th, mm, &[a, b], dst_abs, 2, RetShape::ToBool, fuel)
-                    }
+                    self.call_value(th, mm, &[a, b], dst_abs, 2, RetShape::ToBool, fuel)
                 }
             }
         }
@@ -4682,7 +4698,7 @@ impl Lua {
                 let mm = self.metamethod(v, Mm::Close);
                 if mm == Value::Nil {
                     // PUC reports the missing metamethod at close time.
-                    return Err(self.rt_err(
+                    return Err(Self::rt_err(
                         th,
                         "attempt to call a nil value (metamethod 'close')".into(),
                     ));
@@ -4764,7 +4780,7 @@ impl Lua {
             let mm = self.binary_mm(x, y, Mm::Concat);
             if mm == Value::Nil {
                 let bad = if is_concatable(x) { y } else { x };
-                return Err(self.rt_err(
+                return Err(Self::rt_err(
                     th,
                     format!("attempt to concatenate a {} value", bad.type_name()),
                 ));
@@ -4794,7 +4810,7 @@ impl Lua {
             match th.stack[first + i] {
                 Value::Str(s) => out.extend_from_slice(self.strings.get(s)),
                 v @ (Value::Int(_) | Value::Float(_)) => {
-                    out.extend_from_slice(fmt_number(v).as_bytes())
+                    out.extend_from_slice(fmt_number(v).as_bytes());
                 }
                 _ => unreachable!("flat_concat on non-concatable"),
             }
@@ -4808,7 +4824,7 @@ impl Lua {
         // integral) forces the float path.
         if let (Value::Int(i0), Value::Int(s)) = (th.stack[a], th.stack[a + 2]) {
             if s == 0 {
-                return Err(self.rt_err(th, "'for' step is zero".into()));
+                return Err(Self::rt_err(th, "'for' step is zero".into()));
             }
             match self.for_limit(th, a + 1, s > 0)? {
                 Some(l) if (s > 0 && i0 <= l) || (s < 0 && i0 >= l) => {
@@ -4823,7 +4839,7 @@ impl Lua {
             let step = self.for_number(th, a + 2, "step")?;
             let init = self.for_number(th, a, "initial value")?;
             if step == 0.0 {
-                return Err(self.rt_err(th, "'for' step is zero".into()));
+                return Err(Self::rt_err(th, "'for' step is zero".into()));
             }
             if (step > 0.0 && init <= limit) || (step < 0.0 && init >= limit) {
                 th.stack[a] = Value::Float(init);
@@ -4851,7 +4867,7 @@ impl Lua {
             },
             _ => None,
         };
-        n.ok_or_else(|| self.rt_err(th, format!("'for' {what} must be a number")))
+        n.ok_or_else(|| Self::rt_err(th, format!("'for' {what} must be a number")))
     }
 
     /// PUC `forlimit`: coerce an integer loop's limit. Numeric strings are
@@ -4869,9 +4885,9 @@ impl Lua {
             Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
                 Some(Value::Int(l)) => Ok(Some(l)),
                 Some(Value::Float(f)) => Ok(for_int_limit(f, step_positive)),
-                _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+                _ => Err(Self::rt_err(th, "'for' limit must be a number".into())),
             },
-            _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+            _ => Err(Self::rt_err(th, "'for' limit must be a number".into())),
         }
     }
 
@@ -4950,7 +4966,7 @@ impl Lua {
         let (mm_name, msg) = mm.unwrap();
         let m = self.metamethod(v, mm_name);
         if m == Value::Nil {
-            return Err(self.rt_err(th, msg));
+            return Err(Self::rt_err(th, msg));
         }
         // unary metamethods receive the operand twice (Lua convention)
         self.call_value(th, m, &[v, v], dst_abs, 2, RetShape::Normal, fuel)
@@ -5038,7 +5054,7 @@ impl Lua {
         }
     }
 
-    fn rt_err(&self, th: &Thread, message: String) -> VmError {
+    fn rt_err(th: &Thread, message: String) -> VmError {
         let source = th
             .frames
             .last()
@@ -5126,6 +5142,7 @@ impl Lua {
     }
 
     /// Approximate live heap footprint in bytes.
+    #[must_use]
     pub fn memory_used(&self) -> usize {
         let mut total = self.strings.bytes() + self.strings.live_count() * 40;
         for (i, t) in self.tables.iter().enumerate() {
@@ -5173,7 +5190,7 @@ impl Lua {
         if let Some(limit) = self.memory_limit {
             // only re-measured at collection points; cheap proxy otherwise
             if due && self.memory_used() > limit {
-                return Err(self.rt_err(th, "not enough memory".into()));
+                return Err(Self::rt_err(th, "not enough memory".into()));
             }
         }
         Ok(())
@@ -5535,10 +5552,10 @@ impl Lua {
             while i < ephemerons.len() {
                 let ti = ephemerons[i];
                 for (k, v) in self.tables[ti].entries() {
-                    if !self.value_marked(m, k) {
+                    if !Self::value_marked(m, k) {
                         continue;
                     }
-                    if !self.value_marked(m, v) {
+                    if !Self::value_marked(m, v) {
                         work.push(v);
                         changed = true;
                     }
@@ -5555,7 +5572,7 @@ impl Lua {
     /// True when `v` is alive for weak-reference purposes: non-collectable
     /// values and strings always are (PUC never collects a string through a
     /// weak table); everything else must be marked.
-    fn value_marked(&self, m: &Marks, v: Value) -> bool {
+    fn value_marked(m: &Marks, v: Value) -> bool {
         match v {
             Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
             Value::Table(t) => m.tables[t.0 as usize],
@@ -5566,7 +5583,7 @@ impl Lua {
         }
     }
 
-    fn weak_dead(&self, m: &Marks, v: Value) -> bool {
+    fn weak_dead(m: &Marks, v: Value) -> bool {
         matches!(
             v,
             Value::Table(_)
@@ -5574,7 +5591,7 @@ impl Lua {
                 | Value::Native(_)
                 | Value::Thread(_)
                 | Value::Userdata(_)
-        ) && !self.value_marked(m, v)
+        ) && !Self::value_marked(m, v)
     }
 
     /// Removes entries whose weak component died, and marks string keys/values
@@ -5587,8 +5604,8 @@ impl Lua {
             let keys_weak = matches!(kind, WeakKind::Keys | WeakKind::Both);
             let values_weak = matches!(kind, WeakKind::Values | WeakKind::Both);
             for (k, v) in self.tables[i].entries() {
-                let key_dead = keys_weak && self.weak_dead(m, k);
-                let val_dead = values_weak && self.weak_dead(m, v);
+                let key_dead = keys_weak && Self::weak_dead(m, k);
+                let val_dead = values_weak && Self::weak_dead(m, v);
                 if key_dead || val_dead {
                     self.tables[i].remove(k);
                 } else {
@@ -5653,12 +5670,7 @@ impl Lua {
             // A native/intrinsic call that triggered the collection may hold
             // open multret arguments above the top frame's window.
             if extra_top > 0 {
-                let start = th
-                    .frames
-                    .last()
-                    .and_then(|f| f.lua())
-                    .map(|f| f.base)
-                    .unwrap_or(0);
+                let start = th.frames.last().and_then(|f| f.lua()).map_or(0, |f| f.base);
                 let end = extra_top.min(stack_len);
                 if start < end {
                     work.extend_from_slice(&th.stack[start..end]);
@@ -5791,8 +5803,7 @@ fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_l
                     work.push(h);
                 }
             }
-            Pending::CloseTbc { err, .. } => work.push(err),
-            Pending::Reraise { err } => work.push(err),
+            Pending::CloseTbc { err, .. } | Pending::Reraise { err } => work.push(err),
             // Return values staged above the register window must survive
             // while their `__close` handlers run.
             Pending::FinishReturn { start, count } => {
@@ -5880,6 +5891,11 @@ impl Execution {
     /// Runs the script for at most `fuel` units of work (roughly one unit
     /// per VM instruction, with surcharges for calls and allocations).
     /// Returns `Step::Pending` if the budget ran out — call again to resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this execution already finished or a runtime error
+    /// escapes the script.
     pub fn step(&mut self, lua: &mut Lua, fuel: u64) -> Result<Step, Error> {
         if self.finished {
             return Err(Error::Runtime(RuntimeError {
@@ -5923,12 +5939,14 @@ impl Execution {
         lua.exec_roots.remove(&self.thread.0);
     }
 
+    #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished
     }
 
     /// `(chunk name, source line)` of the instruction the execution would
     /// run next, for debuggers and tracers. `None` once it has finished.
+    #[must_use]
     pub fn current_location(&self, lua: &Lua) -> Option<(String, u32)> {
         let th = lua.threads.get(self.current.0 as usize)?;
         let f = th.frames.iter().rev().find_map(|f| f.lua())?;
@@ -5982,8 +6000,8 @@ fn short_source(src: &str) -> String {
 /// Primary destination register of an instruction, if it writes one. Used by
 /// the best-effort `varinfo` naming for "number has no integer
 /// representation" errors.
-fn instr_dst(i: &Instr) -> Option<u8> {
-    match *i {
+fn instr_dst(i: Instr) -> Option<u8> {
+    match i {
         Instr::LoadK { dst, .. }
         | Instr::LoadNil { dst, .. }
         | Instr::LoadBool { dst, .. }
@@ -6034,7 +6052,7 @@ fn name_for_register(
             }
             Instr::LoadK { dst, .. } if dst == reg => return Some("constant".to_string()),
             _ => {
-                if instr_dst(&instr) == Some(reg) {
+                if instr_dst(instr) == Some(reg) {
                     return None;
                 }
             }
@@ -6058,8 +6076,7 @@ fn line_of(th: &Thread) -> u32 {
         .iter()
         .rev()
         .find_map(|f| f.lua())
-        .map(frame_line)
-        .unwrap_or(0)
+        .map_or(0, frame_line)
 }
 
 /// Source line the frame's next instruction belongs to.
@@ -6243,10 +6260,10 @@ fn int_lt_float(i: i64, f: f64) -> bool {
     if f.is_nan() {
         return false;
     }
-    if f >= 9.223372036854776e18 {
+    if f >= 9.223_372_036_854_776e18 {
         return true; // f >= 2^63 > any i64
     }
-    if f < -9.223372036854776e18 {
+    if f < -9.223_372_036_854_776e18 {
         return false;
     }
     let ff = f.floor();
@@ -6258,10 +6275,10 @@ fn int_le_float(i: i64, f: f64) -> bool {
     if f.is_nan() {
         return false;
     }
-    if f >= 9.223372036854776e18 {
+    if f >= 9.223_372_036_854_776e18 {
         return true;
     }
-    if f < -9.223372036854776e18 {
+    if f < -9.223_372_036_854_776e18 {
         return false;
     }
     let ff = f.floor();
@@ -6276,16 +6293,16 @@ fn for_int_limit(f: f64, step_positive: bool) -> Option<i64> {
         return None;
     }
     if step_positive {
-        if f < -9.223372036854776e18 {
+        if f < -9.223_372_036_854_776e18 {
             None
-        } else if f >= 9.223372036854776e18 {
+        } else if f >= 9.223_372_036_854_776e18 {
             Some(i64::MAX)
         } else {
             Some(f.floor() as i64)
         }
-    } else if f >= 9.223372036854776e18 {
+    } else if f >= 9.223_372_036_854_776e18 {
         None
-    } else if f < -9.223372036854776e18 {
+    } else if f < -9.223_372_036_854_776e18 {
         Some(i64::MIN)
     } else {
         Some(f.ceil() as i64)
@@ -6304,7 +6321,7 @@ fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
 }
 
 fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
-    use ArithOp::*;
+    use ArithOp::{Add, BAnd, BOr, BXor, Div, IDiv, Mod, Mul, Pow, Shl, Shr, Sub};
     let num_err = |v: Value| format!("attempt to perform arithmetic on a {} value", v.type_name());
     let int_err = |v: Value| match v {
         Value::Float(_) => "number has no integer representation".to_string(),
@@ -6319,14 +6336,15 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
         to_float(n.ok_or_else(|| num_err(v))?).ok_or_else(|| num_err(v))
     };
     match op {
-        Add | Sub | Mul => match (na, nb) {
-            (Some(Value::Int(x)), Some(Value::Int(y))) => Ok(Value::Int(match op {
-                Add => x.wrapping_add(y),
-                Sub => x.wrapping_sub(y),
-                Mul => x.wrapping_mul(y),
-                _ => unreachable!(),
-            })),
-            _ => {
+        Add | Sub | Mul => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
+                Ok(Value::Int(match op {
+                    Add => x.wrapping_add(y),
+                    Sub => x.wrapping_sub(y),
+                    Mul => x.wrapping_mul(y),
+                    _ => unreachable!(),
+                }))
+            } else {
                 let x = as_float(na, a)?;
                 let y = as_float(nb, b)?;
                 Ok(Value::Float(match op {
@@ -6336,7 +6354,7 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     _ => unreachable!(),
                 }))
             }
-        },
+        }
         Div => {
             let x = as_float(na, a)?;
             let y = as_float(nb, b)?;
@@ -6347,8 +6365,8 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
             let y = as_float(nb, b)?;
             Ok(Value::Float(x.powf(y)))
         }
-        IDiv => match (na, nb) {
-            (Some(Value::Int(x)), Some(Value::Int(y))) => {
+        IDiv => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
                 if y == 0 {
                     return Err("attempt to divide by zero".into());
                 }
@@ -6359,15 +6377,14 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     q
                 };
                 Ok(Value::Int(q))
-            }
-            _ => {
+            } else {
                 let x = as_float(na, a)?;
                 let y = as_float(nb, b)?;
                 Ok(Value::Float((x / y).floor()))
             }
-        },
-        Mod => match (na, nb) {
-            (Some(Value::Int(x)), Some(Value::Int(y))) => {
+        }
+        Mod => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
                 if y == 0 {
                     return Err("attempt to perform 'n%0'".into());
                 }
@@ -6377,8 +6394,7 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                 } else {
                     r
                 }))
-            }
-            _ => {
+            } else {
                 let x = as_float(na, a)?;
                 let y = as_float(nb, b)?;
                 let r = x % y;
@@ -6388,7 +6404,7 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     r
                 }))
             }
-        },
+        }
         BAnd | BOr | BXor => {
             let x = to_int(a).ok_or_else(|| int_err(a))?;
             let y = to_int(b).ok_or_else(|| int_err(b))?;

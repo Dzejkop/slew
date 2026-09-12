@@ -170,8 +170,8 @@ pub enum Instr {
         name: u16,
     },
     /// Numeric for: `base` holds (counter, limit, step); `base+3` is the
-    /// visible variable. ForPrep validates and jumps past ForLoop when the
-    /// loop runs zero times; ForLoop steps and jumps back while in range.
+    /// visible variable. `ForPrep` validates and jumps past `ForLoop` when the
+    /// loop runs zero times; `ForLoop` steps and jumps back while in range.
     ForPrep {
         base: u8,
         off: i32,
@@ -194,6 +194,7 @@ impl Instr {
     /// dynamic top at run time and are handled separately by the VM; here they
     /// contribute only their register base. Used as a conservative lower bound
     /// on a frame's live extent.
+    #[must_use]
     pub fn reg_high(self) -> u8 {
         fn m(a: u8, b: u8) -> u8 {
             a.max(b)
@@ -203,10 +204,13 @@ impl Instr {
             | Instr::LoadBool { dst, .. }
             | Instr::GetUpval { dst, .. }
             | Instr::NewTable { dst }
-            | Instr::Closure { dst, .. } => dst.saturating_add(1),
+            | Instr::Closure { dst, .. }
+            | Instr::Vararg { dst, .. } => dst.saturating_add(1),
             Instr::LoadNil { dst, n } => dst.saturating_add(n),
-            Instr::Move { dst, src } => m(dst, src).saturating_add(1),
-            Instr::SetUpval { src, .. } => src.saturating_add(1),
+            Instr::Move { dst, src } | Instr::Unary { dst, src, .. } => {
+                m(dst, src).saturating_add(1)
+            }
+            Instr::SetUpval { src, .. } | Instr::Test { src, .. } => src.saturating_add(1),
             Instr::GetIndex { dst, obj, key } => m(m(dst, obj), key).saturating_add(1),
             Instr::GetField { dst, obj, .. } => m(dst, obj).saturating_add(1),
             Instr::SetIndex { obj, key, src } => m(m(obj, key), src).saturating_add(1),
@@ -217,10 +221,9 @@ impl Instr {
             Instr::Arith { dst, lhs, rhs, .. } | Instr::Cmp { dst, lhs, rhs, .. } => {
                 m(m(dst, lhs), rhs).saturating_add(1)
             }
-            Instr::Unary { dst, src, .. } => m(dst, src).saturating_add(1),
             Instr::Concat { dst, base, n } => m(dst.saturating_add(1), base.saturating_add(n)),
-            Instr::Jump { .. } => 0,
-            Instr::Test { src, .. } => src.saturating_add(1),
+            // 255 is the unpatched `Close` placeholder.
+            Instr::Jump { .. } | Instr::Close { from: 255 } => 0,
             Instr::Call { base, .. } | Instr::TailCall { base, .. } => base.saturating_add(1),
             Instr::Return { base, n } => {
                 if n == 0 {
@@ -229,9 +232,6 @@ impl Instr {
                     base.saturating_add(n - 1).max(base.saturating_add(1))
                 }
             }
-            Instr::Vararg { dst, .. } => dst.saturating_add(1),
-            // 255 is the unpatched `Close` placeholder.
-            Instr::Close { from: 255 } => 0,
             Instr::Close { from } => from.saturating_add(1),
             Instr::Tbc { reg, .. } => reg.saturating_add(1),
             Instr::ForPrep { base, .. } | Instr::ForLoop { base, .. } => base.saturating_add(4),

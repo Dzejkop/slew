@@ -217,7 +217,7 @@ fn run_to_completion(lua: &mut Lua, src: &str) {
     loop {
         match exec.step(lua, 1_000_000).expect("setup runs") {
             Step::Done(_) => return,
-            Step::Pending => continue,
+            Step::Pending => {}
         }
     }
 }
@@ -479,8 +479,8 @@ fn tui_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char(' ') => app.paused = !app.paused,
-                KeyCode::Char('+') | KeyCode::Char('=') => app.bump_speed(1.5),
-                KeyCode::Char('-') | KeyCode::Char('_') => app.bump_speed(1.0 / 1.5),
+                KeyCode::Char('+' | '=') => app.bump_speed(1.5),
+                KeyCode::Char('-' | '_') => app.bump_speed(1.0 / 1.5),
                 KeyCode::Char('0') => app.speed = 1.0,
                 _ => {}
             }

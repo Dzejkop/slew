@@ -1,6 +1,8 @@
 //! The `string` library. Pattern functions are backed by `crate::pattern`;
 //! `gmatch`/`gsub` live in the Lua prelude on top of `string.find`.
 
+use std::cmp::Ordering;
+
 use crate::pattern::{self, Capture};
 use crate::value::{Value, fmt_g, fmt_number};
 use crate::vm::{Intrinsic, Lua, NativeKind};
@@ -80,12 +82,10 @@ fn arg_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
 /// Converts a 1-based (possibly negative) string index to a 0-based offset,
 /// per Lua's relative-index rules.
 fn str_index(i: i64, len: usize, default_for_zero: usize) -> usize {
-    if i > 0 {
-        (i as usize - 1).min(len)
-    } else if i == 0 {
-        default_for_zero
-    } else {
-        len.saturating_sub(i.unsigned_abs() as usize)
+    match i.cmp(&0) {
+        Ordering::Greater => (i as usize - 1).min(len),
+        Ordering::Equal => default_for_zero,
+        Ordering::Less => len.saturating_sub(i.unsigned_abs() as usize),
     }
 }
 
@@ -135,7 +135,7 @@ fn n_rep(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let per = s.len().checked_add(sep.len());
     let fits = per
         .and_then(|p| p.checked_mul(n as usize))
-        .is_some_and(|t| t <= i32::MAX as usize);
+        .is_some_and(|t| i32::try_from(t).is_ok());
     if !fits {
         return Err("resulting string too large".into());
     }
@@ -375,9 +375,9 @@ fn checkformat(form: &[u8], flags: &[u8], precision: bool) -> Result<(), String>
 }
 
 fn skip2digits(form: &[u8], mut i: usize) -> usize {
-    if form.get(i).is_some_and(|c| c.is_ascii_digit()) {
+    if form.get(i).is_some_and(u8::is_ascii_digit) {
         i += 1;
-        if form.get(i).is_some_and(|c| c.is_ascii_digit()) {
+        if form.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
     }
@@ -600,7 +600,7 @@ pub(crate) fn render_spec(
                                 // A decimal escape must not swallow a
                                 // following digit, so PUC zero-pads to three
                                 // digits then.
-                                if bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+                                if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
                                     out.extend_from_slice(format!("\\{b:03}").as_bytes());
                                 } else {
                                     out.extend_from_slice(format!("\\{b}").as_bytes());
@@ -783,7 +783,7 @@ fn format_hex_float(x: f64, upper: bool, precision: Option<usize>, flags: Flags)
     let raw_exp = ((bits >> 52) & 0x7ff) as i64;
     let frac = bits & ((1u64 << 52) - 1);
     let zero = raw_exp == 0 && frac == 0;
-    let mut lead: u64 = if raw_exp == 0 { 0 } else { 1 };
+    let mut lead: u64 = u64::from(raw_exp != 0);
     let exp: i64 = if zero {
         0
     } else if raw_exp == 0 {
@@ -828,7 +828,7 @@ fn format_hex_float(x: f64, upper: bool, precision: Option<usize>, flags: Flags)
                         r
                     }
                 };
-                format!("{kept:0width$x}", width = p)
+                format!("{kept:0p$x}")
             }
             Some(p) => {
                 // Excessive precision: exact digits plus zero padding.

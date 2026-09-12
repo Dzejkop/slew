@@ -106,26 +106,77 @@ impl Default for Userdata {
 /// interpreter buffer. Implementations choose their own sandboxing policy.
 pub trait Host {
     // ---- standard streams ----
+    /// Writes `bytes` to the standard output stream.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the write fails.
     fn stdout_write(&mut self, bytes: &[u8]) -> Result<(), HostError>;
+    /// Writes `bytes` to the standard error stream.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the write fails.
     fn stderr_write(&mut self, bytes: &[u8]) -> Result<(), HostError>;
+    /// Reads into `buf`, returning the number of bytes read.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the read fails.
     fn stdin_read(&mut self, buf: &mut [u8]) -> Result<usize, HostError>;
 
     // ---- files ----
     /// Opens `path` according to `mode` (`r`/`w`/`a`, optional `+`, optional
     /// `b`; validated by the caller) and returns a host handle.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the file cannot be opened.
     fn open(&mut self, path: &str, mode: &str) -> Result<u64, HostError>;
+    /// Closes the file handle `handle`.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if `handle` is not an open file or the close fails.
     fn close(&mut self, handle: u64) -> Result<(), HostError>;
+    /// Reads up to `buf.len()` bytes from `handle`, returning the count read.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if `handle` is not an open file or the read fails.
     fn read(&mut self, handle: u64, buf: &mut [u8]) -> Result<usize, HostError>;
+    /// Writes `bytes` to `handle`, returning the number of bytes written.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if `handle` is not an open file or the write fails.
     fn write(&mut self, handle: u64, bytes: &[u8]) -> Result<usize, HostError>;
+    /// Seeks `handle` relative to `whence` by `offset`, returning the new position.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if `handle` is not an open file or the seek fails.
     fn seek(&mut self, handle: u64, whence: SeekWhence, offset: i64) -> Result<u64, HostError>;
+    /// Flushes any buffered data for `handle`.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if `handle` is not an open file or the flush fails.
     fn flush(&mut self, handle: u64) -> Result<(), HostError>;
+    /// Sets the buffering mode for `handle`.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the buffering configuration is invalid.
     fn setvbuf(&mut self, _handle: u64, _mode: &[u8], _size: usize) -> Result<(), HostError> {
         Ok(())
     }
 
     // ---- filesystem (os.*) ----
+    /// Removes the file at `path`.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the file cannot be removed.
     fn remove(&mut self, path: &str) -> Result<(), HostError>;
+    /// Renames the file `from` to `to`.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if the rename fails.
     fn rename(&mut self, from: &str, to: &str) -> Result<(), HostError>;
+    /// Returns a fresh temporary file name.
+    ///
+    /// # Errors
+    /// Returns a [`HostError`] if a name cannot be generated.
     fn tmpname(&mut self) -> Result<String, HostError>;
 
     // ---- environment / time / locale ----
@@ -179,6 +230,7 @@ impl StdHost {
     }
 
     /// Preloads the bytes that `io.stdin`/`io.read` will see.
+    #[must_use]
     pub fn with_stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = bytes.into();
         self
@@ -186,11 +238,13 @@ impl StdHost {
 
     /// A shared handle to the captured stdout bytes. Cloning the handle before
     /// the host is moved into the interpreter lets tests inspect the sink.
+    #[must_use]
     pub fn stdout_sink(&self) -> std::rc::Rc<std::cell::RefCell<Vec<u8>>> {
         self.stdout.clone()
     }
 
     /// A shared handle to the captured stderr bytes.
+    #[must_use]
     pub fn stderr_sink(&self) -> std::rc::Rc<std::cell::RefCell<Vec<u8>>> {
         self.stderr.clone()
     }
@@ -234,7 +288,7 @@ impl StdHost {
     }
 }
 
-fn io_err(e: std::io::Error) -> HostError {
+fn io_err(e: &std::io::Error) -> HostError {
     let errno = e.raw_os_error().unwrap_or(0);
     HostError::with_errno(e.to_string(), errno)
 }
@@ -271,7 +325,7 @@ impl Host for StdHost {
         } else if mode.contains('a') {
             opts.create(true).append(true);
         }
-        let file = opts.open(&real).map_err(io_err)?;
+        let file = opts.open(&real).map_err(|e| io_err(&e))?;
         let h = self.next_handle;
         self.next_handle += 1;
         self.files.insert(h, file);
@@ -288,7 +342,7 @@ impl Host for StdHost {
     fn read(&mut self, handle: u64, buf: &mut [u8]) -> Result<usize, HostError> {
         use std::io::Read;
         match self.files.get_mut(&handle) {
-            Some(f) => f.read(buf).map_err(io_err),
+            Some(f) => f.read(buf).map_err(|e| io_err(&e)),
             None => Err(HostError::new("invalid file handle")),
         }
     }
@@ -296,7 +350,7 @@ impl Host for StdHost {
     fn write(&mut self, handle: u64, bytes: &[u8]) -> Result<usize, HostError> {
         use std::io::Write;
         match self.files.get_mut(&handle) {
-            Some(f) => f.write(bytes).map_err(io_err),
+            Some(f) => f.write(bytes).map_err(|e| io_err(&e)),
             None => Err(HostError::new("invalid file handle")),
         }
     }
@@ -309,7 +363,7 @@ impl Host for StdHost {
             SeekWhence::End => std::io::SeekFrom::End(offset),
         };
         match self.files.get_mut(&handle) {
-            Some(f) => f.seek(pos).map_err(io_err),
+            Some(f) => f.seek(pos).map_err(|e| io_err(&e)),
             None => Err(HostError::new("invalid file handle")),
         }
     }
@@ -317,28 +371,27 @@ impl Host for StdHost {
     fn flush(&mut self, handle: u64) -> Result<(), HostError> {
         use std::io::Write;
         match self.files.get_mut(&handle) {
-            Some(f) => f.flush().map_err(io_err),
+            Some(f) => f.flush().map_err(|e| io_err(&e)),
             None => Err(HostError::new("invalid file handle")),
         }
     }
 
     fn remove(&mut self, path: &str) -> Result<(), HostError> {
         let real = self.confined(path, false)?;
-        std::fs::remove_file(&real).map_err(io_err)
+        std::fs::remove_file(&real).map_err(|e| io_err(&e))
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<(), HostError> {
         let src = self.confined(from, false)?;
         let dst = self.confined(to, true)?;
-        std::fs::rename(&src, &dst).map_err(io_err)
+        std::fs::rename(&src, &dst).map_err(|e| io_err(&e))
     }
 
     fn tmpname(&mut self) -> Result<String, HostError> {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         Ok(format!("slew_tmp_{pid}_{nanos}"))
     }
 
@@ -353,8 +406,7 @@ impl Host for StdHost {
     fn time(&mut self) -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs() as i64)
     }
 
     fn time_parts(&mut self, t: i64, _utc: bool) -> DateParts {
@@ -369,7 +421,7 @@ impl Host for StdHost {
 
     fn setlocale(&mut self, locale: Option<&str>, _category: Option<&str>) -> Option<String> {
         match locale {
-            None | Some("") | Some("C") | Some("POSIX") => Some("C".to_string()),
+            None | Some("" | "C" | "POSIX") => Some("C".to_string()),
             Some(_) => None,
         }
     }
@@ -382,15 +434,15 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let yoe = y - era * 400;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    era * 146_097 + doe - 719_468
 }
 
 /// Inverse: civil date from days (Hinnant).
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;

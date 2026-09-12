@@ -1,0 +1,3 @@
+# Default rustfmt style; pin the edition explicitly so `cargo fmt` and editors
+# agree on edition-2024 formatting without relying on manifest inference.
+edition = "2024"

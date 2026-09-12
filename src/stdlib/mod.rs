@@ -123,7 +123,7 @@ fn run_prelude(lua: &mut Lua) {
     loop {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => break,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("prelude failed: {e}"),
         }
     }
@@ -198,19 +198,19 @@ fn install_package(lua: &mut Lua) {
 /// chunks are decoded by [`dump::undump`].
 fn load_source(
     lua: &mut Lua,
-    src: Vec<u8>,
+    src: &[u8],
     chunkname: &str,
     mode: &[u8],
     env: Option<Value>,
 ) -> Vec<Value> {
-    if dump::is_binary(&src) {
+    if dump::is_binary(src) {
         if !mode.contains(&b'b') {
             return vec![
                 Value::Nil,
                 lua.new_string(b"attempt to load a binary chunk (mode is 't')"),
             ];
         }
-        return match dump::undump(lua, &src, env) {
+        return match dump::undump(lua, src, env) {
             Ok(f) => vec![f],
             Err(msg) => {
                 let full = format!("{chunkname}: {msg}");
@@ -224,7 +224,7 @@ fn load_source(
             lua.new_string(b"attempt to load a text chunk (mode is 'b')"),
         ];
     }
-    match lua.load_named(chunkname, &src) {
+    match lua.load_named(chunkname, src) {
         Ok(chunk) => vec![lua.make_function(&chunk, env)],
         Err(Error::Parse(e)) => text_error(lua, chunkname, e.line, &e.message),
         Err(Error::Compile(e)) => text_error(lua, chunkname, e.line, &e.message),
@@ -297,7 +297,7 @@ fn n_load(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     // an explicitly passed `env` (even nil) replaces `_ENV`; absent means
     // the globals table
     let env = (args.len() > 3).then(|| arg(args, 3));
-    Ok(load_source(lua, src, &chunkname, &mode, env))
+    Ok(load_source(lua, &src, &chunkname, &mode, env))
 }
 
 fn n_loadfile(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -311,7 +311,7 @@ fn n_loadfile(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let mode = opt_bytes(lua, args, 1, "loadfile")?.unwrap_or_else(|| b"bt".to_vec());
     let env = (args.len() > 2).then(|| arg(args, 2));
     match lua.read_file(&name) {
-        Ok(Some(src)) => Ok(load_source(lua, src, &name, &mode, env)),
+        Ok(Some(src)) => Ok(load_source(lua, &src, &name, &mode, env)),
         Ok(None) => {
             let msg = format!("cannot open {name}");
             Ok(vec![Value::Nil, lua.new_string(msg.as_bytes())])
@@ -422,10 +422,10 @@ fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         None => Ok(vec![Value::Nil]),
         Some(mt) => {
             let protected = lua.metamethod_pub(v, "__metatable");
-            if protected != Value::Nil {
-                Ok(vec![protected])
-            } else {
+            if protected == Value::Nil {
                 Ok(vec![Value::Table(mt)])
+            } else {
+                Ok(vec![protected])
             }
         }
     }
@@ -596,7 +596,7 @@ fn n_rawset(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let Value::Table(id) = t else { unreachable!() };
     lua.tables[id.0 as usize]
         .set(arg(args, 1), arg(args, 2))
-        .map_err(|m| m.to_string())?;
+        .map_err(std::string::ToString::to_string)?;
     Ok(vec![t])
 }
 

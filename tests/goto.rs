@@ -25,7 +25,7 @@ fn eval_multi(src: &str) -> Vec<String> {
             Ok(Step::Done(vals)) => {
                 return vals.iter().map(|v| lua.display_value(*v)).collect();
             }
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }

@@ -10,7 +10,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     for _ in 0..1000 {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -39,7 +39,7 @@ fn run_err(src: &str) -> String {
     loop {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Err(e) => return e.to_string(),
         }
     }
@@ -558,7 +558,7 @@ fn uncaught_error_value_reaches_host() {
     let mut exec = lua.execute(&chunk);
     let err = loop {
         match exec.step(&mut lua, 10_000) {
-            Ok(Step::Pending) => continue,
+            Ok(Step::Pending) => {}
             Ok(Step::Done(_)) => panic!("expected error"),
             Err(slew::Error::Runtime(e)) => break e,
             Err(e) => panic!("unexpected: {e}"),
@@ -711,7 +711,7 @@ fn suspension_inside_pcall() {
     loop {
         match exec.step(&mut lua, 100).unwrap() {
             Step::Done(vals) => {
-                assert_eq!(vals, vec![Value::Int(500500)]);
+                assert_eq!(vals, vec![Value::Int(500_500)]);
                 break;
             }
             Step::Pending => pendings += 1,
