@@ -60,3 +60,11 @@ failing earlier, or panicking the host, is a regression. Refresh the
 baseline after intentional progress with `SLEW_BLESS=1 scripts/run-lua-tests.sh`.
 Known intentional gaps (no weak tables, no `io`/`os`, ...) are listed in
 [DESIGN.md](DESIGN.md).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+crate, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

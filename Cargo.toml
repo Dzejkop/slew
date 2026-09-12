@@ -2,13 +2,26 @@
 name = "slew"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A suspendable Lua interpreter with strict, embedder-controlled execution budgets"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Dzejkop/slew"
 homepage = "https://github.com/Dzejkop/slew"
+documentation = "https://docs.rs/slew"
 readme = "README.md"
 keywords = ["lua", "interpreter", "vm", "sandbox", "embedding"]
 categories = ["development-tools", "emulators"]
+# Repo infrastructure that has no place in the published crate. Everything
+# else (src, tests, examples, DESIGN.md, README.md) ships.
+exclude = [
+    "/.github",
+    "/docs",
+    "/scripts",
+    "/flake.nix",
+    "/flake.lock",
+    "/release-plz.toml",
+    "/rustfmt.toml",
+]
 
 [dependencies]
 reedline = { version = "0.48.0", optional = true }
