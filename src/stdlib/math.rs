@@ -1,9 +1,11 @@
-//! The `math` library. The PRNG is xoshiro256** with a fixed default seed:
-//! scripts are deterministic by default, in keeping with strict execution
-//! profiles. Embedders wanting real entropy can call `math.randomseed(n)`
-//! with a seed of their choosing.
+//! The `math` library. The PRNG is PUC 5.4's xoshiro256** implementation,
+//! ported byte-for-byte: `math.randomseed(n [, m])` seeds exactly as PUC's
+//! `setseed` (state `{n, 0xff, m, 0}` plus 16 discarded draws), and
+//! `math.random()`/`math.random(m)`/`math.random(m, n)`/`math.random(0)`
+//! consume the generator identically. The default seed is fixed rather than
+//! time-derived so scripts are deterministic; embedders reseed explicitly.
 
-use crate::value::{float_to_exact_int, Value};
+use crate::value::{Value, float_to_exact_int};
 use crate::vm::Lua;
 
 use super::{arg, set_field};
@@ -22,6 +24,8 @@ pub fn install(lua: &mut Lua) {
         ("asin", n_asin),
         ("acos", n_acos),
         ("atan", n_atan),
+        ("deg", n_deg),
+        ("rad", n_rad),
         ("exp", n_exp),
         ("log", n_log),
         ("fmod", n_fmod),
@@ -59,7 +63,10 @@ fn int(args: &[Value], i: usize, who: &str) -> Result<i64, String> {
     match arg(args, i) {
         Value::Int(n) => Ok(n),
         Value::Float(f) => float_to_exact_int(f).ok_or_else(|| {
-            format!("bad argument #{} to '{who}' (number has no integer representation)", i + 1)
+            format!(
+                "bad argument #{} to '{who}' (number has no integer representation)",
+                i + 1
+            )
         }),
         v => Err(format!(
             "bad argument #{} to '{who}' (number expected, got {})",
@@ -123,6 +130,22 @@ fn n_atan(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Float(y.atan2(x))])
 }
 
+/// `math.deg`: radians → degrees (`x / (pi/180)`).
+fn n_deg(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+    Ok(vec![Value::Float(
+        num(args, 0, "deg")? / RADIANS_PER_DEGREE,
+    )])
+}
+
+/// `math.rad`: degrees → radians (`x * (pi/180)`).
+fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+    const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+    Ok(vec![Value::Float(
+        num(args, 0, "rad")? * RADIANS_PER_DEGREE,
+    )])
+}
+
 fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "log")?;
     Ok(vec![Value::Float(match arg(args, 1) {
@@ -159,13 +182,23 @@ fn n_fmod(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 fn n_modf(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "modf")?;
     let ip = x.trunc();
-    Ok(vec![to_int_result(ip), Value::Float(if x.is_infinite() { 0.0 } else { x - ip })])
+    Ok(vec![
+        to_int_result(ip),
+        Value::Float(if x.is_infinite() { 0.0 } else { x - ip }),
+    ])
 }
 
-fn n_tointeger(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tointeger(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         v @ Value::Int(_) => v,
         Value::Float(f) => float_to_exact_int(f).map_or(Value::Nil, Value::Int),
+        // `lua_tointegerx` coerces numeric strings, including below-`i64::MIN`
+        // decimals via the shared numeral parser.
+        Value::Str(id) => match super::parse_number(lua.strings.get(id)) {
+            Some(Value::Int(i)) => Value::Int(i),
+            Some(Value::Float(f)) => float_to_exact_int(f).map_or(Value::Nil, Value::Int),
+            _ => Value::Nil,
+        },
         _ => Value::Nil,
     }])
 }
@@ -180,7 +213,7 @@ fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 fn minmax(args: &[Value], who: &str, want_max: bool) -> Result<Vec<Value>, String> {
     if args.is_empty() {
-        return Err(format!("bad argument #1 to '{who}' (number expected, got no value)"));
+        return Err(format!("bad argument #1 to '{who}' (value expected)"));
     }
     let mut best = args[0];
     for (i, &v) in args.iter().enumerate() {
@@ -205,11 +238,11 @@ fn to_f(v: Value) -> f64 {
 }
 
 fn n_max(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    minmax(args, "max", true)
+    minmax(args, "math.max", true)
 }
 
 fn n_min(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    minmax(args, "min", false)
+    minmax(args, "math.min", false)
 }
 
 fn n_ult(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -218,47 +251,83 @@ fn n_ult(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Bool(a < b)])
 }
 
-// ---- deterministic PRNG (xoshiro256**) ----
+// ---- deterministic PRNG (PUC 5.4 xoshiro256**) ----
+
+/// PUC's `I2d`: the top 53 bits of `x` scaled to `[0, 1)`.
+fn i2d(x: u64) -> f64 {
+    (x >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// PUC's `project`: uniform projection of `ran` into `[0, n]`, drawing more
+/// values from `lua` when the first lands outside.
+fn project(lua: &mut Lua, mut ran: u64, n: u64) -> u64 {
+    if n & n.wrapping_add(1) == 0 {
+        return ran & n; // n + 1 is a power of two
+    }
+    let mut lim = n;
+    lim |= lim >> 1;
+    lim |= lim >> 2;
+    lim |= lim >> 4;
+    lim |= lim >> 8;
+    lim |= lim >> 16;
+    lim |= lim >> 32;
+    loop {
+        ran &= lim;
+        if ran <= n {
+            return ran;
+        }
+        ran = lua.next_random();
+    }
+}
 
 fn n_random(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let r = lua.next_random();
+    // PUC draws the value before validating arguments, so failed calls still
+    // advance the generator.
+    let rv = lua.next_random();
+    if args.len() > 2 {
+        return Err("wrong number of arguments".into());
+    }
     match (arg(args, 0), arg(args, 1)) {
-        (Value::Nil, _) => {
-            // float in [0, 1)
-            Ok(vec![Value::Float((r >> 11) as f64 * (1.0 / (1u64 << 53) as f64))])
-        }
+        (Value::Nil, _) => Ok(vec![Value::Float(i2d(rv))]),
         (_, Value::Nil) => {
-            let m = int(args, 0, "random")?;
-            if m < 1 {
-                return Err("bad argument #1 to 'random' (interval is empty)".into());
+            let up = int(args, 0, "random")?;
+            if up == 0 {
+                // single 0: full random integer
+                Ok(vec![Value::Int(rv as i64)])
+            } else {
+                if up < 1 {
+                    return Err("bad argument #1 to 'random' (interval is empty)".into());
+                }
+                let p = project(lua, rv, (up as u64).wrapping_sub(1));
+                Ok(vec![Value::Int(p.wrapping_add(1) as i64)])
             }
-            Ok(vec![Value::Int(1 + (r % m as u64) as i64)])
         }
         _ => {
             let lo = int(args, 0, "random")?;
-            let hi = int(args, 1, "random")?;
-            if lo > hi {
-                return Err("bad argument #2 to 'random' (interval is empty)".into());
+            let up = int(args, 1, "random")?;
+            if lo > up {
+                return Err("bad argument #1 to 'random' (interval is empty)".into());
             }
-            let range = hi.wrapping_sub(lo) as u64;
-            let off = if range == u64::MAX { r } else { r % (range + 1) };
-            Ok(vec![Value::Int(lo.wrapping_add(off as i64))])
+            let p = project(lua, rv, (up as u64).wrapping_sub(lo as u64));
+            Ok(vec![Value::Int(p.wrapping_add(lo as u64) as i64)])
         }
     }
 }
 
 fn n_randomseed(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
-    let seed = match arg(args, 0) {
-        Value::Nil => 0,
-        Value::Int(i) => i as u64,
-        Value::Float(f) => f.to_bits(),
-        v => {
-            return Err(format!(
-                "bad argument #1 to 'randomseed' (number expected, got {})",
-                v.type_name()
-            ))
-        }
+    // `math.randomseed()` with no argument uses a time/address-derived seed in
+    // PUC. slew has no ambient time authority, so it reuses its fixed default;
+    // either way the returned pair fully reproduces the state.
+    let (n1, n2) = if arg(args, 0) == Value::Nil {
+        (0x536c65775f5f5f31u64, 0u64)
+    } else {
+        let n1 = int(args, 0, "randomseed")? as u64;
+        let n2 = match arg(args, 1) {
+            Value::Nil => 0,
+            _ => int(args, 1, "randomseed")? as u64,
+        };
+        (n1, n2)
     };
-    lua.seed_random(seed);
-    Ok(vec![])
+    lua.seed_random_pair(n1, n2);
+    Ok(vec![Value::Int(n1 as i64), Value::Int(n2 as i64)])
 }

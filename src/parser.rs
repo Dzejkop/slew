@@ -18,7 +18,10 @@ impl fmt::Display for ParseError {
 
 impl From<LexError> for ParseError {
     fn from(e: LexError) -> Self {
-        ParseError { message: e.message, line: e.line }
+        ParseError {
+            message: e.message,
+            line: e.line,
+        }
     }
 }
 
@@ -90,7 +93,20 @@ impl<'a> Parser<'a> {
     }
 
     fn err<T>(&self, message: impl Into<String>) -> Result<T, ParseError> {
-        Err(ParseError { message: message.into(), line: self.line })
+        Err(ParseError {
+            message: message.into(),
+            line: self.line,
+        })
+    }
+
+    /// The current token as PUC spells it after `near`: end of input is the
+    /// unquoted `<eof>`, every other token is wrapped in single quotes.
+    fn near(&self) -> String {
+        if self.tok == Token::Eof {
+            "<eof>".to_string()
+        } else {
+            format!("'{}'", self.tok)
+        }
     }
 
     fn advance(&mut self) -> Result<Token, ParseError> {
@@ -113,17 +129,19 @@ impl<'a> Parser<'a> {
             self.advance()?;
             Ok(())
         } else {
-            self.err(format!("'{}' expected near '{}'", tok, self.tok))
+            self.err(format!("'{}' expected near {}", tok, self.near()))
         }
     }
 
     fn expect_name(&mut self) -> Result<Box<str>, ParseError> {
         match self.tok {
             Token::Name(_) => {
-                let Token::Name(n) = self.advance()? else { unreachable!() };
+                let Token::Name(n) = self.advance()? else {
+                    unreachable!()
+                };
                 Ok(n)
             }
-            _ => self.err(format!("<name> expected near '{}'", self.tok)),
+            _ => self.err(format!("<name> expected near {}", self.near())),
         }
     }
 
@@ -161,7 +179,7 @@ impl<'a> Parser<'a> {
         };
         self.check(&Token::Semi)?;
         if !self.block_ends() {
-            return self.err(format!("'end' expected near '{}'", self.tok));
+            return self.err(format!("'end' expected near {}", self.near()));
         }
         Ok(Stmt::Return { exprs, line })
     }
@@ -179,13 +197,16 @@ impl<'a> Parser<'a> {
             }
             Token::Goto => {
                 self.advance()?;
-                Ok(Stmt::Goto { label: self.expect_name()?, line })
+                Ok(Stmt::Goto {
+                    label: self.expect_name()?,
+                    line,
+                })
             }
             Token::DoubleColon => {
                 self.advance()?;
                 let name = self.expect_name()?;
                 self.expect_token(Token::DoubleColon)?;
-                Ok(Stmt::Label(name))
+                Ok(Stmt::Label(name, line))
             }
             Token::Do => {
                 self.advance()?;
@@ -253,7 +274,14 @@ impl<'a> Parser<'a> {
             self.expect_token(Token::Do)?;
             let body = self.block()?;
             self.expect_token(Token::End)?;
-            Ok(Stmt::NumericFor { var: first, start, end, step, body, line })
+            Ok(Stmt::NumericFor {
+                var: first,
+                start,
+                end,
+                step,
+                body,
+                line,
+            })
         } else {
             let mut vars = vec![first];
             while self.check(&Token::Comma)? {
@@ -264,7 +292,12 @@ impl<'a> Parser<'a> {
             self.expect_token(Token::Do)?;
             let body = self.block()?;
             self.expect_token(Token::End)?;
-            Ok(Stmt::GenericFor { vars, exprs, body, line })
+            Ok(Stmt::GenericFor {
+                vars,
+                exprs,
+                body,
+                line,
+            })
         }
     }
 
@@ -333,7 +366,11 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        Ok(Stmt::Local { names, values, line })
+        Ok(Stmt::Local {
+            names,
+            values,
+            line,
+        })
     }
 
     /// Expression statement: assignment or call.
@@ -352,7 +389,11 @@ impl<'a> Parser<'a> {
             }
             self.expect_token(Token::Assign)?;
             let values = self.expr_list()?;
-            Ok(Stmt::Assign { targets, values, line })
+            Ok(Stmt::Assign {
+                targets,
+                values,
+                line,
+            })
         } else {
             if !matches!(first, Expr::Call { .. } | Expr::MethodCall { .. }) {
                 return self.err("syntax error: unexpected expression statement");
@@ -374,7 +415,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Token::Name(_) => params.push(self.expect_name()?),
-                    _ => return self.err(format!("<name> expected near '{}'", self.tok)),
+                    _ => return self.err(format!("<name> expected near {}", self.near())),
                 }
                 if !self.check(&Token::Comma)? {
                     break;
@@ -383,8 +424,15 @@ impl<'a> Parser<'a> {
         }
         self.expect_token(Token::RParen)?;
         let body = self.block()?;
+        let end_line = self.line; // line of the closing `end`
         self.expect_token(Token::End)?;
-        Ok(FuncBody { params, is_vararg, body, line })
+        Ok(FuncBody {
+            params,
+            is_vararg,
+            body,
+            line,
+            end_line,
+        })
     }
 
     fn expr_list(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -406,22 +454,38 @@ impl<'a> Parser<'a> {
             Token::Not => {
                 self.advance()?;
                 let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp { op: UnOp::Not, operand: Box::new(operand), line }
+                Expr::UnOp {
+                    op: UnOp::Not,
+                    operand: Box::new(operand),
+                    line,
+                }
             }
             Token::Minus => {
                 self.advance()?;
                 let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp { op: UnOp::Neg, operand: Box::new(operand), line }
+                Expr::UnOp {
+                    op: UnOp::Neg,
+                    operand: Box::new(operand),
+                    line,
+                }
             }
             Token::Hash => {
                 self.advance()?;
                 let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp { op: UnOp::Len, operand: Box::new(operand), line }
+                Expr::UnOp {
+                    op: UnOp::Len,
+                    operand: Box::new(operand),
+                    line,
+                }
             }
             Token::Tilde => {
                 self.advance()?;
                 let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp { op: UnOp::BNot, operand: Box::new(operand), line }
+                Expr::UnOp {
+                    op: UnOp::BNot,
+                    operand: Box::new(operand),
+                    line,
+                }
             }
             _ => self.simple_expr()?,
         };
@@ -433,7 +497,12 @@ impl<'a> Parser<'a> {
             let line = self.line;
             self.advance()?;
             let rhs = self.sub_expr(right)?;
-            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), line };
+            lhs = Expr::BinOp {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                line,
+            };
         }
         Ok(lhs)
     }
@@ -454,15 +523,21 @@ impl<'a> Parser<'a> {
                 Ok(Expr::False)
             }
             Token::Int(_) => {
-                let Token::Int(i) = self.advance()? else { unreachable!() };
+                let Token::Int(i) = self.advance()? else {
+                    unreachable!()
+                };
                 Ok(Expr::Int(i))
             }
             Token::Float(_) => {
-                let Token::Float(f) = self.advance()? else { unreachable!() };
+                let Token::Float(f) = self.advance()? else {
+                    unreachable!()
+                };
                 Ok(Expr::Float(f))
             }
             Token::Str(_) => {
-                let Token::Str(s) = self.advance()? else { unreachable!() };
+                let Token::Str(s) = self.advance()? else {
+                    unreachable!()
+                };
                 Ok(Expr::Str(s))
             }
             Token::Ellipsis => {
@@ -489,7 +564,7 @@ impl<'a> Parser<'a> {
                 self.expect_token(Token::RParen)?;
                 Expr::Paren(Box::new(inner))
             }
-            t => return self.err(format!("unexpected symbol near '{t}'")),
+            _ => return self.err(format!("unexpected symbol near {}", self.near())),
         };
         loop {
             let line = self.line;
@@ -507,17 +582,30 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let key = self.expr()?;
                     self.expect_token(Token::RBracket)?;
-                    e = Expr::Index { obj: Box::new(e), key: Box::new(key), line };
+                    e = Expr::Index {
+                        obj: Box::new(e),
+                        key: Box::new(key),
+                        line,
+                    };
                 }
                 Token::Colon => {
                     self.advance()?;
                     let name = self.expect_name()?;
                     let args = self.call_args()?;
-                    e = Expr::MethodCall { obj: Box::new(e), name, args, line };
+                    e = Expr::MethodCall {
+                        obj: Box::new(e),
+                        name,
+                        args,
+                        line,
+                    };
                 }
                 Token::LParen | Token::Str(_) | Token::LBrace => {
                     let args = self.call_args()?;
-                    e = Expr::Call { func: Box::new(e), args, line };
+                    e = Expr::Call {
+                        func: Box::new(e),
+                        args,
+                        line,
+                    };
                 }
                 _ => return Ok(e),
             }
@@ -537,11 +625,13 @@ impl<'a> Parser<'a> {
                 Ok(args)
             }
             Token::Str(_) => {
-                let Token::Str(s) = self.advance()? else { unreachable!() };
+                let Token::Str(s) = self.advance()? else {
+                    unreachable!()
+                };
                 Ok(vec![Expr::Str(s)])
             }
             Token::LBrace => Ok(vec![self.table_constructor()?]),
-            t => self.err(format!("function arguments expected near '{t}'")),
+            _ => self.err(format!("function arguments expected near {}", self.near())),
         }
     }
 
@@ -561,7 +651,9 @@ impl<'a> Parser<'a> {
                     pairs.push((k, v));
                 }
                 Token::Name(_) if self.peek_is_assign()? => {
-                    let Token::Name(n) = self.advance()? else { unreachable!() };
+                    let Token::Name(n) = self.advance()? else {
+                        unreachable!()
+                    };
                     let k = Expr::Str(n.as_bytes().into());
                     self.advance()?; // '='
                     let v = self.expr()?;

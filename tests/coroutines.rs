@@ -3,7 +3,9 @@
 use slew::{Lua, Step, Value};
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     for _ in 0..10_000 {
         match exec.step(lua, 100_000) {
@@ -30,7 +32,9 @@ fn eval_multi(src: &str) -> Vec<String> {
 
 fn run_err(src: &str) -> String {
     let mut lua = Lua::new();
-    let chunk = lua.load(src).unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
+    let chunk = lua
+        .load(src)
+        .unwrap_or_else(|e| panic!("{e}\nsource:\n{src}"));
     let mut exec = lua.execute(&chunk);
     loop {
         match exec.step(&mut lua, 100_000) {
@@ -183,8 +187,10 @@ fn yield_from_main_errors() {
     assert!(err.contains("outside a coroutine"), "got: {err}");
     assert_eq!(eval("return coroutine.isyieldable()"), "false");
     assert_eq!(
-        eval("local co = coroutine.create(function() return coroutine.isyieldable() end) \
-              local _, v = coroutine.resume(co) return v"),
+        eval(
+            "local co = coroutine.create(function() return coroutine.isyieldable() end) \
+              local _, v = coroutine.resume(co) return v"
+        ),
         "true"
     );
 }
@@ -356,15 +362,19 @@ fn close_receives_error_object_during_unwind() {
 
 #[test]
 fn close_false_and_nil_allowed() {
-    assert_eq!(eval("do local x <close> = nil local y <close> = false end return 'ok'"), "ok");
+    assert_eq!(
+        eval("do local x <close> = nil local y <close> = false end return 'ok'"),
+        "ok"
+    );
     let err = run_err("local x <close> = 42");
     assert!(err.contains("non-closable"), "got: {err}");
     let mut lua = Lua::new();
-    assert!(lua
-        .load("local a <close>, b <close> = nil, nil")
-        .unwrap_err()
-        .to_string()
-        .contains("multiple"));
+    assert!(
+        lua.load("local a <close>, b <close> = nil, nil")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple")
+    );
 }
 
 #[test]
@@ -377,6 +387,59 @@ fn error_inside_close_propagates() {
              end)"
         ),
         ["false", "close failed"]
+    );
+}
+
+#[test]
+fn errors_chained_through_unwinding_close() {
+    let closers = "local function c(f) return setmetatable({}, {__close = f}) end \
+                   local seen = {} local count = 0 ";
+    // Every to-be-closed variable is closed even when a __close raises during
+    // unwinding, each handler receives the previous error, and the final
+    // error is the last one raised (upstream locals.lua:418).
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) count = count + 1; error('@x') end) \
+                 local y <close> = c(function(_, msg) count = count + 1; error('@y') end) \
+                 local z <close> = c(function(_, msg) count = count + 1; error('@z') end) \
+                 return 200 \
+             end \
+             local _, msg = pcall(foo) \
+             return table.concat({{tostring(string.find(msg, '@x') ~= nil), tostring(count)}}, ',')"
+        )),
+        "true,3"
+    );
+    // The error object passed to the remaining handler is the newest one:
+    // `z` raises `@z` on the normal-return close, then `y` sees `@z` and
+    // raises `@y`, and `x` sees `@y`.
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) seen.x = msg end) \
+                 local y <close> = c(function(_, msg) seen.y = msg; error('@y') end) \
+                 local z <close> = c(function(_, msg) error('@z') end) \
+                 return 200 \
+             end \
+             pcall(foo) \
+             return tostring(string.find(seen.x, '@y') ~= nil)"
+        )),
+        "true"
+    );
+    // A non-string original error object reaches the first handler unchanged.
+    assert_eq!(
+        eval(&format!(
+            "{closers} \
+             local function foo() \
+                 local x <close> = c(function(_, msg) seen.x = msg end) \
+                 error(4) \
+             end \
+             pcall(foo) \
+             return tostring(seen.x == 4)"
+        )),
+        "true"
     );
 }
 
@@ -404,4 +467,146 @@ fn close_suspends_correctly() {
             Step::Pending => {}
         }
     }
+}
+
+#[test]
+fn generic_for_closes_fourth_explist_value() {
+    // locals.lua: the generic-for explist may yield iterator, state, control
+    // and a fourth to-be-closed value; it must be closed on every exit path.
+    // Normal completion.
+    assert_eq!(
+        eval(
+            "local closed = 0 \
+             for k in next, {1, 2, 3}, nil, \
+                 setmetatable({}, {__close = function() closed = closed + 1 end}) do end \
+             return closed"
+        ),
+        "1"
+    );
+    // `break`.
+    assert_eq!(
+        eval(
+            "local closed = 0 \
+             for k in next, {1, 2, 3}, nil, \
+                 setmetatable({}, {__close = function() closed = closed + 1 end}) do break end \
+             return closed"
+        ),
+        "1"
+    );
+    // Error unwinding, with the original error preserved.
+    assert_eq!(
+        eval_multi(
+            "local closed = 0 \
+             local ok, err = pcall(function() \
+                 for k in next, {1, 2, 3}, nil, \
+                     setmetatable({}, {__close = function() closed = closed + 1 end}) do \
+                     error('boom', 0) \
+                 end \
+             end) \
+             return ok, err, closed"
+        ),
+        ["false", "boom", "1"]
+    );
+    // A closing value returned as the 4th result of a custom iterator factory
+    // (locals.lua's `open`), exercised across normal and broken loops.
+    assert_eq!(
+        eval_multi(
+            "local open = 0 \
+             local function iter(n) \
+                 local i = n \
+                 return function() i = i - 1; if i > 0 then return i end end, \
+                        nil, nil, \
+                        setmetatable({}, {__close = function() open = open + 1 end}) \
+             end \
+             local s = 0 \
+             for i in iter(10) do s = s + i end \
+             local b = 0 \
+             for i in iter(10) do if i < 5 then break end b = b + i end \
+             return s, b, open"
+        ),
+        ["45", "35", "2"]
+    );
+}
+
+#[test]
+fn pcall_as_coroutine_body_suspends_and_resumes() {
+    // `coroutine.create(pcall)` calls the body protected across yields; on the
+    // final error the pending `__close` handlers run in PUC's order and with
+    // PUC's error tracking before the error is returned.
+    let src = "\
+local function func2close (f) return setmetatable({}, {__close = f}) end
+local track = {}
+local function h (o) local hv <close> = o; return 1 end
+local function foo ()
+  local x <close> = func2close(function (_, msg) track[#track + 1] = msg or false; error(20) end)
+  local y <close> = func2close(function (_, msg) track[#track + 1] = msg or false; return 1000 end)
+  local z <close> = func2close(function (_, msg) track[#track + 1] = msg or false; error(10) end)
+  coroutine.yield(1)
+  h(func2close(function (_, msg) track[#track + 1] = msg or false; error(2) end))
+end
+local co = coroutine.create(pcall)
+local st, res = coroutine.resume(co, foo)
+assert(st and res == 1)
+local st2, res1, res2 = coroutine.resume(co)
+assert(coroutine.status(co) == 'dead')
+assert(st2 and not res1 and res2 == 20)
+assert(track[1] == false and track[2] == 2 and track[3] == 10 and track[4] == 10)
+return true";
+    assert_eq!(eval(src), "true");
+}
+
+#[test]
+fn pcall_as_coroutine_body_returns_results() {
+    // A non-yielding protected body returns `true, ...` as the coroutine's
+    // values, which resume then prefixes with its own success flag.
+    assert_eq!(
+        eval_multi(
+            "local co = coroutine.create(pcall)\n\
+             return coroutine.resume(co, function () return 1, 2 end)"
+        ),
+        ["true", "true", "1", "2"]
+    );
+}
+
+#[test]
+fn c_call_boundaries_are_not_yieldable() {
+    // PUC invokes `table.sort` comparators and `string.gsub` function
+    // replacements from C via `lua_call` (no continuation), so a yield inside
+    // them fails with a cross-boundary error while the enclosing coroutine
+    // stays yieldable afterwards.
+    let src = "\
+local co = coroutine.wrap(function ()
+  assert(not pcall(table.sort, {1, 2, 3}, coroutine.yield))
+  assert(coroutine.isyieldable())
+  coroutine.yield(20)
+  return 30
+end)
+assert(co() == 20)
+assert(co() == 30)
+local g = function (c)
+  assert(not coroutine.isyieldable())
+  return c .. c
+end
+local co2 = coroutine.wrap(function ()
+  assert(coroutine.isyieldable())
+  return string.gsub('a', '.', g)
+end)
+assert(co2() == 'aa')
+return true";
+    assert_eq!(eval(src), "true");
+}
+
+#[test]
+fn nested_protected_calls_prepend_each_success_flag() {
+    // Each `pcall`/`xpcall` adds its own success flag on top of its callee's
+    // results, including when the callee is itself a protected call.
+    let src = "\
+local a, b, v = xpcall(pcall, function (...) return ... end,
+                       function () return 20 end)
+assert(a == true and b == true and v == 20)
+local c, d, e = xpcall(pcall, function (...) return ... end,
+                       function () error('boom', 0) end)
+assert(c == true and d == false and e == 'boom')
+return true";
+    assert_eq!(eval(src), "true");
 }

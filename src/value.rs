@@ -5,10 +5,59 @@
 //! collector straightforward (no `Rc` cycles, no unsafe).
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StrId(pub u32);
+
+/// PUC's `LUAI_MAXSHORTLEN`: strings up to this length are *short* and always
+/// interned; longer strings are *long* and (when created at runtime) get a
+/// fresh object identity.
+pub const MAXSHORTLEN: usize = 40;
+
+/// A reference to a Lua string.
+///
+/// `obj` is the object identity (distinct `%p` for distinct runtime long
+/// strings), `content` is a canonical object handle with the same bytes used
+/// for equality and table keys. For interned strings the two coincide.
+#[derive(Clone, Copy, Debug)]
+pub struct StrRef {
+    pub obj: StrId,
+    /// Canonical handle whose `StrId` uniquely identifies the byte content.
+    pub content: StrId,
+}
+
+impl StrRef {
+    /// A reference to a string already known to be canonical (interned), so its
+    /// object handle also identifies its content.
+    pub const fn interned(id: StrId) -> Self {
+        StrRef {
+            obj: id,
+            content: id,
+        }
+    }
+}
+
+impl PartialEq for StrRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+    }
+}
+
+impl Eq for StrRef {}
+
+impl Hash for StrRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.content.hash(state);
+    }
+}
+
+impl From<StrRef> for StrId {
+    fn from(r: StrRef) -> StrId {
+        r.obj
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TableId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -19,20 +68,26 @@ pub struct NativeId(pub u32);
 pub struct UpvalId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ThreadId(pub u32);
+/// Handle into the userdata arena. Userdata carries an optional metatable and
+/// a host-object payload (see [`crate::host::Userdata`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct UserdataId(pub u32);
 
 /// A Lua value. `PartialEq` is *raw* identity/bit equality (NaN ~= NaN, and
-/// `Int(1) != Float(1.0)`); Lua `==` semantics live in the VM (`Lua::values_equal`).
+/// `Int(1) != Float(1.0)`), except strings which compare by content (see
+/// [`StrRef`]); Lua `==` semantics live in the VM (`Lua::values_equal`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(StrId),
+    Str(StrRef),
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),
     Thread(ThreadId),
+    Userdata(UserdataId),
 }
 
 impl Value {
@@ -49,12 +104,20 @@ impl Value {
             Value::Table(_) => "table",
             Value::Closure(_) | Value::Native(_) => "function",
             Value::Thread(_) => "thread",
+            Value::Userdata(_) => "userdata",
         }
     }
 }
 
-/// String interner. Every live Lua string is interned, so `StrId` equality
-/// is string equality and strings hash O(1) as table keys.
+/// String store. Short strings (length <= [`MAXSHORTLEN`]) and compile-time
+/// literals are *interned*: equal content is one object. Long strings created
+/// at runtime are not deduplicated — each gets its own object — but every
+/// object also records a canonical *content* handle so equality and table keys
+/// stay content-based (see [`StrRef`]).
+///
+/// `map` links a byte content to the canonical live object holding it. An
+/// object's content handle is always a live object with the same bytes, and
+/// the collector keeps it alive as long as any value references that content.
 ///
 /// Strings referenced from compiled `Proto` constants are interned as
 /// *fixed*: protos live outside the GC heap (host-held `Chunk`s, `Rc`s in
@@ -64,6 +127,7 @@ impl Value {
 pub struct Strings {
     vec: Vec<Option<Rc<[u8]>>>,
     fixed: Vec<bool>,
+    /// Content bytes -> canonical object handle holding them.
     map: HashMap<Rc<[u8]>, StrId>,
     free: Vec<u32>,
     /// Total bytes of live string data.
@@ -71,16 +135,38 @@ pub struct Strings {
 }
 
 impl Strings {
-    pub fn intern(&mut self, s: &[u8]) -> StrId {
-        self.intern_impl(s, false)
+    /// Interns `s`, returning a canonical reference (deduplicated by content).
+    pub fn intern(&mut self, s: &[u8]) -> StrRef {
+        let id = self.intern_canonical(s, false);
+        StrRef::interned(id)
     }
 
     /// Interns a string that is never garbage collected.
-    pub fn intern_fixed(&mut self, s: &[u8]) -> StrId {
-        self.intern_impl(s, true)
+    pub fn intern_fixed(&mut self, s: &[u8]) -> StrRef {
+        let id = self.intern_canonical(s, true);
+        StrRef::interned(id)
     }
 
-    fn intern_impl(&mut self, s: &[u8], fixed: bool) -> StrId {
+    /// Creates a string produced at runtime. Short strings are interned exactly
+    /// like literals; long strings get a fresh object identity while sharing a
+    /// canonical content handle, matching PUC's short/long string model.
+    pub fn new_string(&mut self, s: &[u8]) -> StrRef {
+        if s.len() <= MAXSHORTLEN {
+            return self.intern(s);
+        }
+        let rc: Rc<[u8]> = s.into();
+        let obj = self.alloc(rc.clone(), false);
+        let content = match self.map.get(&rc) {
+            Some(&c) => c,
+            None => {
+                self.map.insert(rc, obj);
+                obj
+            }
+        };
+        StrRef { obj, content }
+    }
+
+    fn intern_canonical(&mut self, s: &[u8], fixed: bool) -> StrId {
         if let Some(&id) = self.map.get(s) {
             if fixed {
                 self.fixed[id.0 as usize] = true;
@@ -88,33 +174,40 @@ impl Strings {
             return id;
         }
         let rc: Rc<[u8]> = s.into();
-        self.bytes += s.len();
-        let id = match self.free.pop() {
-            Some(slot) => {
-                self.vec[slot as usize] = Some(rc.clone());
-                self.fixed[slot as usize] = fixed;
-                StrId(slot)
-            }
-            None => {
-                self.vec.push(Some(rc.clone()));
-                self.fixed.push(fixed);
-                StrId(self.vec.len() as u32 - 1)
-            }
-        };
+        let id = self.alloc(rc.clone(), fixed);
         self.map.insert(rc, id);
         id
     }
 
-    /// Looks up an already-interned string without interning.
-    pub fn lookup(&self, s: &[u8]) -> Option<StrId> {
-        self.map.get(s).copied()
+    /// Allocates a fresh object slot holding `rc`.
+    fn alloc(&mut self, rc: Rc<[u8]>, fixed: bool) -> StrId {
+        self.bytes += rc.len();
+        match self.free.pop() {
+            Some(slot) => {
+                self.vec[slot as usize] = Some(rc);
+                self.fixed[slot as usize] = fixed;
+                StrId(slot)
+            }
+            None => {
+                self.vec.push(Some(rc));
+                self.fixed.push(fixed);
+                StrId(self.vec.len() as u32 - 1)
+            }
+        }
     }
 
-    pub fn get(&self, id: StrId) -> &[u8] {
+    /// Looks up the canonical reference for `s` without interning.
+    pub fn lookup(&self, s: &[u8]) -> Option<StrRef> {
+        self.map.get(s).copied().map(StrRef::interned)
+    }
+
+    /// Returns the bytes of a string, given either an object or content handle.
+    pub fn get(&self, id: impl Into<StrId>) -> &[u8] {
+        let id = id.into();
         self.vec[id.0 as usize].as_deref().expect("stale StrId")
     }
 
-    pub fn get_str_lossy(&self, id: StrId) -> std::borrow::Cow<'_, str> {
+    pub fn get_str_lossy(&self, id: impl Into<StrId>) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(self.get(id))
     }
 
@@ -130,9 +223,9 @@ impl Strings {
         self.bytes
     }
 
-    /// Number of live (interned, unswept) strings.
+    /// Number of live (unswept) string objects.
     pub fn live_count(&self) -> usize {
-        self.map.len()
+        self.vec.iter().filter(|slot| slot.is_some()).count()
     }
 
     /// Sweeps unmarked, non-fixed strings. `marked` is indexed by `StrId`.
@@ -142,9 +235,16 @@ impl Strings {
             if self.fixed[i] || marked.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let Some(rc) = self.vec[i].take() else { continue };
+            let Some(rc) = self.vec[i].take() else {
+                continue;
+            };
             self.bytes -= rc.len();
-            self.map.remove(&rc);
+            // Drop the content mapping only if this object is the canonical
+            // representative; a non-canonical long string shares its content
+            // with a (still live) canonical object.
+            if self.map.get(&rc) == Some(&StrId(i as u32)) {
+                self.map.remove(&rc);
+            }
             self.free.push(i as u32);
             freed += 1;
         }
@@ -160,11 +260,12 @@ pub enum HKey {
     /// Non-integral float, by bit pattern. Never NaN.
     Float(u64),
     Bool(bool),
-    Str(StrId),
+    Str(StrRef),
     Table(TableId),
     Closure(ClosId),
     Native(NativeId),
     Thread(ThreadId),
+    Userdata(UserdataId),
 }
 
 /// Converts a value to a table key per Lua 5.4 rules.
@@ -187,6 +288,7 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
         Value::Closure(c) => HKey::Closure(c),
         Value::Native(n) => HKey::Native(n),
         Value::Thread(t) => HKey::Thread(t),
+        Value::Userdata(u) => HKey::Userdata(u),
     })
 }
 
@@ -209,20 +311,36 @@ pub struct Table {
     /// Dense array part for keys `1..=array.len()` (may contain trailing nils).
     array: Vec<Value>,
     hash: HashMap<HKey, Value>,
+    /// Insertion order of every key ever placed in the hash part. Removed keys
+    /// stay here as tombstones so an in-progress `next` traversal can still
+    /// locate a key that was set to nil mid-iteration (PUC keeps its dead
+    /// keys around for exactly this reason). Never mutated during iteration,
+    /// so the cursor survives deletion and collection of the current key.
+    order: Vec<HKey>,
+    /// Position of a key in `order`, also serving as "was this key ever
+    /// inserted" so re-inserting a removed key does not add a duplicate.
+    order_pos: HashMap<HKey, usize>,
     pub metatable: Option<TableId>,
+    /// Set once the collector has selected this table for a `__gc` run, so a
+    /// resurrected object is never finalized twice.
+    pub finalized: bool,
 }
 
 impl Table {
     pub fn get(&self, key: Value) -> Value {
-        let Ok(k) = to_key(key) else { return Value::Nil };
+        let Ok(k) = to_key(key) else {
+            return Value::Nil;
+        };
         self.get_key(k)
     }
 
     fn get_key(&self, k: HKey) -> Value {
         if let HKey::Int(i) = k
-            && i >= 1 && (i as usize) <= self.array.len() {
-                return self.array[i as usize - 1];
-            }
+            && i >= 1
+            && (i as usize) <= self.array.len()
+        {
+            return self.array[i as usize - 1];
+        }
         self.hash.get(&k).copied().unwrap_or(Value::Nil)
     }
 
@@ -249,6 +367,10 @@ impl Table {
         if value == Value::Nil {
             self.hash.remove(&k);
         } else {
+            if !self.order_pos.contains_key(&k) {
+                self.order_pos.insert(k, self.order.len());
+                self.order.push(k);
+            }
             self.hash.insert(k, value);
         }
         Ok(())
@@ -292,19 +414,47 @@ impl Table {
         }
     }
 
-    /// Rough heap footprint in bytes, for memory budgeting.
-    pub fn mem_estimate(&self) -> usize {
-        64 + self.array.capacity() * 16 + self.hash.capacity() * 48
+    /// Snapshot of every live (non-nil) entry as Lua key/value pairs. Used by
+    /// the collector to clear dead weak entries; O(n) and allocation-heavy,
+    /// which is fine because it only runs during a collection.
+    pub(crate) fn entries(&self) -> Vec<(Value, Value)> {
+        let mut out = Vec::with_capacity(self.array.len() + self.hash.len());
+        for (i, &v) in self.array.iter().enumerate() {
+            if v != Value::Nil {
+                out.push((Value::Int(i as i64 + 1), v));
+            }
+        }
+        for (&k, &v) in &self.hash {
+            if v != Value::Nil {
+                out.push((key_to_value(k), v));
+            }
+        }
+        out
     }
 
-    /// Iteration support for `next`: a stable snapshot order is array part
-    /// then hash part. O(n) per call; fine until we move to an ordered map.
+    /// Removes an entry by key (a table key produced by [`Table::entries`]).
+    pub(crate) fn remove(&mut self, key: Value) {
+        let _ = self.set(key, Value::Nil);
+    }
+
+    /// Rough heap footprint in bytes, for memory budgeting.
+    pub fn mem_estimate(&self) -> usize {
+        64 + self.array.capacity() * 16
+            + self.hash.capacity() * 48
+            + self.order.capacity() * 16
+            + self.order_pos.capacity() * 48
+    }
+
+    /// Iteration support for `next`: a stable order is array part, then hash
+    /// part in insertion order. O(n) per call; fine until we move to an
+    /// ordered map.
     ///
-    /// Returns `Err(InvalidKey)` when `key` is not present in the table,
-    /// which the base library turns into an "invalid key to 'next'" error.
+    /// Returns `Err(InvalidKey)` when `key` was never in the table, which the
+    /// base library turns into an "invalid key to 'next'" error. A key that
+    /// was removed is still locatable (its `order` slot is a tombstone), so
+    /// deleting the current key mid-iteration is safe.
     pub fn next_after(&self, key: Option<HKey>) -> Result<Option<(Value, Value)>, InvalidKey> {
-        let array_iter = (1..=self.array.len() as i64).map(HKey::Int);
-        let mut all = array_iter.chain(self.hash.keys().copied());
+        let mut all = self.iter_keys();
         if let Some(prev) = key {
             // skip until just past `prev`
             let mut found = false;
@@ -326,6 +476,19 @@ impl Table {
         }
         Ok(None)
     }
+
+    /// The `next` traversal order: array indices `1..=len`, then hash keys in
+    /// insertion order. Integer keys that have migrated into the array part
+    /// are skipped in the hash phase so a key is never visited twice.
+    fn iter_keys(&self) -> impl Iterator<Item = HKey> + '_ {
+        let array_len = self.array.len() as i64;
+        (1..=array_len).map(HKey::Int).chain(
+            self.order
+                .iter()
+                .copied()
+                .filter(move |k| !matches!(k, HKey::Int(i) if *i >= 1 && *i <= array_len)),
+        )
+    }
 }
 
 pub fn key_to_value(k: HKey) -> Value {
@@ -338,6 +501,7 @@ pub fn key_to_value(k: HKey) -> Value {
         HKey::Closure(c) => Value::Closure(c),
         HKey::Native(n) => Value::Native(n),
         HKey::Thread(t) => Value::Thread(t),
+        HKey::Userdata(u) => Value::Userdata(u),
     }
 }
 

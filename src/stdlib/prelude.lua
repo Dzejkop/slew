@@ -2,7 +2,81 @@
 -- Lua so they go through the regular (suspendable) VM machinery.
 
 local find, sub, byte = string.find, string.sub, string.byte
+-- Captured here, before the wrappers below replace the globals, so the
+-- prelude's own (and the wrappers' raw) uses stay on the native fast paths.
 local unpack, concat = table.unpack, table.concat
+local raw_remove = table.remove
+local getmetatable = getmetatable
+local next, select, tostring, rawget = next, select, tostring, rawget
+-- Raw metatable (bypasses the `__metatable` guard); the native is a private
+-- seed global, removed from the environment once captured.
+local raw_metatable = __slew_getmetatable
+__slew_getmetatable = nil
+
+-- Non-yieldable C-boundary bracket. PUC's C library invokes `table.sort`
+-- comparators and `string.gsub` function replacements through `lua_call`
+-- (no continuation), so a `coroutine.yield` inside them raises
+-- "attempt to yield across a C-call boundary" and `coroutine.isyieldable()`
+-- is false. The two private intrinsics bracket the callback; `pcall`
+-- guarantees the depth is restored even when the callback errors (the
+-- boundary yield error in particular), so the enclosing coroutine stays
+-- yieldable afterwards.
+local nyenter, nyleave = __slew_nyenter, __slew_nyleave
+__slew_nyenter = nil
+__slew_nyleave = nil
+
+local pack = table.pack
+local function call_non_yieldable(f, ...)
+  nyenter()
+  local r = pack(pcall(f, ...))
+  nyleave()
+  if not r[1] then error(r[2], 0) end
+  return unpack(r, 2, r.n)
+end
+
+local function nywrap(f)
+  return function(...) return call_non_yieldable(f, ...) end
+end
+
+-- ---- base functions that must call back into Lua -----------------------
+-- Natives cannot invoke metamethods, so `pairs` (`__pairs`) and `ipairs`
+-- (`__index`) live here and run through the VM. `print` is a native-backed
+-- intrinsic (so it has no upvalues) that drives `__tostring` per argument.
+
+function pairs(...)
+  if select('#', ...) == 0 then
+    error("bad argument #1 to 'pairs' (value expected)", 2)
+  end
+  local t = ...
+  local mt = raw_metatable(t)
+  if mt ~= nil then
+    local mm = rawget(mt, '__pairs')
+    if mm ~= nil then
+      -- PUC's luaB_pairs returns exactly the three values it reads from the
+      -- metamethod.
+      local f, s, c = mm(t)
+      return f, s, c
+    end
+  end
+  return next, t, nil
+end
+
+-- A single shared iterator, so `ipairs(t) == ipairs(t)` holds (nextvar.lua
+-- asserts the identity). `t[i]` indexes through the VM, honoring `__index`;
+-- the `+ 1` wraps around like PUC's `luaL_intop(+, i, 1)`.
+local function ipairs_iter(t, i)
+  i = i + 1
+  local v = t[i]
+  if v == nil then return nil end
+  return i, v
+end
+
+function ipairs(...)
+  if select('#', ...) == 0 then
+    error("bad argument #1 to 'ipairs' (value expected)", 2)
+  end
+  return ipairs_iter, (...), 0
+end
 
 -- table.insert lives here rather than as a native so that it can honor
 -- __len and __newindex metamethods through the regular VM machinery.
@@ -29,6 +103,36 @@ local function table_len(t)
     error("object length is not an integer", 3)
   end
   return i
+end
+
+-- luaL_checkinteger-ish: integers, floats with an exact integer value, and
+-- numeric strings; everything else raises the PUC-style argument error.
+local function check_integer(v, n, who)
+  local i = to_integer(v)
+  if i ~= nil then return i end
+  local numeric = type(v) == 'number' or
+                  (type(v) == 'string' and tonumber(v) ~= nil)
+  if numeric then
+    error("bad argument #" .. n .. " to '" .. who ..
+          "' (number has no integer representation)", 3)
+  end
+  error("bad argument #" .. n .. " to '" .. who ..
+        "' (number expected, got " .. type(v) .. ")", 3)
+end
+
+-- luaL_checktab: a table, or a non-table whose metatable supplies the
+-- metamethods the operation needs.
+local function check_tab(v, n, who, need_r, need_w, need_l)
+  if type(v) == 'table' then return end
+  local mt = getmetatable(v)
+  if type(mt) == 'table' and
+     (not need_r or mt.__index ~= nil) and
+     (not need_w or mt.__newindex ~= nil) and
+     (not need_l or mt.__len ~= nil) then
+    return
+  end
+  error("bad argument #" .. n .. " to '" .. who ..
+        "' (table expected, got " .. type(v) .. ")", 3)
 end
 
 function table.insert(t, ...)
@@ -58,20 +162,159 @@ function table.insert(t, ...)
   end
 end
 
-function string.gmatch(s, p)
-  if type(s) == 'number' then s = tostring(s) end
-  local pos = 1
-  local len = #s
-  return function()
-    if pos > len + 1 then return nil end
-    local r = {find(s, p, pos)}
-    local st, en = r[1], r[2]
-    if not st then
-      pos = len + 2
-      return nil
+-- `table.remove`, `table.concat` and `table.unpack` are metamethod-aware.
+-- With no metatable the raw native fast path is exact; otherwise the body
+-- drives `#t`, `t[k]` and `t[k] = v` through the VM so `__len`, `__index`
+-- and `__newindex` are honored (PUC 5.4 semantics).
+
+function table.remove(t, pos)
+  if getmetatable(t) == nil then return raw_remove(t, pos) end
+  check_tab(t, 1, 'remove', true, true, true)
+  local size = table_len(t)
+  if pos == nil then pos = size else pos = check_integer(pos, 2, 'remove') end
+  if pos ~= size and math.ult(size, pos - 1) then
+    error("bad argument #2 to 'remove' (position out of bounds)", 2)
+  end
+  local removed = t[pos]
+  while pos < size do
+    t[pos] = t[pos + 1]
+    pos = pos + 1
+  end
+  t[pos] = nil
+  return removed
+end
+
+function table.concat(t, sep, i, j)
+  if getmetatable(t) == nil then return concat(t, sep, i, j) end
+  check_tab(t, 1, 'concat', true, false, true)
+  if sep == nil then
+    sep = ''
+  elseif type(sep) == 'number' then
+    sep = tostring(sep)
+  elseif type(sep) ~= 'string' then
+    error("bad argument #2 to 'concat' (string expected, got " ..
+          type(sep) .. ")", 2)
+  end
+  local last = table_len(t)
+  local first = 1
+  if i ~= nil then first = check_integer(i, 3, 'concat') end
+  if j ~= nil then last = check_integer(j, 4, 'concat') end
+  local out, n = {}, 0
+  while first < last do
+    local v = t[first]
+    if type(v) == 'string' or type(v) == 'number' then
+      n = n + 1; out[n] = v
+    else
+      error("invalid value (at index " .. first ..
+            ") in table for 'concat'", 2)
     end
-    if en < st then pos = st + 1 else pos = en + 1 end
-    if r[3] ~= nil then return unpack(r, 3) else return sub(s, st, en) end
+    n = n + 1; out[n] = sep
+    first = first + 1
+  end
+  if first == last then
+    local v = t[first]
+    if type(v) == 'string' or type(v) == 'number' then
+      n = n + 1; out[n] = v
+    else
+      error("invalid value (at index " .. first ..
+            ") in table for 'concat'", 2)
+    end
+  end
+  return concat(out)
+end
+
+function table.unpack(t, i, j)
+  if getmetatable(t) == nil then return unpack(t, i, j) end
+  check_tab(t, 1, 'unpack', true, false, true)
+  local first = 1
+  if i ~= nil then first = check_integer(i, 2, 'unpack') end
+  local last
+  if j == nil then last = table_len(t) else last = check_integer(j, 3, 'unpack') end
+  if first > last then return end
+  -- `last - first` is the result count minus one; it wraps on an overflowing
+  -- span (e.g. mininteger..maxinteger), which must be reported as too many.
+  local n = last - first
+  if n < 0 or n >= 1000000 then
+    error("too many results to unpack", 2)
+  end
+  local res = {}
+  local k = 1
+  while first <= last do
+    res[k] = t[first]
+    k = k + 1
+    first = first + 1
+  end
+  return unpack(res, 1, k - 1)
+end
+
+-- `table.move` (PUC 5.4): copy a1[f..e] to a2[t..], honoring `__index` on the
+-- source and `__newindex` on the destination, and returning a2 (or a1).
+function table.move(a1, f, e, t, a2)
+  f = check_integer(f, 2, 'move')
+  e = check_integer(e, 3, 'move')
+  t = check_integer(t, 4, 'move')
+  local tt, dest_arg = a2, 5
+  if tt == nil then tt = a1; dest_arg = 1 end
+  check_tab(a1, 1, 'move', true, false, false)
+  check_tab(tt, dest_arg, 'move', false, true, false)
+  if e >= f then
+    if not (f > 0 or e < math.maxinteger + f) then
+      error("bad argument #3 to 'move' (too many elements to move)", 2)
+    end
+    local n = e - f + 1
+    if not (t <= math.maxinteger - n + 1) then
+      error("bad argument #4 to 'move' (destination wrap around)", 2)
+    end
+    if t > e or t <= f or (a2 ~= nil and a1 ~= tt) then
+      local i = 0
+      while i < n do
+        tt[t + i] = a1[f + i]
+        i = i + 1
+      end
+    else
+      local i = n - 1
+      while i >= 0 do
+        tt[t + i] = a1[f + i]
+        i = i - 1
+      end
+    end
+  end
+  return tt
+end
+
+-- PUC's `posrelatI`: 1-based start position, clipped to 1 (unlike find's
+-- `u_posrelat`, which returns 0 for a too-negative index).
+local function posrelatI(pos, len)
+  if pos > 0 then return pos
+  elseif pos == 0 then return 1
+  elseif -pos > len then return 1
+  else return len + pos + 1 end
+end
+
+function string.gmatch(s, p, init)
+  if type(s) == 'number' then s = tostring(s) end
+  local len = #s
+  if init == nil then init = 1 else init = check_integer(init, 3, 'gmatch') end
+  local pos = posrelatI(init, len)
+  if pos > len + 1 then pos = len + 2 end  -- start after end: no matches
+  -- PUC's `lastmatch`: an empty match at the end of the previous match is
+  -- rejected, so a following byte is copied instead (5.3.3 semantics).
+  local last = nil
+  return function()
+    while pos <= len + 1 do
+      local r = {find(s, p, pos)}
+      local st, en = r[1], r[2]
+      if not st then break end
+      local e = en + 1
+      if e == last then
+        pos = st + 1
+      else
+        last = e
+        if en < st then pos = st + 1 else pos = en + 1 end
+        if r[3] ~= nil then return unpack(r, 3) else return sub(s, st, en) end
+      end
+    end
+    return nil
   end
 end
 
@@ -109,75 +352,105 @@ function string.gsub(s, pat, repl, maxn)
   if tr == 'number' then
     repl = tostring(repl)
     tr = 'string'
+  elseif tr == 'function' then
+    -- PUC invokes the replacement from C: yielding across it is an error.
+    repl = nywrap(repl)
   end
   local anchored = sub(pat, 1, 1) == '^'
   local out, pos, count = {}, 1, 0
+  local changed = false
   local len = #s
+  -- PUC's `lastmatch`: reject an empty match that would begin exactly where
+  -- the previous match ended, copying a byte and retrying instead.
+  local last = nil
   while pos <= len + 1 do
     if maxn and count >= maxn then break end
     local r = {find(s, pat, pos)}
     local st = r[1]
     if not st then break end
     local en = r[2]
-    out[#out+1] = sub(s, pos, st - 1)
-    local whole = sub(s, st, en)
-    local caps = {}
-    for i = 3, #r do caps[i-2] = r[i] end
-    if caps[1] == nil then caps[1] = whole end
-    local value
-    if tr == 'string' then
-      value = expand_repl(repl, whole, caps)
-    elseif tr == 'table' then
-      value = repl[caps[1]]
-    elseif tr == 'function' then
-      value = repl(unpack(caps))
+    local e = en + 1
+    if e == last then
+      if pos <= len then
+        out[#out+1] = sub(s, pos, pos)
+        pos = pos + 1
+      else
+        break
+      end
     else
-      error("bad argument #3 to 'gsub' (string/function/table expected)")
+      out[#out+1] = sub(s, pos, st - 1)
+      local whole = sub(s, st, en)
+      local caps = {}
+      for i = 3, #r do caps[i-2] = r[i] end
+      if caps[1] == nil then caps[1] = whole end
+      local value
+      if tr == 'string' then
+        value = expand_repl(repl, whole, caps)
+      elseif tr == 'table' then
+        value = repl[caps[1]]
+      elseif tr == 'function' then
+        value = repl(unpack(caps))
+      else
+        error("bad argument #3 to 'gsub' (string/function/table expected)")
+      end
+      if value == nil or value == false then
+        value = whole
+      else
+        if type(value) == 'number' then
+          value = tostring(value)
+        elseif type(value) ~= 'string' then
+          error("invalid replacement value (a " .. type(value) .. ")")
+        end
+        changed = true
+      end
+      out[#out+1] = value
+      count = count + 1
+      last = e
+      if en < st then
+        -- empty match: copy one char and advance
+        if st <= len then out[#out+1] = sub(s, st, st) end
+        pos = st + 1
+      else
+        pos = en + 1
+      end
+      if anchored then break end
     end
-    if value == nil or value == false then
-      value = whole
-    elseif type(value) == 'number' then
-      value = tostring(value)
-    elseif type(value) ~= 'string' then
-      error("invalid replacement value (a " .. type(value) .. ")")
-    end
-    out[#out+1] = value
-    count = count + 1
-    if en < st then
-      -- empty match: copy one char and advance
-      if st <= len then out[#out+1] = sub(s, st, st) end
-      pos = st + 1
-    else
-      pos = en + 1
-    end
-    if anchored then break end
+  end
+  if not changed then
+    -- PUC returns the original subject object when nothing was replaced.
+    return s, count
   end
   out[#out+1] = sub(s, pos)
   return concat(out), count
 end
 
 function table.sort(t, cmp)
-  cmp = cmp or function(a, b) return a < b end
-  local function qs(lo, hi)
+  local n = math.tointeger(#t)
+  if n == nil then
+    error("bad argument #1 to 'sort' (object length is not an integer)", 2)
+  end
+  if n > 1 then
+    if n >= 2147483647 then
+      error("bad argument #1 to 'sort' (array too big)", 2)
+    end
+    if cmp == nil then
+      cmp = function(a, b) return a < b end
+    else
+      -- PUC invokes a user comparator from C: yielding across it is an error.
+      cmp = nywrap(cmp)
+    end
+    local function qs(lo, hi)
     while lo < hi do
-      if hi - lo < 12 then
-        -- insertion sort for small ranges
-        for i = lo + 1, hi do
-          local v = t[i]
-          local j = i - 1
-          while j >= lo and cmp(v, t[j]) do
-            t[j+1] = t[j]
-            j = j - 1
-          end
-          t[j+1] = v
-        end
-        return
-      end
       -- median-of-three pivot
       local mid = (lo + hi) // 2
       if cmp(t[mid], t[lo]) then t[lo], t[mid] = t[mid], t[lo] end
       if cmp(t[hi], t[lo]) then t[lo], t[hi] = t[hi], t[lo] end
       if cmp(t[hi], t[mid]) then t[mid], t[hi] = t[hi], t[mid] end
+      -- Ranges of two or three elements are fully ordered by the median step
+      -- above, so there is nothing left to partition. PUC's auxsort returns
+      -- at the same points (`up - lo == 1` / `up - lo == 2`), which is why its
+      -- invalid-order guard only fires for four or more elements.
+      if hi - lo <= 2 then return end
       local p = t[mid]
       local i, j = lo, hi
       while true do
@@ -203,6 +476,135 @@ function table.sort(t, cmp)
         hi = j
       end
     end
+    end
+    qs(1, n)
   end
-  qs(1, #t)
+end
+
+-- ---- package and require ------------------------------------------------
+-- Module bytes come from `loadfile`, which is backed by the host reader (or
+-- by nothing at all): the interpreter has no filesystem authority of its
+-- own. `package.searchers` is the Lua-level seam, so an embedder can replace
+-- or extend it to serve modules from anywhere.
+
+local raw_load = load
+
+function load(chunk, ...)
+  if type(chunk) == 'function' then
+    -- Reader chunks run under pcall: a failing reader surfaces as
+    -- `nil, message` from load, exactly as PUC's protected parser does.
+    local parts, n = {}, 0
+    local ok, err = pcall(function()
+      while true do
+        local piece = chunk()
+        if piece == nil then break end
+        if type(piece) == 'number' then
+          piece = tostring(piece)
+        elseif type(piece) ~= 'string' then
+          error("reader function must return a string", 0)
+        end
+        if #piece == 0 then break end
+        n = n + 1
+        parts[n] = piece
+      end
+    end)
+    if not ok then return nil, err end
+    local chunkname, mode, env = ...
+    if chunkname == nil then chunkname = "=(load)" end
+    local text = table.concat(parts)
+    local nargs = select('#', ...)
+    if nargs >= 3 then return raw_load(text, chunkname, mode, env) end
+    if nargs == 2 then return raw_load(text, chunkname, mode) end
+    return raw_load(text, chunkname)
+  end
+  -- forward the argument tail verbatim so an absent `env` stays absent
+  return raw_load(chunk, ...)
+end
+
+local function preload_searcher(name)
+  local v = package.preload[name]
+  if v == nil then
+    return "no field package.preload['" .. name .. "']"
+  end
+  return v, ":preload:"
+end
+
+local function load_error(name, filename, msg)
+  return "error loading module '" .. name .. "' from file '" ..
+         filename .. "':\n\t" .. msg
+end
+
+local function lua_searcher(name)
+  local path = package.path
+  if type(path) ~= 'string' then
+    error("'package.path' must be a string", 0)
+  end
+  local filename, err = package.searchpath(name, path, ".", "/")
+  if not filename then return err end
+  local f, msg = loadfile(filename, "t")
+  if not f then
+    error(load_error(name, filename, msg), 0)
+  end
+  return f, filename
+end
+
+local function c_searcher(name)
+  local path = package.cpath
+  if type(path) ~= 'string' then
+    error("'package.cpath' must be a string", 0)
+  end
+  local filename, err = package.searchpath(name, path, ".", "/")
+  if not filename then return err end
+  error(load_error(name, filename, "dynamic libraries are not supported"), 0)
+end
+
+local function croot_searcher(name)
+  local p = find(name, ".", 1, true)
+  if not p then return nil end
+  local path = package.cpath
+  if type(path) ~= 'string' then
+    error("'package.cpath' must be a string", 0)
+  end
+  local filename, err = package.searchpath(sub(name, 1, p - 1), path, ".", "/")
+  if not filename then return err end
+  error(load_error(name, filename, "dynamic libraries are not supported"), 0)
+end
+
+package.searchers = {preload_searcher, lua_searcher, c_searcher, croot_searcher}
+
+function require(name)
+  local loaded = package.loaded
+  local v = loaded[name]
+  if v then return v end
+  local searchers = package.searchers
+  if type(searchers) ~= 'table' then
+    error("'package.searchers' must be a table", 0)
+  end
+  local msgs = {}
+  local loader, extra
+  local i = 1
+  while true do
+    local s = searchers[i]
+    if s == nil then
+      error("module '" .. name .. "' not found:" .. table.concat(msgs), 0)
+    end
+    local a, b = s(name)
+    if type(a) == 'function' then
+      loader, extra = a, b
+      break
+    elseif type(a) == 'string' then
+      msgs[#msgs + 1] = "\n\t" .. a
+    end
+    i = i + 1
+  end
+  local res = loader(name, extra)
+  if res ~= nil then loaded[name] = res end
+  if loaded[name] == nil then loaded[name] = true end
+  return loaded[name], extra
+end
+
+function dofile(filename)
+  local f, err = loadfile(filename)
+  if f == nil then error(err, 0) end
+  return f()
 end

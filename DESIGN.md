@@ -83,11 +83,45 @@ Everything implemented follows 5.4 rules from the start, in particular:
 - **M4**: stdlib — `string` with a full Lua-pattern engine, `table`, `math`
   (deterministically seeded PRNG). Callback-using functions (`table.sort`,
   `gsub`, `gmatch`) are written in a Lua prelude compiled at startup, so
-  they are suspendable like all Lua code. `os`/`io` deliberately absent.
+  they are suspendable like all Lua code. `io`/`os` exist only when an
+  embedder installs a capability host (see below); without one they are
+  absent.
 - **M5**: mark-sweep GC over the handle arenas (free-list slot reuse) with
   roots from globals, live executions, and host anchors; `lua.gc()`,
   `memory_used()`, auto-collection by allocation threshold, and
   `memory_limit` as part of the execution profile.
+
+## Host capabilities
+
+The interpreter has no ambient authority: it never opens files, reads the
+environment, or spawns processes. Anything that would need the host goes
+through a capability the embedder installs explicitly.
+
+- `Lua::set_file_reader` installs the byte source used by `loadfile`,
+  `dofile`, and `package.searchpath`'s probes. Without one, `loadfile`
+  reports "cannot open", and `require` resolves only `package.preload` and
+  modules already in `package.loaded`.
+- The `fs` (default-on) feature adds just `Lua::set_fs_file_reader(root)`, a
+  filesystem adapter confined to `root` (absolute paths, `..`, and symlinks
+  escaping the root are refused). Disable the feature for targets without a
+  filesystem; the core still compiles.
+- Module policy lives one level up, in the Lua prelude: `package.path`,
+  `package.searchers`, and `require` are ordinary Lua and can be replaced or
+  extended. `package.path` is not a security boundary; the reader (or a
+  custom searcher) is.
+- `load` (string or reader-function chunks) is pure. Only `loadfile`,
+  `dofile`, and `package.searchpath`'s existence probes cross the host seam,
+  so the filesystem surface stays a single function.
+- `Lua::set_host` installs the `io`/`os` capability host (`src/host.rs`).
+  While no host is installed, `io`/`os` do not exist (globals unset,
+  `require` fails) and the core never opens a file, reads the environment, or
+  spawns a process. `Lua::has_host`/`clear_host` detect and remove it. `os.exit`
+  is surfaced as a request (`Lua::take_exit_request`) plus a controlled error;
+  the host process is never terminated. `os.execute` is absent (process
+  authority is a non-goal). A std-backed `StdHost` (root-confined filesystem,
+  captured std streams, UTC calendar) ships for tests and simple embedders.
+  File handles are userdata whose host resources are released on `close`, on
+  `__gc`, and on sweep of an unreachable handle.
 
 ## Execution profile knobs
 
@@ -109,11 +143,56 @@ Everything implemented follows 5.4 rules from the start, in particular:
   to across the switch); `coroutine.resume`'s `false, err` convention works.
 - An error raised by a `__close` handler during unwinding supersedes the
   original error and skips remaining closes up to the next handler.
-- `ipairs` uses raw indexing (no `__index` metamethods).
-- `print` uses raw tostring (no `__tostring`); `tostring()` itself honors it.
-- No weak tables (`__mode`) or finalizers (`__gc`): sandboxed scripting
-  rarely needs them; resources should be host-managed.
-- `string.format` lacks `%a`.
+- `tostring`/`print` honor `__tostring` and fall back to `__name`; `pairs`
+  honors `__pairs` and `ipairs` honors `__index` (PUC 5.4 semantics). `print`
+  and `collectgarbage` are intrinsics (not prelude Lua closures) so they are
+  C-like functions with no upvalues.
+- Weak tables (`__mode` = `k`/`v`/`kv`), ephemeron semantics, and `__gc`
+  finalizers (run once, may resurrect, LIFO) are implemented in the mark-sweep
+  collector, as is `collectgarbage([opt[, arg]])` and `coroutine.close`.
+- `collectgarbage("step", n)`: the collector has no resumable incremental
+  phases, so one `step` runs a full (bounded) mark-sweep collection and
+  returns `true`, matching PUC incremental mode's contract that the call
+  reports a finished collection cycle (`false` only while a cycle is still
+  in progress, which never happens here). `n` is type-checked like PUC but
+  cannot select a partial amount of work. This keeps the upstream
+  `repeat ... until collectgarbage("step", siz)` loops terminating.
+  `collectgarbage` option #1 coerces numbers to strings (so
+  `collectgarbage(5)` reports `invalid option '5'`), as PUC does. Calling
+  `collectgarbage` from inside a `__gc` handler reports every option as
+  invalid and yields a single `nil` (PUC's "collection running" state), so a
+  reentrant call is a no-op.
+- **Root precision**: the compiler records, per instruction, the live register
+  extent at that point (`Proto::reg_extent`). The collector roots only
+  `frame.base .. base + reg_extent[pc]` for each frame — not the whole thread
+  stack — so slots of popped/tail-replaced frames and dead temporaries above
+  the current top are not roots. Open multret arguments of an intrinsic call
+  and return values staged while `__close` handlers run are rooted explicitly.
+  Suspended coroutines keep their live registers rooted across resume/yield.
+  This matches PUC's weak-table reclamation (upstream `gc.lua` passes) without
+  premature collection.
+- Binary chunks carry PUC 5.4's header and `LUAC_INT`/`LUAC_NUM` sentinels,
+  but the proto body after them is slew-specific (see `src/stdlib/dump.rs`),
+  so dumps round-trip through slew's `load` and are not portable to PUC's
+  `luac`/`undump`.
+- `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
+  supported.
+- `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the
+  upvalue API, and the metatable bypass). One deviation follows from the
+  architecture: prelude stdlib functions (e.g. `pairs`, `ipairs`,
+  `table.sort`) are Lua closures carrying an `_ENV` upvalue, so
+  `debug.getinfo` reports `what == "Lua"` for them instead of `"C"` and
+  `debug.upvaluejoin` treats them like any closure.
+- Synthetic C frames are modelled for the `pcall`/`xpcall` boundaries: they
+  occupy a level with `what == "C"`, `currentline == -1`, `source == "=[C]"`,
+  and `name` (`"pcall"`/`"xpcall"`), so `debug.getinfo`/`debug.traceback`
+  match PUC while a `__close` handler runs during unwinding. A
+  `coroutine.close` C frame is also modelled (PUC reports no frame for a
+  close handler it drives), giving `what == "C"` there. The
+  `coroutine.yield`/`resume` boundaries are *not* modelled, so level 0 of a
+  suspended coroutine still names the yielding Lua frame (where PUC reports
+  the C `yield` frame), and PUC's `metamethod 'close'` frame naming is not
+  yet implemented.
 - `next` iteration order is stable per table state but not PUC's; per-call
   cost is O(n) (acceptable until tables move to an insertion-ordered map).
 

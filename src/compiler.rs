@@ -30,12 +30,17 @@ pub fn compile(
     chunk_name: &str,
 ) -> Result<Rc<Proto>, CompileError> {
     let source: Rc<str> = chunk_name.into();
-    let mut c = Compiler { strings, funcs: Vec::new(), source };
+    let mut c = Compiler {
+        strings,
+        funcs: Vec::new(),
+        source,
+    };
     let mut main = FuncState::new(format!("main chunk ({chunk_name})"), 0, true);
     // The main chunk has _ENV as its sole upvalue (Lua 5.4); the host fills
     // it with the globals table when instantiating the chunk.
     main.upvals.push(UpvalDesc::Upval(0));
     main.upval_names.push("_ENV".into());
+    main.upval_attribs.push(Attrib::None);
     c.funcs.push(main);
     c.block_scope(block)?;
     c.check_pending_gotos()?;
@@ -50,7 +55,7 @@ pub fn compile(
 enum CKey {
     Int(i64),
     Float(u64),
-    Str(crate::value::StrId),
+    Str(crate::value::StrRef),
 }
 
 struct LocalVar {
@@ -75,6 +80,9 @@ struct PendingGoto {
     jump_pc: usize,
     /// Active-local count at the goto, capped at each enclosing block exit.
     nact: usize,
+    /// Set when the goto leaves a block that has a captured or to-be-closed
+    /// local, so its placeholder `Close` must be patched (PUC's `gt->close`).
+    close: bool,
     line: u32,
 }
 
@@ -83,6 +91,8 @@ struct LabelDef {
     name: Box<str>,
     pc: usize,
     reg: u8,
+    /// Source line of the `::name::` definition (for repeated-label errors).
+    line: u32,
 }
 
 struct FuncState {
@@ -93,6 +103,15 @@ struct FuncState {
     protos: Vec<Rc<Proto>>,
     upvals: Vec<UpvalDesc>,
     upval_names: Vec<Box<str>>,
+    /// Attribute of each upvalue, parallel to `upvals`/`upval_names`. Only
+    /// needed at compile time to reject writes to captured `<const>`/`<close>`
+    /// locals; not carried into the `Proto`.
+    upval_attribs: Vec<Attrib>,
+    /// Debug call names, parallel to `code` (see `Proto::call_names`).
+    call_names: Vec<Option<(&'static str, Box<str>)>>,
+    /// Live register extent per instruction, parallel to `code` (see
+    /// `Proto::reg_extent`).
+    reg_extent: Vec<u8>,
     locals: Vec<LocalVar>,
     loops: Vec<LoopCtx>,
     gotos: Vec<PendingGoto>,
@@ -106,6 +125,14 @@ struct FuncState {
     max_regs: u8,
     cur_line: u32,
     name: String,
+    /// Line of the `function` keyword (0 for the main chunk).
+    linedefined: u32,
+    /// Line of the closing `end` (0 for the main chunk).
+    line_end: u32,
+    /// True once a to-be-closed local is declared in this function; proper
+    /// tail calls are disabled while a `__close` handler may be pending
+    /// (PUC's `insidetbc` rule).
+    has_tbc: bool,
 }
 
 impl FuncState {
@@ -118,6 +145,9 @@ impl FuncState {
             protos: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
+            upval_attribs: Vec::new(),
+            call_names: Vec::new(),
+            reg_extent: Vec::new(),
             locals: Vec::new(),
             loops: Vec::new(),
             gotos: Vec::new(),
@@ -129,10 +159,20 @@ impl FuncState {
             max_regs: nparams.max(2),
             cur_line: 0,
             name,
+            linedefined: 0,
+            line_end: 0,
+            has_tbc: false,
         }
     }
 
     fn into_proto(self, source: Rc<str>) -> Proto {
+        // The main chunk reports `lastlinedefined` 0 (PUC sets it in
+        // `lua_load`); real functions report the line of their closing `end`.
+        let lastlinedefined = if self.linedefined == 0 {
+            0
+        } else {
+            self.line_end
+        };
         Proto {
             code: self.code,
             source,
@@ -140,10 +180,15 @@ impl FuncState {
             consts: self.consts,
             protos: self.protos,
             upvals: self.upvals,
+            upval_names: self.upval_names,
             nparams: self.nparams,
             is_vararg: self.is_vararg,
             max_regs: self.max_regs,
+            reg_extent: self.reg_extent,
             name: self.name,
+            linedefined: self.linedefined,
+            lastlinedefined,
+            call_names: self.call_names,
         }
     }
 }
@@ -188,7 +233,10 @@ impl<'h> Compiler<'h> {
     }
 
     fn err<T>(&mut self, message: impl Into<String>) -> Result<T, CompileError> {
-        Err(CompileError { message: message.into(), line: self.fs().cur_line })
+        Err(CompileError {
+            message: message.into(),
+            line: self.fs().cur_line,
+        })
     }
 
     fn at_line(&mut self, line: u32) {
@@ -199,6 +247,11 @@ impl<'h> Compiler<'h> {
         let fs = self.fs();
         fs.code.push(i);
         fs.lines.push(fs.cur_line);
+        fs.call_names.push(None);
+        // `free_reg` is the current allocation high-water: every operand the
+        // instruction can touch is already allocated, so this is a safe (and
+        // tight) live extent for the collector.
+        fs.reg_extent.push(fs.free_reg);
         fs.code.len() - 1
     }
 
@@ -215,9 +268,9 @@ impl<'h> Compiler<'h> {
         let target = self.here();
         let off = target as i32 - (idx as i32 + 1);
         match &mut self.fs().code[idx] {
-            Instr::Jump { off: o }
-            | Instr::Test { off: o, .. }
-            | Instr::ForPrep { off: o, .. } => *o = off,
+            Instr::Jump { off: o } | Instr::Test { off: o, .. } | Instr::ForPrep { off: o, .. } => {
+                *o = off
+            }
             other => unreachable!("patching non-jump {other:?}"),
         }
     }
@@ -283,7 +336,12 @@ impl<'h> Compiler<'h> {
     }
 
     fn declare_local(&mut self, name: Box<str>, reg: u8, attrib: Attrib) {
-        self.fs().locals.push(LocalVar { name, reg, captured: false, attrib });
+        self.fs().locals.push(LocalVar {
+            name,
+            reg,
+            captured: false,
+            attrib,
+        });
     }
 
     fn enter_scope(&mut self) -> usize {
@@ -310,7 +368,7 @@ impl<'h> Compiler<'h> {
 
     fn block_scope(&mut self, b: &Block) -> Result<(), CompileError> {
         let floor = self.enter_scope();
-        self.stmt_seq(&b.stmts)?;
+        self.stmt_seq(&b.stmts, true)?;
         self.exit_scope(floor);
         Ok(())
     }
@@ -318,27 +376,42 @@ impl<'h> Compiler<'h> {
     /// Compiles a statement sequence, handling label visibility: a label is
     /// "at the end of the block" (and may be jumped to over the block's
     /// locals) when only other labels follow it.
-    fn stmt_seq(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
+    fn stmt_seq(&mut self, stmts: &[Stmt], trailing_label_last: bool) -> Result<(), CompileError> {
         let nact_entry = self.funcs.last().unwrap().locals.len();
         let labels_floor = self.funcs.last().unwrap().labels.len();
         let gotos_floor = self.funcs.last().unwrap().gotos.len();
         let outer_goto_floor = self.funcs.last().unwrap().goto_floor;
         self.funcs.last_mut().unwrap().goto_floor = gotos_floor;
         for (i, s) in stmts.iter().enumerate() {
-            if let Stmt::Label(name) = s {
-                let last = stmts[i + 1..].iter().all(|s| matches!(s, Stmt::Label(_)));
-                self.define_label(name, last, nact_entry)?;
+            if let Stmt::Label(name, line) = s {
+                // PUC treats a label as "at the end of the block" only when
+                // nothing but no-op statements (`;` and other labels) follow
+                // *and* the block's closing token is not `until` (a repeat's
+                // condition still sees the body's locals).
+                let rest_noop = stmts[i + 1..]
+                    .iter()
+                    .all(|s| matches!(s, Stmt::Label(..) | Stmt::Empty));
+                let last = trailing_label_last && rest_noop;
+                self.define_label(name, *line, last, nact_entry)?;
             } else {
                 self.stmt(s)?;
             }
         }
         self.funcs.last_mut().unwrap().goto_floor = outer_goto_floor;
         // leaving the block: labels go out of scope; unmatched gotos float
-        // up with their local count capped at this block's entry level
+        // up with their local count capped at this block's entry level. A
+        // goto that leaves a block holding captured or to-be-closed locals
+        // must run their `Close` (PUC's `movegotosout`/`gt->close`).
         let fs = self.funcs.last_mut().unwrap();
         fs.labels.truncate(labels_floor);
+        let block_has_upval = fs.locals[nact_entry.min(fs.locals.len())..]
+            .iter()
+            .any(|l| l.captured || l.attrib == Attrib::Close);
         let start = gotos_floor.min(fs.gotos.len());
         for g in &mut fs.gotos[start..] {
+            if block_has_upval && g.nact > nact_entry {
+                g.close = true;
+            }
             g.nact = g.nact.min(nact_entry);
         }
         Ok(())
@@ -347,38 +420,66 @@ impl<'h> Compiler<'h> {
     fn define_label(
         &mut self,
         name: &str,
+        line: u32,
         last_in_block: bool,
         block_nact: usize,
     ) -> Result<(), CompileError> {
-        if self.funcs.last().unwrap().labels.iter().any(|l| &*l.name == name) {
-            return self.err(format!("label '{name}' already defined"));
+        if let Some(old) = self
+            .funcs
+            .last()
+            .unwrap()
+            .labels
+            .iter()
+            .find(|l| &*l.name == name)
+        {
+            let old_line = old.line;
+            return self.err(format!("label '{name}' already defined on line {old_line}"));
         }
         let fs = self.funcs.last().unwrap();
-        let nact = if last_in_block { block_nact } else { fs.locals.len() };
-        let reg = fs.locals[..nact].iter().map(|l| l.reg + 1).max().unwrap_or(0);
+        let nact = if last_in_block {
+            block_nact
+        } else {
+            fs.locals.len()
+        };
+        let reg = fs.locals[..nact]
+            .iter()
+            .map(|l| l.reg + 1)
+            .max()
+            .unwrap_or(0);
         let floor = fs.goto_floor;
         let pc = self.here();
         // resolve pending gotos targeting this label; only gotos opened in
         // this block can see it (labels are not visible to enclosing blocks)
         let mut i = floor;
         while i < self.funcs.last().unwrap().gotos.len() {
-            let g = &self.funcs.last().unwrap().gotos[i];
-            if &*g.name != name {
+            let (gname, gline, gnact) = {
+                let g = &self.funcs.last().unwrap().gotos[i];
+                (g.name.clone(), g.line, g.nact)
+            };
+            if &*gname != name {
                 i += 1;
                 continue;
             }
-            if g.nact < nact {
-                let line = g.line;
+            if gnact < nact {
+                // PUC names the first local active at the label but not at
+                // the goto, i.e. `actvar[goto.nactvar]`.
+                let var = self
+                    .funcs
+                    .last()
+                    .unwrap()
+                    .locals
+                    .get(gnact)
+                    .map(|l| l.name.to_string())
+                    .unwrap_or_default();
                 self.fs().cur_line = line;
                 return self.err(format!(
-                    "<goto {name}> jumps into the scope of a local"
+                    "<goto {gname}> at line {gline} jumps into the scope of local '{var}'"
                 ));
             }
             let g = self.funcs.last_mut().unwrap().gotos.remove(i);
-            if nact < g.nact {
-                // jumping out of local scopes: close their upvalues
-                if let Instr::Close { from } =
-                    &mut self.funcs.last_mut().unwrap().code[g.close_pc]
+            if g.close || nact < g.nact {
+                // jumping out of local scopes: close their upvalues / TBC vars
+                if let Instr::Close { from } = &mut self.funcs.last_mut().unwrap().code[g.close_pc]
                 {
                     *from = reg;
                 }
@@ -388,7 +489,12 @@ impl<'h> Compiler<'h> {
                 *o = off;
             }
         }
-        self.funcs.last_mut().unwrap().labels.push(LabelDef { name: name.into(), pc, reg });
+        self.funcs.last_mut().unwrap().labels.push(LabelDef {
+            name: name.into(),
+            pc,
+            reg,
+            line,
+        });
         Ok(())
     }
 
@@ -396,7 +502,12 @@ impl<'h> Compiler<'h> {
         if let Some(g) = self.funcs.last().unwrap().gotos.first() {
             let (name, line) = (g.name.clone(), g.line);
             self.fs().cur_line = line;
-            return self.err(format!("no visible label '{name}' for goto"));
+            if &*name == "break" {
+                return self.err(format!("break outside loop at line {line}"));
+            }
+            return self.err(format!(
+                "no visible label '{name}' for <goto> at line {line}"
+            ));
         }
         Ok(())
     }
@@ -426,23 +537,30 @@ impl<'h> Compiler<'h> {
             return NameLoc::Global;
         }
         // resolve in the enclosing function, then capture
-        let desc = if let Some(i) = self.funcs[level - 1]
+        let (desc, attrib) = if let Some(i) = self.funcs[level - 1]
             .locals
             .iter()
             .rposition(|l| &*l.name == name)
         {
             self.funcs[level - 1].locals[i].captured = true;
-            UpvalDesc::Local(self.funcs[level - 1].locals[i].reg)
+            (
+                UpvalDesc::Local(self.funcs[level - 1].locals[i].reg),
+                self.funcs[level - 1].locals[i].attrib,
+            )
         } else {
             match self.resolve_at(level - 1, name) {
                 NameLoc::Local(_) => unreachable!("handled above"),
-                NameLoc::Upval(i) => UpvalDesc::Upval(i),
+                NameLoc::Upval(i) => (
+                    UpvalDesc::Upval(i),
+                    self.funcs[level - 1].upval_attribs[i as usize],
+                ),
                 NameLoc::Global => return NameLoc::Global,
             }
         };
         let fs = &mut self.funcs[level];
         fs.upvals.push(desc);
         fs.upval_names.push(name.into());
+        fs.upval_attribs.push(attrib);
         NameLoc::Upval(fs.upvals.len() as u8 - 1)
     }
 
@@ -452,11 +570,11 @@ impl<'h> Compiler<'h> {
         let watermark = self.local_top();
         match s {
             Stmt::Empty => {}
-            Stmt::Label(name) => {
+            Stmt::Label(name, line) => {
                 // labels are normally handled by stmt_seq (which knows
                 // block-end position); a stray one is not last-in-block
                 let nact = self.funcs.last().unwrap().locals.len();
-                self.define_label(name, false, nact)?;
+                self.define_label(name, *line, false, nact)?;
             }
             Stmt::Goto { label, line } => {
                 self.at_line(*line);
@@ -477,11 +595,16 @@ impl<'h> Compiler<'h> {
                         close_pc,
                         jump_pc,
                         nact,
+                        close: false,
                         line: *line,
                     });
                 }
             }
-            Stmt::Local { names, values, line } => {
+            Stmt::Local {
+                names,
+                values,
+                line,
+            } => {
                 self.at_line(*line);
                 if names.iter().filter(|(_, a)| *a == Attrib::Close).count() > 1 {
                     return self.err("multiple to-be-closed variables in local list");
@@ -491,7 +614,12 @@ impl<'h> Compiler<'h> {
                 for (i, (name, attrib)) in names.iter().enumerate() {
                     self.declare_local(name.clone(), base + i as u8, *attrib);
                     if *attrib == Attrib::Close {
-                        self.emit(Instr::Tbc { reg: base + i as u8 });
+                        self.fs().has_tbc = true;
+                        let name_k = self.str_const(name.as_bytes())?;
+                        self.emit(Instr::Tbc {
+                            reg: base + i as u8,
+                            name: name_k,
+                        });
                     }
                 }
                 // locals stay allocated
@@ -512,8 +640,13 @@ impl<'h> Compiler<'h> {
                 let t = self.target_of(target)?;
                 self.store(t, tmp)?;
             }
-            Stmt::Assign { targets, values, line } => {
+            Stmt::Assign {
+                targets,
+                values,
+                line,
+            } => {
                 self.at_line(*line);
+                let tmp_start = self.fs().free_reg;
                 let resolved: Vec<Target> = targets
                     .iter()
                     .map(|t| self.target_of(t))
@@ -523,6 +656,10 @@ impl<'h> Compiler<'h> {
                 for (i, t) in resolved.into_iter().enumerate() {
                     self.store(t, base + i as u8)?;
                 }
+                // Drop the target-prefix temporaries: the collector scans the
+                // whole stack (including dead slots), so leaving a captured
+                // value there would over-retain it (e.g. a weak key).
+                self.clear_regs(tmp_start, base);
             }
             Stmt::ExprStat(e) => {
                 self.call_like(e, Some(0))?;
@@ -531,14 +668,17 @@ impl<'h> Compiler<'h> {
             Stmt::While { cond, body } => {
                 let top = self.here();
                 let r = self.expr_to_any(cond)?;
-                let exit = self.emit_jump(Instr::Test { src: r, if_true: false, off: 0 });
+                let exit = self.emit_jump(Instr::Test {
+                    src: r,
+                    if_true: false,
+                    off: 0,
+                });
                 self.fs().free_reg = self.local_top();
                 let floor = self.fs().free_reg;
-                self.funcs
-                    .last_mut()
-                    .unwrap()
-                    .loops
-                    .push(LoopCtx { breaks: Vec::new(), reg_floor: floor });
+                self.funcs.last_mut().unwrap().loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    reg_floor: floor,
+                });
                 self.block_scope(body)?;
                 let off = self.back_off(top);
                 self.emit(Instr::Jump { off });
@@ -549,15 +689,18 @@ impl<'h> Compiler<'h> {
                 let top = self.here();
                 let floor = self.enter_scope();
                 let reg_floor = self.fs().free_reg;
-                self.funcs
-                    .last_mut()
-                    .unwrap()
-                    .loops
-                    .push(LoopCtx { breaks: Vec::new(), reg_floor });
-                self.stmt_seq(&body.stmts)?;
+                self.funcs.last_mut().unwrap().loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    reg_floor,
+                });
+                self.stmt_seq(&body.stmts, false)?;
                 // condition sees the body's locals (Lua scoping rule)
                 let r = self.expr_to_any(cond)?;
-                let exit = self.emit_jump(Instr::Test { src: r, if_true: true, off: 0 });
+                let exit = self.emit_jump(Instr::Test {
+                    src: r,
+                    if_true: true,
+                    off: 0,
+                });
                 self.emit(Instr::Close { from: reg_floor });
                 let off = self.back_off(top);
                 self.emit(Instr::Jump { off });
@@ -569,7 +712,11 @@ impl<'h> Compiler<'h> {
                 let mut end_jumps = Vec::new();
                 for (i, (cond, body)) in arms.iter().enumerate() {
                     let r = self.expr_to_any(cond)?;
-                    let skip = self.emit_jump(Instr::Test { src: r, if_true: false, off: 0 });
+                    let skip = self.emit_jump(Instr::Test {
+                        src: r,
+                        if_true: false,
+                        off: 0,
+                    });
                     self.fs().free_reg = self.local_top();
                     self.block_scope(body)?;
                     let is_last_arm = i + 1 == arms.len() && else_block.is_none();
@@ -585,7 +732,14 @@ impl<'h> Compiler<'h> {
                     self.patch_to_here(j);
                 }
             }
-            Stmt::NumericFor { var, start, end, step, body, line } => {
+            Stmt::NumericFor {
+                var,
+                start,
+                end,
+                step,
+                body,
+                line,
+            } => {
                 self.at_line(*line);
                 let floor = self.enter_scope();
                 let base = self.fs().free_reg;
@@ -609,11 +763,10 @@ impl<'h> Compiler<'h> {
                 self.declare_local(var.clone(), var_reg, Attrib::None);
                 let prep = self.emit_jump(Instr::ForPrep { base, off: 0 });
                 let body_top = self.here();
-                self.funcs
-                    .last_mut()
-                    .unwrap()
-                    .loops
-                    .push(LoopCtx { breaks: Vec::new(), reg_floor: base });
+                self.funcs.last_mut().unwrap().loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    reg_floor: base,
+                });
                 self.block_scope(body)?;
                 if self.var_captured(var_reg) {
                     self.emit(Instr::Close { from: var_reg });
@@ -624,27 +777,40 @@ impl<'h> Compiler<'h> {
                 self.finish_loop();
                 self.exit_scope(floor);
             }
-            Stmt::GenericFor { vars, exprs, body, line } => {
+            Stmt::GenericFor {
+                vars,
+                exprs,
+                body,
+                line,
+            } => {
                 self.at_line(*line);
                 let floor = self.enter_scope();
                 let base = self.fs().free_reg;
-                self.explist_to(exprs, 3)?;
+                // explist is adjusted to four values: iterator, state, control,
+                // and the closing value (5.4's 4th result, closed at loop exit).
+                self.explist_to(exprs, 4)?;
                 self.declare_local("(for state)".into(), base, Attrib::None);
                 self.declare_local("(for state)".into(), base + 1, Attrib::None);
                 self.declare_local("(for state)".into(), base + 2, Attrib::None);
+                self.declare_local("(for close)".into(), base + 3, Attrib::Close);
+                self.fs().has_tbc = true;
+                let name_k = self.str_const(b"(for state)")?;
+                self.emit(Instr::Tbc {
+                    reg: base + 3,
+                    name: name_k,
+                });
                 let vars_base = self.fs().free_reg;
-                debug_assert_eq!(vars_base, base + 3);
+                debug_assert_eq!(vars_base, base + 4);
                 for v in vars {
                     let r = self.alloc_reg()?;
                     self.declare_local(v.clone(), r, Attrib::None);
                 }
                 let to_call = self.emit_jump(Instr::Jump { off: 0 });
                 let body_top = self.here();
-                self.funcs
-                    .last_mut()
-                    .unwrap()
-                    .loops
-                    .push(LoopCtx { breaks: Vec::new(), reg_floor: base });
+                self.funcs.last_mut().unwrap().loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    reg_floor: base,
+                });
                 self.block_scope(body)?;
                 let captured = (0..vars.len()).any(|i| self.var_captured(vars_base + i as u8));
                 if captured {
@@ -655,12 +821,28 @@ impl<'h> Compiler<'h> {
                 let nvars = vars.len();
                 let save = self.fs().free_reg;
                 let tmp = self.alloc_regs(3)?;
-                self.emit(Instr::Move { dst: tmp, src: base });
-                self.emit(Instr::Move { dst: tmp + 1, src: base + 1 });
-                self.emit(Instr::Move { dst: tmp + 2, src: base + 2 });
-                self.emit(Instr::Call { base: tmp, nargs: 3, nres: nvars as u8 + 1 });
+                self.emit(Instr::Move {
+                    dst: tmp,
+                    src: base,
+                });
+                self.emit(Instr::Move {
+                    dst: tmp + 1,
+                    src: base + 1,
+                });
+                self.emit(Instr::Move {
+                    dst: tmp + 2,
+                    src: base + 2,
+                });
+                self.emit(Instr::Call {
+                    base: tmp,
+                    nargs: 3,
+                    nres: nvars as u8 + 1,
+                });
                 for i in 0..nvars {
-                    self.emit(Instr::Move { dst: vars_base + i as u8, src: tmp + i as u8 });
+                    self.emit(Instr::Move {
+                        dst: vars_base + i as u8,
+                        src: tmp + i as u8,
+                    });
                 }
                 let off = self.back_off(body_top);
                 self.emit(Instr::TForLoop { base, off });
@@ -670,13 +852,25 @@ impl<'h> Compiler<'h> {
             }
             Stmt::Return { exprs, line } => {
                 self.at_line(*line);
+                // `return f(...)` in a function with no pending to-be-closed
+                // variables is a proper tail call: no frame is left behind.
+                if exprs.len() == 1
+                    && !self.fs().has_tbc
+                    && matches!(exprs[0], Expr::Call { .. } | Expr::MethodCall { .. })
+                {
+                    self.tail_call_like(&exprs[0])?;
+                    return Ok(());
+                }
                 let (base, count) = self.explist_open(exprs)?;
-                self.emit(Instr::Return { base, n: enc(count) });
+                self.emit(Instr::Return {
+                    base,
+                    n: enc(count),
+                });
             }
             Stmt::Break(line) => {
                 self.at_line(*line);
                 if self.funcs.last().unwrap().loops.is_empty() {
-                    return self.err("break outside a loop");
+                    return self.err(format!("break outside loop at line {line}"));
                 }
                 let floor = self.funcs.last().unwrap().loops.last().unwrap().reg_floor;
                 self.emit(Instr::Close { from: floor });
@@ -726,25 +920,40 @@ impl<'h> Compiler<'h> {
                             .iter()
                             .rev()
                             .find(|l| l.reg == reg)
-                            .is_some_and(|l| l.attrib == Attrib::Const);
+                            .is_some_and(|l| l.attrib != Attrib::None);
                         if is_const {
-                            return self
-                                .err(format!("attempt to assign to const variable '{n}'"));
+                            return self.err(format!("attempt to assign to const variable '{n}'"));
                         }
                         Ok(Target::Local(reg))
                     }
-                    NameLoc::Upval(i) => Ok(Target::Upval(i)),
+                    NameLoc::Upval(i) => {
+                        let read_only = self
+                            .funcs
+                            .last()
+                            .unwrap()
+                            .upval_attribs
+                            .get(i as usize)
+                            .is_some_and(|a| *a != Attrib::None);
+                        if read_only {
+                            return self.err(format!("attempt to assign to const variable '{n}'"));
+                        }
+                        Ok(Target::Upval(i))
+                    }
                     NameLoc::Global => Ok(Target::Global(self.str_const(n.as_bytes())?)),
                 }
             }
             Expr::Index { obj, key, line } => {
                 self.at_line(*line);
-                let o = self.expr_to_any(obj)?;
+                // Target prefixes must capture their pre-assignment values,
+                // because an earlier or later target may overwrite the local
+                // they read (e.g. `i, a[i], a = ...`). Force fresh temps
+                // instead of aliasing a local's register.
+                let o = self.expr_to_fresh(obj)?;
                 if let Expr::Str(s) = &**key {
                     let k = self.str_const(s)?;
                     Ok(Target::Field { obj: o, k })
                 } else {
-                    let k = self.expr_to_any(key)?;
+                    let k = self.expr_to_fresh(key)?;
                     Ok(Target::Index { obj: o, key: k })
                 }
             }
@@ -762,19 +971,17 @@ impl<'h> Compiler<'h> {
             Target::Upval(up) => {
                 self.emit(Instr::SetUpval { up, src });
             }
-            Target::Global(k) => {
-                match self.env_loc() {
-                    EnvLoc::Local(r) => {
-                        self.emit(Instr::SetField { obj: r, k, src });
-                    }
-                    EnvLoc::Upval(up) => {
-                        let tmp = self.alloc_reg()?;
-                        self.emit(Instr::GetUpval { dst: tmp, up });
-                        self.emit(Instr::SetField { obj: tmp, k, src });
-                        self.fs().free_reg -= 1;
-                    }
+            Target::Global(k) => match self.env_loc() {
+                EnvLoc::Local(r) => {
+                    self.emit(Instr::SetField { obj: r, k, src });
                 }
-            }
+                EnvLoc::Upval(up) => {
+                    let tmp = self.alloc_reg()?;
+                    self.emit(Instr::GetUpval { dst: tmp, up });
+                    self.emit(Instr::SetField { obj: tmp, k, src });
+                    self.fs().free_reg -= 1;
+                }
+            },
             Target::Index { obj, key } => {
                 self.emit(Instr::SetIndex { obj, key, src });
             }
@@ -804,7 +1011,10 @@ impl<'h> Compiler<'h> {
         if exprs.is_empty() {
             if want > 0 {
                 self.alloc_regs(want)?;
-                self.emit(Instr::LoadNil { dst: base, n: want as u8 });
+                self.emit(Instr::LoadNil {
+                    dst: base,
+                    n: want as u8,
+                });
             }
             return Ok(());
         }
@@ -829,7 +1039,10 @@ impl<'h> Compiler<'h> {
                     self.expr_to_reg(e, r)?;
                     if need > 1 {
                         let pad = self.alloc_regs(need - 1)?;
-                        self.emit(Instr::LoadNil { dst: pad, n: (need - 1) as u8 });
+                        self.emit(Instr::LoadNil {
+                            dst: pad,
+                            n: (need - 1) as u8,
+                        });
                     }
                 }
             }
@@ -873,10 +1086,36 @@ impl<'h> Compiler<'h> {
                 if nres.is_none() {
                     self.fs().free_reg = base; // results tracked via top
                 }
-                self.emit(Instr::Vararg { dst: base, n: enc(nres) });
+                self.emit(Instr::Vararg {
+                    dst: base,
+                    n: enc(nres),
+                });
                 Ok(base)
             }
             _ => unreachable!("multret_tail on non-multret expression"),
+        }
+    }
+
+    /// Best-effort PUC `getobjname` for a call's callee: the name (and
+    /// `namewhat` category) to report from `debug.getinfo`'s `n` option.
+    fn callee_name(&mut self, e: &Expr) -> Option<(&'static str, Box<str>)> {
+        match e {
+            Expr::Name(n, _) => {
+                let namewhat = match self.resolve(n) {
+                    NameLoc::Global => "global",
+                    NameLoc::Local(_) => "local",
+                    NameLoc::Upval(_) => "upvalue",
+                };
+                Some((namewhat, n.clone()))
+            }
+            Expr::Index { key, .. } => match &**key {
+                Expr::Str(s) => Some((
+                    "field",
+                    String::from_utf8_lossy(s).into_owned().into_boxed_str(),
+                )),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -887,30 +1126,42 @@ impl<'h> Compiler<'h> {
         match e {
             Expr::Call { func, args, line } => {
                 self.at_line(*line);
+                let name = self.callee_name(func);
                 self.expr_to_reg(func, base)?;
                 self.fs().free_reg = base + 1;
                 let argc = self.compile_args(args)?;
                 self.at_line(*line);
-                self.emit(Instr::Call {
+                let idx = self.emit(Instr::Call {
                     base,
                     nargs: argc.map_or(0, |c| c as u8 + 1),
                     nres: enc(nres),
                 });
+                self.fs().call_names[idx] = name;
             }
-            Expr::MethodCall { obj, name, args, line } => {
+            Expr::MethodCall {
+                obj,
+                name,
+                args,
+                line,
+            } => {
                 self.at_line(*line);
                 let selfr = self.alloc_reg()?; // base + 1
                 self.expr_to_reg(obj, selfr)?;
                 self.fs().free_reg = base + 2;
                 let k = self.str_const(name.as_bytes())?;
-                self.emit(Instr::GetField { dst: base, obj: selfr, k });
+                self.emit(Instr::GetField {
+                    dst: base,
+                    obj: selfr,
+                    k,
+                });
                 let argc = self.compile_args(args)?;
                 self.at_line(*line);
-                self.emit(Instr::Call {
+                let idx = self.emit(Instr::Call {
                     base,
                     nargs: argc.map_or(0, |c| c as u8 + 2),
                     nres: enc(nres),
                 });
+                self.fs().call_names[idx] = Some(("method", name.clone()));
             }
             _ => unreachable!("call_like on non-call"),
         }
@@ -928,6 +1179,53 @@ impl<'h> Compiler<'h> {
             }
         }
         Ok(base)
+    }
+
+    /// Compiles `return <call>` as a proper tail call. Mirrors `call_like`
+    /// but emits `TailCall` (open results) so the VM reuses the frame.
+    fn tail_call_like(&mut self, e: &Expr) -> Result<(), CompileError> {
+        let base = self.alloc_reg()?;
+        match e {
+            Expr::Call { func, args, line } => {
+                self.at_line(*line);
+                let name = self.callee_name(func);
+                self.expr_to_reg(func, base)?;
+                self.fs().free_reg = base + 1;
+                let argc = self.compile_args(args)?;
+                self.at_line(*line);
+                let idx = self.emit(Instr::TailCall {
+                    base,
+                    nargs: argc.map_or(0, |c| c as u8 + 1),
+                });
+                self.fs().call_names[idx] = name;
+            }
+            Expr::MethodCall {
+                obj,
+                name,
+                args,
+                line,
+            } => {
+                self.at_line(*line);
+                let selfr = self.alloc_reg()?; // base + 1
+                self.expr_to_reg(obj, selfr)?;
+                self.fs().free_reg = base + 2;
+                let k = self.str_const(name.as_bytes())?;
+                self.emit(Instr::GetField {
+                    dst: base,
+                    obj: selfr,
+                    k,
+                });
+                let argc = self.compile_args(args)?;
+                self.at_line(*line);
+                let idx = self.emit(Instr::TailCall {
+                    base,
+                    nargs: argc.map_or(0, |c| c as u8 + 2),
+                });
+                self.fs().call_names[idx] = Some(("method", name.clone()));
+            }
+            _ => unreachable!("tail_call_like on non-call"),
+        }
+        Ok(())
     }
 
     /// Compiles call arguments into consecutive registers above the current
@@ -959,6 +1257,26 @@ impl<'h> Compiler<'h> {
         let r = self.alloc_reg()?;
         self.expr_to_reg(e, r)?;
         Ok(r)
+    }
+
+    /// Like [`Self::expr_to_any`], but always materializes the value in a
+    /// fresh temporary, even for a local. Assignment-target prefixes use this
+    /// so a later store to that local cannot invalidate the captured value.
+    fn expr_to_fresh(&mut self, e: &Expr) -> Result<u8, CompileError> {
+        let r = self.alloc_reg()?;
+        self.expr_to_reg(e, r)?;
+        Ok(r)
+    }
+
+    /// Sets registers `from..to` to nil. Keeps stale references out of dead
+    /// slots, which the whole-stack collector would otherwise treat as roots.
+    fn clear_regs(&mut self, from: u8, to: u8) {
+        if from < to {
+            self.emit(Instr::LoadNil {
+                dst: from,
+                n: to - from,
+            });
+        }
     }
 
     fn expr_to_reg(&mut self, e: &Expr, dst: u8) -> Result<(), CompileError> {
@@ -1028,7 +1346,11 @@ impl<'h> Compiler<'h> {
                     self.emit(Instr::GetField { dst, obj: o, k });
                 } else {
                     let kr = self.expr_to_any(key)?;
-                    self.emit(Instr::GetIndex { dst, obj: o, key: kr });
+                    self.emit(Instr::GetIndex {
+                        dst,
+                        obj: o,
+                        key: kr,
+                    });
                 }
                 self.fs().free_reg = save;
             }
@@ -1069,7 +1391,12 @@ impl<'h> Compiler<'h> {
                     let last = i + 1 == items.len();
                     if last && item.is_multret() {
                         self.multret_tail(item, None)?;
-                        self.emit(Instr::SetList { obj: dst, base: batch_base, n: 0, start });
+                        self.emit(Instr::SetList {
+                            obj: dst,
+                            base: batch_base,
+                            n: 0,
+                            start,
+                        });
                         pending = 0;
                         break;
                     }
@@ -1103,11 +1430,19 @@ impl<'h> Compiler<'h> {
                     if let Expr::Str(s) = k {
                         let kc = self.str_const(s)?;
                         let vr = self.expr_to_any(v)?;
-                        self.emit(Instr::SetField { obj: dst, k: kc, src: vr });
+                        self.emit(Instr::SetField {
+                            obj: dst,
+                            k: kc,
+                            src: vr,
+                        });
                     } else {
                         let kr = self.expr_to_any(k)?;
                         let vr = self.expr_to_any(v)?;
-                        self.emit(Instr::SetIndex { obj: dst, key: kr, src: vr });
+                        self.emit(Instr::SetIndex {
+                            obj: dst,
+                            key: kr,
+                            src: vr,
+                        });
                     }
                     self.fs().free_reg = save;
                 }
@@ -1143,7 +1478,13 @@ impl<'h> Compiler<'h> {
                 let save = self.fs().free_reg;
                 let mut parts: Vec<&Expr> = vec![lhs];
                 let mut cur = rhs;
-                while let Expr::BinOp { op: BinOp::Concat, lhs, rhs, .. } = cur {
+                while let Expr::BinOp {
+                    op: BinOp::Concat,
+                    lhs,
+                    rhs,
+                    ..
+                } = cur
+                {
                     parts.push(lhs);
                     cur = rhs;
                 }
@@ -1154,7 +1495,11 @@ impl<'h> Compiler<'h> {
                     self.expr_to_reg(p, r)?;
                 }
                 self.at_line(line);
-                self.emit(Instr::Concat { dst, base, n: parts.len() as u8 });
+                self.emit(Instr::Concat {
+                    dst,
+                    base,
+                    n: parts.len() as u8,
+                });
                 self.fs().free_reg = save;
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -1172,7 +1517,12 @@ impl<'h> Compiler<'h> {
                 let lr = self.expr_to_any(l)?;
                 let rr = self.expr_to_any(r)?;
                 self.at_line(line);
-                self.emit(Instr::Cmp { op: cmp, dst, lhs: lr, rhs: rr });
+                self.emit(Instr::Cmp {
+                    op: cmp,
+                    dst,
+                    lhs: lr,
+                    rhs: rr,
+                });
                 self.fs().free_reg = save;
             }
             _ => {
@@ -1195,7 +1545,12 @@ impl<'h> Compiler<'h> {
                 let lr = self.expr_to_any(lhs)?;
                 let rr = self.expr_to_any(rhs)?;
                 self.at_line(line);
-                self.emit(Instr::Arith { op: aop, dst, lhs: lr, rhs: rr });
+                self.emit(Instr::Arith {
+                    op: aop,
+                    dst,
+                    lhs: lr,
+                    rhs: rr,
+                });
                 self.fs().free_reg = save;
             }
         }
@@ -1213,6 +1568,7 @@ impl<'h> Compiler<'h> {
         }
         let mut fs = FuncState::new(name, fb.params.len() as u8, fb.is_vararg);
         fs.cur_line = fb.line;
+        fs.linedefined = fb.line;
         self.funcs.push(fs);
         for p in &fb.params {
             let r = self.alloc_reg()?;
@@ -1220,6 +1576,10 @@ impl<'h> Compiler<'h> {
         }
         self.block_scope(&fb.body)?;
         self.check_pending_gotos()?;
+        // The implicit final `RETURN` carries the line of the closing `end`,
+        // which is what PUC records in `lastlinedefined` and `activelines`.
+        self.at_line(fb.end_line);
+        self.fs().line_end = fb.end_line;
         self.emit(Instr::Return { base: 0, n: 1 });
         let done = self.funcs.pop().unwrap();
         let proto = Rc::new(done.into_proto(self.source.clone()));

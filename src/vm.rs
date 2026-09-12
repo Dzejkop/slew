@@ -11,11 +11,12 @@
 //! protection boundary and error unwinding walks the frame vec.
 
 use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
-use crate::compiler::{compile, CompileError};
-use crate::parser::{parse, ParseError};
+use crate::compiler::{CompileError, compile};
+use crate::host::{Host, HostObject, Userdata};
+use crate::parser::{ParseError, parse};
 use crate::value::{
-    fmt_number, float_to_exact_int, ClosId, NativeId, StrId, Strings, Table, TableId, ThreadId,
-    UpvalId, Value,
+    ClosId, NativeId, StrRef, Strings, Table, TableId, ThreadId, UpvalId, UserdataId, Value,
+    float_to_exact_int, fmt_number,
 };
 use std::fmt;
 use std::rc::Rc;
@@ -23,8 +24,11 @@ use std::rc::Rc;
 /// Default cap on call-frame depth; a deliberately bounded execution profile
 /// knob (recursion consumes heap, not the host stack).
 const MAX_CALL_DEPTH: usize = 10_000;
-/// Bound on `__index`/`__newindex`/`__call` metamethod chains.
-const MAX_META_CHAIN: usize = 100;
+/// Bound on `__index`/`__newindex`/`__call` metamethod chains. High enough
+/// for the upstream suite's 100-deep `__call` chains while still catching a
+/// genuine cycle; `__call` resolution keeps the argument window at a fixed
+/// scratch base, so chasing N levels costs O(N) space, not O(N^2).
+const MAX_META_CHAIN: usize = 10_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -39,7 +43,13 @@ pub struct RuntimeError {
     pub message: String,
     /// The Lua error value (`error()` can raise any value).
     pub value: Value,
+    /// Line where the error was raised; for errors inside a called function
+    /// or a `load`ed chunk this points into that chunk, not the root script.
     pub line: u32,
+    /// Line of the outermost frame (the root script) when the error escaped.
+    /// Handy for progress reporting: a script that calls a helper still
+    /// reports its own call site here.
+    pub root_line: u32,
 }
 
 impl fmt::Display for Error {
@@ -76,12 +86,20 @@ pub(crate) enum ErrVal {
 pub(crate) struct VmError {
     pub val: ErrVal,
     pub line: u32,
+    /// Line of the outermost frame at raise time (the script's own call
+    /// site). Set by the dispatcher before unwinding pops frames, since
+    /// `recover` discards them.
+    pub root_line: u32,
     /// Chunk name for the position prefix; `None` for native errors,
     /// which carry no position (matching PUC).
     pub source: Option<Rc<str>>,
 }
 
 pub type NativeFn = fn(&mut Lua, &[Value]) -> Result<Vec<Value>, String>;
+
+/// Host-provided module byte source. `Ok(None)` means "not found"; `Err` is
+/// a hard failure. See [`Lua::set_file_reader`].
+type FileReaderFn = dyn FnMut(&str) -> Result<Option<Vec<u8>>, String>;
 
 /// Builtins that must interact with the frame machinery (raise error
 /// values, set up protected calls, call metamethods, switch threads).
@@ -97,8 +115,31 @@ pub(crate) enum Intrinsic {
     /// The function returned by `coroutine.wrap`: resumes its thread,
     /// returns results bare, propagates errors.
     WrapResume(ThreadId),
+    /// Increment / decrement the thread's non-yieldable depth. The prelude
+    /// brackets a callback that PUC's C library invokes with `lua_call`
+    /// (non-yieldable), so `coroutine.yield` inside it errors with
+    /// "attempt to yield across a C-call boundary" and `isyieldable` is false.
+    EnterNonYieldable,
+    LeaveNonYieldable,
     IsYieldable,
     Running,
+    CoroutineClose,
+    CollectGarbage,
+    Print,
+    /// `string.format`: parses the format string and renders arguments,
+    /// suspending to run `__tostring` for `%s` where present.
+    Format,
+    DebugGetinfo,
+    DebugTraceback,
+    DebugGetupvalue,
+    DebugSetupvalue,
+    DebugUpvalueid,
+    DebugUpvaluejoin,
+    DebugGetmetatable,
+    DebugSetmetatable,
+    DebugGetregistry,
+    DebugGethook,
+    DebugSethook,
 }
 
 pub(crate) enum NativeKind {
@@ -150,12 +191,61 @@ enum Pending {
     CallClose { v: Value, err: Value },
     /// Final step of error recovery: deliver `false, err` (or run the
     /// xpcall handler) at the protected call's result slots.
-    DeliverError { ret_to: usize, nres: u8, err: Value, handler: Option<Value> },
+    DeliverError {
+        ret_to: usize,
+        nres: u8,
+        err: Value,
+        handler: Option<Value>,
+    },
+    /// A message handler errored while handling an error: deliver PUC's
+    /// `false, "error in error handling"` at the protected call's slots.
+    DeliverErrErr { ret_to: usize, nres: u8 },
     /// Final step of a return that had to run `__close` handlers first.
     FinishReturn { start: usize, count: usize },
+    /// Final step of a tail call into a native/intrinsic: the callee's
+    /// results now sit at `start` (with `th.top` already updated); complete
+    /// the frame's return as usual.
+    TailReturn { start: usize },
+    /// Advance the active `coroutine.close` driver by one `__close` handler.
+    CloseStep,
+    /// Advance the active `print` driver by one `__tostring` call.
+    PrintStep,
+    /// Validate and convert the result of a `tostring` `__tostring` call.
+    FinishTostring {
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+        result_slot: usize,
+    },
+    /// Advance the active `string.format` driver by one format item.
+    FormatStep,
+    /// After an xpcall message handler called at the error point returns,
+    /// unwind the frames that were kept alive for it.
+    UnwindAfterHandler { result_slot: usize },
+    /// Re-apply a return shape to results a nested protected call (pcall /
+    /// xpcall) already delivered at `ret_to`. PUC's `xpcall(pcall, ...)` and
+    /// `pcall(pcall, ...)` each add their own success flag on top of the
+    /// inner call's results; slew's intrinsics delegate to `protected_call`,
+    /// which stamps only the inner flag, so the outer one is applied here.
+    PrependShape {
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+    },
+    /// Emit the "return" hook for the frame that is about to be popped, then
+    /// let the following `FinishReturn` complete the return. Used when a
+    /// function with to-be-closed variables returns: closes run first, then
+    /// the hook, then the frame is popped.
+    ReturnHookFire,
+    /// Advance a deferred yield through its hook stages, then switch threads.
+    YieldStep,
+    /// Re-raise an error after the collected `__close` handlers have run. Used
+    /// when an error escapes a thread with no protection boundary: the closes
+    /// are staged on a synthetic frame, then the error propagates.
+    Reraise { err: Value },
 }
 
-struct Frame {
+struct LuaFrame {
     closure: ClosId,
     proto: Rc<Proto>,
     pc: usize,
@@ -169,10 +259,154 @@ struct Frame {
     protected: bool,
     /// xpcall message handler.
     handler: Option<Value>,
+    /// This frame is an xpcall message handler: if it errors, PUC reports
+    /// `error in error handling` instead of propagating.
+    handler_guard: bool,
     pending: Vec<Pending>,
     /// Registers holding active to-be-closed variables (ascending).
     tbc: Vec<u8>,
     varargs: Vec<Value>,
+    /// True if this frame was entered via a proper tail call.
+    tailcall: bool,
+    /// When this frame is a metamethod call (e.g. `__close`), the PUC
+    /// `namewhat`/`name` to report for it (`("metamethod", "close")`).
+    call_meta: Option<(&'static str, &'static str)>,
+    /// Last source line reported for a line hook (`-1` before the first).
+    last_line: i64,
+    /// This frame is a running debug hook: hooks are disabled while it (or
+    /// anything it calls) is on the stack, matching PUC's `allowhook`.
+    is_hook: bool,
+}
+
+/// Hook event bits for [`Thread::hook_mask`].
+const HOOK_CALL: u8 = 1;
+const HOOK_RETURN: u8 = 2;
+const HOOK_LINE: u8 = 4;
+
+/// A synthetic C-level frame: a VM boundary (pcall/xpcall/coroutine.close)
+/// reported by `debug.getinfo`/`traceback` with `what == "C"`. It has no
+/// bytecode to run; it exists only to occupy a level and to carry the
+/// `__close`/error-delivery continuations of the protected call it guards.
+struct CFrame {
+    /// The C function this frame reports (`getinfo(...).func`).
+    func: Value,
+    /// `getinfo(...).name` and `namewhat` (e.g. `"pcall"`/`"global"`).
+    name: &'static str,
+    namewhat: &'static str,
+    /// First stack slot safely above the caller's live data (scratch base at
+    /// push time); used while this frame is the innermost frame.
+    base: usize,
+    /// `__close`/error-delivery continuations staged on this boundary.
+    pending: Vec<Pending>,
+    /// Present when this frame is itself the error-protection boundary: its
+    /// protected callee was a native/intrinsic with no Lua frame of its own
+    /// (e.g. `pcall(tostring, v)` where `__tostring` runs later). Carries the
+    /// result destination and message handler for error delivery.
+    boundary: Option<CBoundary>,
+}
+
+/// Protection metadata for a [`CFrame`] that guards a native callee.
+#[derive(Clone, Copy)]
+struct CBoundary {
+    ret_to: usize,
+    nres: u8,
+    handler: Option<Value>,
+}
+
+/// Set while an xpcall message handler runs *before* unwinding (so it can see
+/// the erroring frames, as PUC's `luaG_errormsg` does). Cleared once the
+/// handler returns and the deferred unwind begins.
+struct HandlerUnwind;
+
+enum Frame {
+    Lua(LuaFrame),
+    C(CFrame),
+}
+
+impl Frame {
+    fn as_lua(&self) -> &LuaFrame {
+        match self {
+            Frame::Lua(f) => f,
+            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+        }
+    }
+
+    fn as_lua_mut(&mut self) -> &mut LuaFrame {
+        match self {
+            Frame::Lua(f) => f,
+            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+        }
+    }
+
+    fn is_c(&self) -> bool {
+        matches!(self, Frame::C(_))
+    }
+
+    fn lua(&self) -> Option<&LuaFrame> {
+        match self {
+            Frame::Lua(f) => Some(f),
+            Frame::C(_) => None,
+        }
+    }
+
+    /// Whether this frame is an error-protection boundary. A Lua frame carries
+    /// the flag when it is a protected callee; a C frame carries it when the
+    /// protected callee was a native (see [`CFrame::boundary`]).
+    fn is_protected(&self) -> bool {
+        match self {
+            Frame::Lua(f) => f.protected,
+            Frame::C(c) => c.boundary.is_some(),
+        }
+    }
+
+    fn pending(&self) -> &[Pending] {
+        match self {
+            Frame::Lua(f) => &f.pending,
+            Frame::C(f) => &f.pending,
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut Vec<Pending> {
+        match self {
+            Frame::Lua(f) => &mut f.pending,
+            Frame::C(f) => &mut f.pending,
+        }
+    }
+}
+
+/// The message handler and handler-guard of a protection boundary frame.
+fn frame_boundary(f: &Frame) -> (Option<Value>, bool) {
+    match f {
+        Frame::Lua(f) => (f.handler, f.handler_guard),
+        Frame::C(c) => (c.boundary.as_ref().and_then(|b| b.handler), false),
+    }
+}
+
+/// Whether a frame still holds to-be-closed variables to run.
+fn frame_has_tbc(f: &Frame) -> bool {
+    matches!(f, Frame::Lua(f) if !f.tbc.is_empty())
+}
+
+/// Whether a frame is a directly-invoked `__close` metamethod call.
+fn frame_close_meta(f: &Frame) -> bool {
+    matches!(f, Frame::Lua(f) if f.call_meta == Some(("metamethod", "close")))
+}
+
+/// Appends PUC's `(metamethod 'name')` suffix to a non-callable metamethod
+/// error message (`attempt to call a number value (metamethod 'close')`).
+fn annotate_metamethod_error(e: &mut VmError, name: &str) {
+    if let ErrVal::Msg(m) = &mut e.val
+        && !m.contains("(metamethod '")
+    {
+        m.push_str(&format!(" (metamethod '{name}')"));
+    }
+}
+
+/// Description of a synthetic C frame to push at a protected-call boundary.
+struct CSpec {
+    name: &'static str,
+    namewhat: &'static str,
+    func: Value,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -208,12 +442,54 @@ pub(crate) struct Thread {
     /// Top of the last multret sequence (absolute).
     top: usize,
     pub(crate) status: CoStatus,
+    /// Nesting depth of non-yieldable C-call boundaries currently active on
+    /// this thread (PUC's `nny`). While non-zero, `coroutine.yield` errors
+    /// and `coroutine.isyieldable()` is false. Reset/kept per thread, so a
+    /// coroutine created and resumed *inside* such a boundary is yieldable.
+    non_yieldable: u32,
     /// The thread that resumed this one.
     parent: Option<ThreadId>,
     /// Result-delivery info in the parent (set at each resume).
     resume_ret: Option<ResumeRet>,
     /// Where the next resume's arguments land (set at each yield).
     yield_ret: Option<(usize, u8, RetShape)>,
+    /// True for a root execution's thread. The main thread cannot yield;
+    /// every coroutine created by `coroutine.create`/`wrap` can.
+    is_main: bool,
+    // ---- debug hooks (`debug.sethook`) ----
+    /// Hook function, or `None` when no hook is set.
+    hook: Option<Value>,
+    /// Which events fire: bit 0 call, bit 1 return, bit 2 line.
+    hook_mask: u8,
+    /// Instruction interval for count events (0 disables them).
+    hook_count: i64,
+    /// Countdown to the next count event.
+    hook_counter: i64,
+    /// Non-zero while a coroutine body's start-of-execution call hook is
+    /// still owed (the body frame is pushed outside `do_call`).
+    pending_call_hook: bool,
+    /// A yield whose hook events (call/return) have not all fired yet.
+    yield_job: Option<YieldJob>,
+    /// For a dead coroutine: the error it died with, returned once by
+    /// `coroutine.close`. `Some(Nil)` means "died cleanly".
+    close_error: Option<Value>,
+}
+
+/// Hook events to emit before a suspended yield completes. `coroutine.yield`
+/// is a C function, so it owes a "call" event when invoked and a "return"
+/// event when it yields; both run as ordinary hook frames, so the actual
+/// suspension is deferred through [`Pending::YieldStep`].
+struct YieldJob {
+    parent: ThreadId,
+    rr: ResumeRet,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    args: Vec<Value>,
+    /// The `coroutine.yield` native, for `debug.getinfo(2)` in hook events.
+    func: Value,
+    /// 0: fire call, 1: fire return, 2: perform the yield.
+    stage: u8,
 }
 
 /// A compiled script, reusable across executions.
@@ -337,14 +613,18 @@ pub struct Lua {
     pub(crate) natives: Vec<Native>,
     pub(crate) upvals: Vec<Upval>,
     pub(crate) threads: Vec<Thread>,
+    /// Userdata arena: host objects with optional metatables.
+    pub(crate) userdata: Vec<Userdata>,
     pub(crate) globals: TableId,
-    pub(crate) builtin_next: Value,
-    pub(crate) builtin_ipairs_iter: Value,
     pub(crate) string_meta: Option<TableId>,
-    mm_names: Vec<StrId>,
+    mm_names: Vec<StrRef>,
     /// Thread being dispatched right now (its `Thread` is temporarily
     /// moved out of the arena).
     pub(crate) current_thread: ThreadId,
+    /// Per-type metatables set through `debug.setmetatable` for values that
+    /// cannot carry a per-value metatable: nil, boolean, number, function,
+    /// thread (in that slot order). Tables and strings use their own storage.
+    pub(crate) type_metas: [Option<TableId>; 5],
     /// Set by resume/yield intrinsics; the dispatch loop performs the
     /// actual thread switch.
     switch_to: Option<ThreadId>,
@@ -360,6 +640,8 @@ pub struct Lua {
     upvals_free: Vec<u32>,
     threads_live: Vec<bool>,
     threads_free: Vec<u32>,
+    userdata_live: Vec<bool>,
+    userdata_free: Vec<u32>,
     natives_live: Vec<bool>,
     natives_free: Vec<u32>,
     /// Root + current thread per live (unfinished) execution.
@@ -375,6 +657,117 @@ pub struct Lua {
     /// Memory ceiling in (approximate) bytes; allocation past it raises a
     /// Lua error once detected at a collection point.
     pub memory_limit: Option<usize>,
+    /// Host-supplied source reader for `loadfile`/`dofile` and
+    /// `package.searchpath`. Absent by default: the core has no filesystem
+    /// authority of its own.
+    file_reader: Option<Box<FileReaderFn>>,
+    // ---- GC controls (`collectgarbage`) ----
+    /// False after `collectgarbage("stop")`: automatic collection pauses
+    /// (explicit `collect`/`step` still run).
+    pub(crate) gc_running: bool,
+    /// 0 = incremental, 1 = generational. Only reported by the mode switches;
+    /// the collector itself is a stop-the-world mark-sweep.
+    pub(crate) gc_mode: u8,
+    pub(crate) gc_pause: i64,
+    pub(crate) gc_stepmul: i64,
+    /// Objects selected for `__gc`, awaiting a dispatch safe point. A GC root.
+    pending_finalizers: Vec<Value>,
+    /// Frame depth at which the in-flight finalizer was started; suppresses
+    /// nested finalizer dispatch until that frame returns.
+    finalizer_depth: Option<usize>,
+    /// In-progress `coroutine.close` driver (see [`CloseJob`]).
+    close_job: Option<CloseJob>,
+    /// In-progress `print` driver (see [`PrintJob`]).
+    print_job: Option<PrintJob>,
+    /// In-progress `string.format` driver (see [`FormatJob`]).
+    format_job: Option<FormatJob>,
+    /// An xpcall message handler running at the error point; see
+    /// [`HandlerUnwind`].
+    handler_unwind: Option<HandlerUnwind>,
+    /// Non-zero while [`Lua::fire_hook`] installs a hook frame: suppresses the
+    /// call hook that the hook invocation would otherwise emit.
+    hook_suppress: u32,
+    /// Embedder-installed capability host. `None` means `io`/`os` are absent.
+    pub(crate) host: Option<Box<dyn Host>>,
+    /// The file userdata metatable (set when a host is installed).
+    pub(crate) file_meta: Option<TableId>,
+    /// Default `io.input()` / `io.output()` handles (GC roots).
+    pub(crate) io_input: Option<UserdataId>,
+    pub(crate) io_output: Option<UserdataId>,
+    /// Set by `os.exit`: the requested exit code, for the embedder to observe.
+    /// Never terminates the process here.
+    pub(crate) exit_request: Option<i64>,
+}
+
+/// State for the incremental `coroutine.close` driver: `__close` handlers are
+/// invoked one per dispatch step, protected, until every pending value has
+/// been closed. Driven by [`Pending::CloseStep`].
+struct CloseJob {
+    target: ThreadId,
+    /// The `coroutine.close` C function, for the synthetic close frame.
+    func: Value,
+    /// Values to close, innermost-first.
+    items: Vec<Value>,
+    idx: usize,
+    /// Error accumulated so far (passed to later handlers).
+    err: Value,
+    failed: bool,
+    /// Where the eventual `true` / `false, err` result lands in the caller.
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    /// Scratch slot where the last protected `__close` result was delivered.
+    result_slot: usize,
+    /// True when `result_slot` holds an unread result.
+    awaiting: bool,
+}
+
+/// State for the incremental `print` driver: arguments are rendered one per
+/// dispatch step, invoking `__tostring` where present. Driven by
+/// [`Pending::PrintStep`].
+struct PrintJob {
+    items: Vec<Value>,
+    idx: usize,
+    /// Rendered argument bytes, in order.
+    out: Vec<Vec<u8>>,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    result_slot: usize,
+    awaiting: bool,
+}
+
+/// State for the incremental `string.format` driver. Mirrors PUC's
+/// `str_format` loop, but suspends to resolve `%s` via `__tostring`.
+struct FormatJob {
+    fmt: Vec<u8>,
+    /// Next byte of `fmt` to consume.
+    pos: usize,
+    /// PUC's `arg`: 1-based index into `args` (1 is the format string).
+    arg: usize,
+    /// `[format, ...variadic args]`.
+    args: Vec<Value>,
+    out: Vec<u8>,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    result_slot: usize,
+    awaiting: bool,
+    /// While awaiting a `%s` `__tostring` result: the spec, its argument,
+    /// and the 1-based arg index to report in errors.
+    saved: Option<(crate::stdlib::string::FmtSpec, Value, usize)>,
+}
+
+/// How a table participates in the weak-reference machinery (`__mode`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeakKind {
+    Strong,
+    /// `k`: keys weak, values strong (ephemeron).
+    Keys,
+    /// `v`: keys strong, values weak.
+    Values,
+    /// `kv`: both weak.
+    Both,
 }
 
 impl Default for Lua {
@@ -386,7 +779,10 @@ impl Default for Lua {
 impl Lua {
     pub fn new() -> Self {
         let mut strings = Strings::default();
-        let mm_names = MM_NAMES.iter().map(|n| strings.intern_fixed(n.as_bytes())).collect();
+        let mm_names = MM_NAMES
+            .iter()
+            .map(|n| strings.intern_fixed(n.as_bytes()))
+            .collect();
         let mut lua = Lua {
             strings,
             tables: vec![Table::default()],
@@ -394,12 +790,12 @@ impl Lua {
             natives: Vec::new(),
             upvals: Vec::new(),
             threads: Vec::new(),
+            userdata: Vec::new(),
             globals: TableId(0),
-            builtin_next: Value::Nil,
-            builtin_ipairs_iter: Value::Nil,
             string_meta: None,
             mm_names,
             current_thread: ThreadId(u32::MAX),
+            type_metas: [None; 5],
             switch_to: None,
             rng: [0; 4],
             tables_live: vec![true],
@@ -410,6 +806,8 @@ impl Lua {
             upvals_free: Vec::new(),
             threads_live: Vec::new(),
             threads_free: Vec::new(),
+            userdata_live: Vec::new(),
+            userdata_free: Vec::new(),
             natives_live: Vec::new(),
             natives_free: Vec::new(),
             exec_roots: std::collections::HashMap::new(),
@@ -421,30 +819,56 @@ impl Lua {
                 consts: Vec::new(),
                 protos: Vec::new(),
                 upvals: Vec::new(),
+                upval_names: Vec::new(),
                 nparams: 0,
                 is_vararg: false,
                 max_regs: 0,
+                reg_extent: Vec::new(),
                 name: String::new(),
+                linedefined: 0,
+                lastlinedefined: 0,
+                call_names: Vec::new(),
             }),
             allocs_since_gc: 0,
             str_bytes_at_gc: 0,
             gc_alloc_threshold: 50_000,
             memory_limit: None,
+            file_reader: None,
+            gc_running: true,
+            gc_mode: 1, // PUC 5.4 defaults to generational
+            gc_pause: 200,
+            gc_stepmul: 100,
+            pending_finalizers: Vec::new(),
+            finalizer_depth: None,
+            close_job: None,
+            print_job: None,
+            format_job: None,
+            handler_unwind: None,
+            hook_suppress: 0,
+            host: None,
+            file_meta: None,
+            io_input: None,
+            io_output: None,
+            exit_request: None,
         };
         lua.seed_random(0x536c65775f5f5f31); // "Slew____1"
         crate::stdlib::install(&mut lua);
         lua
     }
 
+    /// Reseeds the PRNG with PUC 5.4's `setseed`, using `0` for the second
+    /// 64-bit word. Equivalent to `seed_random_pair(seed, 0)`.
     pub fn seed_random(&mut self, seed: u64) {
-        // splitmix64 to expand the seed into the xoshiro state
-        let mut x = seed;
-        for s in &mut self.rng {
-            x = x.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            *s = z ^ (z >> 31);
+        self.seed_random_pair(seed, 0);
+    }
+
+    /// Seeds the PRNG with two 64-bit words exactly like PUC 5.4's `setseed`:
+    /// state `{n1, 0xff, n2, 0}`, then 16 discarded `nextrand` calls to spread
+    /// the seed. (`0xff` avoids the all-zero state.)
+    pub fn seed_random_pair(&mut self, n1: u64, n2: u64) {
+        self.rng = [n1, 0xff, n2, 0];
+        for _ in 0..16 {
+            self.next_random();
         }
     }
 
@@ -478,10 +902,16 @@ impl Lua {
     /// [`Execution::step`] is called.
     pub fn execute(&mut self, chunk: &Chunk) -> Execution {
         let env = self.new_upval(Upval::Closed(Value::Table(self.globals)));
-        let cid = self.alloc_closure(LuaClosure { proto: chunk.proto.clone(), upvals: vec![env] });
-        let mut th = Thread::default();
+        let cid = self.alloc_closure(LuaClosure {
+            proto: chunk.proto.clone(),
+            upvals: vec![env],
+        });
+        let mut th = Thread {
+            is_main: true,
+            ..Default::default()
+        };
         th.stack.resize(chunk.proto.max_regs as usize, Value::Nil);
-        th.frames.push(Frame {
+        th.frames.push(Frame::Lua(LuaFrame {
             closure: cid,
             proto: chunk.proto.clone(),
             pc: 0,
@@ -491,14 +921,79 @@ impl Lua {
             shape: RetShape::Normal,
             protected: false,
             handler: None,
+            handler_guard: false,
             pending: Vec::new(),
             tbc: Vec::new(),
             varargs: Vec::new(),
-        });
+            tailcall: false,
+            call_meta: None,
+            last_line: -1,
+            is_hook: false,
+        }));
         let tid = self.alloc_thread(th);
         // GC root for as long as the execution is live
         self.exec_roots.insert(tid.0, tid.0);
-        Execution { thread: tid, current: tid, debt: 0, finished: false }
+        Execution {
+            thread: tid,
+            current: tid,
+            debt: 0,
+            finished: false,
+        }
+    }
+
+    /// Instantiates a compiled chunk as a function value whose `_ENV` is
+    /// `env`: `None` means the globals table, while `Some(Value::Nil)` is a
+    /// real nil environment (as `load(chunk, name, mode, nil)` produces).
+    /// The result is a normal Lua function: callable, closure-capturing, and
+    /// GC-managed, which is what embedders need to populate
+    /// `package.preload` with compiled modules.
+    pub fn make_function(&mut self, chunk: &Chunk, env: Option<Value>) -> Value {
+        let env = env.unwrap_or(Value::Table(self.globals));
+        let up = self.new_upval(Upval::Closed(env));
+        let cid = self.alloc_closure(LuaClosure {
+            proto: chunk.proto.clone(),
+            upvals: vec![up],
+        });
+        Value::Closure(cid)
+    }
+
+    /// Builds a closure from an already-decoded `Proto` (binary chunks). The
+    /// first upvalue receives `env` (the globals table when absent) and any
+    /// further upvalues start closed over `nil`, matching PUC's `lua_load`.
+    pub(crate) fn make_function_from_proto(
+        &mut self,
+        proto: Rc<Proto>,
+        env: Option<Value>,
+    ) -> Value {
+        let first = env.unwrap_or(Value::Table(self.globals));
+        let mut upvals = Vec::with_capacity(proto.upvals.len());
+        for i in 0..proto.upvals.len() {
+            let v = if i == 0 { first } else { Value::Nil };
+            upvals.push(self.new_upval(Upval::Closed(v)));
+        }
+        let cid = self.alloc_closure(LuaClosure { proto, upvals });
+        Value::Closure(cid)
+    }
+
+    /// Installs the host reader behind `loadfile`, `dofile`, and
+    /// `package.searchpath`. `Ok(None)` means "not found"; `Err` is a hard
+    /// failure. Without a reader those functions report "cannot open" and
+    /// `require` resolves only `package.preload` and already-loaded modules:
+    /// the interpreter has no ambient filesystem access.
+    pub fn set_file_reader(
+        &mut self,
+        reader: impl FnMut(&str) -> Result<Option<Vec<u8>>, String> + 'static,
+    ) {
+        self.file_reader = Some(Box::new(reader));
+    }
+
+    /// Reads a module source through the installed reader; no reader means
+    /// "not found".
+    pub(crate) fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        match &mut self.file_reader {
+            Some(reader) => reader(path),
+            None => Ok(None),
+        }
     }
 
     /// Registers a native function as a global.
@@ -516,7 +1011,10 @@ impl Lua {
 
     pub(crate) fn add_native_kind(&mut self, name: &str, kind: NativeKind) -> Value {
         self.allocs_since_gc += 1;
-        let n = Native { name: name.into(), kind };
+        let n = Native {
+            name: name.into(),
+            kind,
+        };
         let id = match self.natives_free.pop() {
             Some(i) => {
                 self.natives[i as usize] = n;
@@ -541,7 +1039,7 @@ impl Lua {
 
     pub fn new_string(&mut self, s: &[u8]) -> Value {
         self.allocs_since_gc += 1;
-        Value::Str(self.strings.intern(s))
+        Value::Str(self.strings.new_string(s))
     }
 
     pub fn new_table(&mut self) -> Value {
@@ -559,6 +1057,63 @@ impl Lua {
             }
         };
         Value::Table(id)
+    }
+
+    /// Allocates a userdata slot. The payload/metatable are supplied by the
+    /// caller; GC liveness is tracked like any other arena object.
+    pub(crate) fn alloc_userdata(&mut self, u: Userdata) -> UserdataId {
+        self.allocs_since_gc += 1;
+        match self.userdata_free.pop() {
+            Some(i) => {
+                self.userdata[i as usize] = u;
+                self.userdata_live[i as usize] = true;
+                UserdataId(i)
+            }
+            None => {
+                self.userdata.push(u);
+                self.userdata_live.push(true);
+                UserdataId(self.userdata.len() as u32 - 1)
+            }
+        }
+    }
+
+    /// True when a capability host has been installed (`io`/`os` exist).
+    pub fn has_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Installs the embedder's capability host and registers `io`/`os`.
+    /// Without a host those globals are absent, so the core has no authority.
+    pub fn set_host(&mut self, host: impl Host + 'static) {
+        if self.host.is_some() {
+            self.clear_host();
+        }
+        self.host = Some(Box::new(host));
+        crate::stdlib::install_host_libs(self);
+    }
+
+    /// Removes the host and unsets `io`/`os` (globals and `package.loaded`).
+    pub fn clear_host(&mut self) {
+        self.host = None;
+        self.file_meta = None;
+        self.io_input = None;
+        self.io_output = None;
+        self.set_global("io", Value::Nil);
+        self.set_global("os", Value::Nil);
+        let loaded_key = self.new_string(b"loaded");
+        let pkg = self.get_global("package");
+        let loaded = self.table_get(pkg, loaded_key);
+        if let Value::Table(id) = loaded {
+            let k = self.new_string(b"io");
+            let _ = self.tables[id.0 as usize].set(k, Value::Nil);
+            let k = self.new_string(b"os");
+            let _ = self.tables[id.0 as usize].set(k, Value::Nil);
+        }
+    }
+
+    /// Takes (and clears) an `os.exit` request, if the script asked to exit.
+    pub fn take_exit_request(&mut self) -> Option<i64> {
+        self.exit_request.take()
     }
 
     pub(crate) fn alloc_closure(&mut self, c: LuaClosure) -> ClosId {
@@ -597,6 +1152,7 @@ impl Lua {
     pub(crate) fn create_coroutine(&mut self, f: Value) -> Value {
         let mut th = Thread::default();
         th.stack.push(f); // consumed on first resume
+        th.top = 1;
         th.status = CoStatus::Start;
         Value::Thread(self.alloc_thread(th))
     }
@@ -644,6 +1200,39 @@ impl Lua {
         }
     }
 
+    /// `luaL_tolstring`'s fallback path, used after `__tostring` has been
+    /// ruled out: a string `__name` field replaces the type tag, then the
+    /// default rendering (`name: 0x...`). Strings keep their raw rendering
+    /// (PUC only consults `__tostring` for them), and `display_value`'s
+    /// output is used when there is no `__name`.
+    pub(crate) fn tostring_default(&mut self, v: Value) -> String {
+        let custom = match v {
+            Value::Table(_)
+            | Value::Closure(_)
+            | Value::Native(_)
+            | Value::Thread(_)
+            | Value::Userdata(_) => match self.metamethod_pub(v, "__name") {
+                Value::Str(id) => Some(self.strings.get_str_lossy(id).into_owned()),
+                _ => None,
+            },
+            _ => None,
+        };
+        match custom {
+            Some(name) => {
+                let ptr = match v {
+                    Value::Table(t) => t.0,
+                    Value::Closure(c) => c.0,
+                    Value::Thread(t) => t.0,
+                    Value::Native(n) => n.0,
+                    Value::Userdata(u) => u.0,
+                    _ => unreachable!(),
+                };
+                format!("{name}: 0x{ptr:08x}")
+            }
+            None => self.display_value(v),
+        }
+    }
+
     /// Human-readable rendering of a value (like raw `tostring`, lossy for
     /// non-UTF-8 strings; does not invoke `__tostring`).
     pub fn display_value(&self, v: Value) -> String {
@@ -656,6 +1245,7 @@ impl Lua {
             Value::Closure(c) => format!("function: 0x{:08x}", c.0),
             Value::Native(n) => format!("function: builtin: {}", self.natives[n.0 as usize].name),
             Value::Thread(t) => format!("thread: 0x{:08x}", t.0),
+            Value::Userdata(u) => format!("userdata: 0x{:08x}", u.0),
         }
     }
 
@@ -665,8 +1255,582 @@ impl Lua {
         match v {
             Value::Table(t) => self.tables[t.0 as usize].metatable,
             Value::Str(_) => self.string_meta,
-            _ => None,
+            Value::Nil => self.type_metas[0],
+            Value::Bool(_) => self.type_metas[1],
+            Value::Int(_) | Value::Float(_) => self.type_metas[2],
+            Value::Closure(_) | Value::Native(_) => self.type_metas[3],
+            Value::Thread(_) => self.type_metas[4],
+            Value::Userdata(u) => self.userdata[u.0 as usize].metatable,
         }
+    }
+
+    /// Raw metatable assignment (no `__metatable` guard), used by
+    /// `debug.setmetatable`. Tables and strings have per-value storage; all
+    /// other types share a per-type metatable.
+    pub(crate) fn set_raw_metatable(&mut self, v: Value, mt: Option<TableId>) {
+        match v {
+            Value::Table(t) => self.tables[t.0 as usize].metatable = mt,
+            Value::Str(_) => self.string_meta = mt,
+            Value::Nil => self.type_metas[0] = mt,
+            Value::Bool(_) => self.type_metas[1] = mt,
+            Value::Int(_) | Value::Float(_) => self.type_metas[2] = mt,
+            Value::Closure(_) | Value::Native(_) => self.type_metas[3] = mt,
+            Value::Thread(_) => self.type_metas[4] = mt,
+            Value::Userdata(u) => self.userdata[u.0 as usize].metatable = mt,
+        }
+    }
+
+    // ---- debug library (intrinsics) ----
+
+    /// `debug.getinfo([thread,] f [, what])`.
+    fn debug_getinfo(
+        &mut self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        f: Option<Value>,
+        what: Value,
+        argno: usize,
+    ) -> Result<Value, String> {
+        const WHO: &str = "debug.getinfo";
+        let t = self.new_table();
+        let Value::Table(tid) = t else { unreachable!() };
+        match f {
+            Some(Value::Closure(cid)) => {
+                let what = self.debug_what(what, argno + 1, WHO)?;
+                let proto = self.closures[cid.0 as usize].proto.clone();
+                self.fill_lua_info(tid, &proto, Value::Closure(cid), -1, false, None, &what);
+            }
+            Some(Value::Native(_)) => {
+                let what = self.debug_what(what, argno + 1, WHO)?;
+                self.fill_native_info(tid, f.unwrap(), &what);
+            }
+            _ => {
+                // Non-function: the argument is a stack level. PUC coerces it
+                // (rejecting fractions) before validating `what`.
+                let level = self.debug_check_int(f, argno, WHO)?;
+                let what = self.debug_what(what, argno + 1, WHO)?;
+                if !self.fill_level_info(tid, th, target, level, &what)? {
+                    return Ok(Value::Nil);
+                }
+            }
+        }
+        Ok(t)
+    }
+
+    /// Parses `debug.getinfo`'s `what` option string, validating each letter.
+    fn debug_what(&self, what: Value, argno: usize, who: &str) -> Result<Vec<u8>, String> {
+        let bytes = match what {
+            // PUC 5.4's default option string; 'r' yields ftransfer/ntransfer.
+            Value::Nil => b"flnSrtu".to_vec(),
+            Value::Str(s) => self.strings.get(s).to_vec(),
+            other => {
+                return Err(format!(
+                    "bad argument #{argno} to '{who}' (string expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        for &c in &bytes {
+            if !matches!(c, b'S' | b'l' | b'u' | b't' | b'n' | b'f' | b'L' | b'r') {
+                return Err(format!("bad argument #{argno} to '{who}' (invalid option)"));
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// `luaL_checkinteger`-style coercion for the debug APIs, with PUC's
+    /// argument-numbered errors. `None` means the argument was absent (which
+    /// PUC distinguishes from an explicit `nil`).
+    fn debug_check_int(&self, v: Option<Value>, argno: usize, who: &str) -> Result<i64, String> {
+        let Some(v) = v else {
+            return Err(format!(
+                "bad argument #{argno} to '{who}' (number expected, got no value)"
+            ));
+        };
+        let n = match v {
+            Value::Int(i) => return Ok(i),
+            Value::Float(f) => Value::Float(f),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(n) => n,
+                None => {
+                    return Err(format!(
+                        "bad argument #{argno} to '{who}' (number expected, got string)"
+                    ));
+                }
+            },
+            other => {
+                return Err(format!(
+                    "bad argument #{argno} to '{who}' (number expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        match n {
+            Value::Int(i) => Ok(i),
+            Value::Float(f) => crate::value::float_to_exact_int(f).ok_or_else(|| {
+                format!("bad argument #{argno} to '{who}' (number has no integer representation)")
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    fn fill_level_info(
+        &mut self,
+        tid: TableId,
+        th: &Thread,
+        target: Option<ThreadId>,
+        level: i64,
+        what: &[u8],
+    ) -> Result<bool, String> {
+        let snap = self.debug_level_snapshot(th, target, level);
+        let Some(snap) = snap else {
+            return Ok(false);
+        };
+        match snap {
+            LevelFrame::Native => {
+                let func = self.debug_getinfo_fn();
+                self.fill_native_info(tid, func, what);
+            }
+            LevelFrame::C {
+                func,
+                name,
+                namewhat,
+            } => {
+                self.fill_c_info(tid, func, name, namewhat, what);
+            }
+            LevelFrame::Lua {
+                proto,
+                pc,
+                closure,
+                tailcall,
+                name,
+            } => {
+                let cur = proto.lines.get(pc.wrapping_sub(1)).copied().unwrap_or(0) as i64;
+                self.fill_lua_info(
+                    tid,
+                    &proto,
+                    Value::Closure(closure),
+                    cur,
+                    tailcall,
+                    name,
+                    what,
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Frame at `level` in `target` (or the running thread), or the C
+    /// function `getinfo` at current level 0. `None` when out of range.
+    fn debug_level_snapshot(
+        &self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        level: i64,
+    ) -> Option<LevelFrame> {
+        let current = target.is_none() || target == Some(self.current_thread);
+        if level < 0 {
+            return None;
+        }
+        let frames: &[Frame] = match target {
+            Some(t) if t != self.current_thread => {
+                self.threads.get(t.0 as usize).map(|x| &x.frames[..])
+            }
+            _ => Some(&th.frames[..]),
+        }?;
+        let level = level as usize;
+        let idx = if current {
+            if level == 0 {
+                return Some(LevelFrame::Native);
+            }
+            if level > frames.len() {
+                return None;
+            }
+            frames.len() - level
+        } else {
+            if level >= frames.len() {
+                return None;
+            }
+            frames.len() - 1 - level
+        };
+        let fr = frames.get(idx)?;
+        match fr {
+            Frame::C(cf) => Some(LevelFrame::C {
+                func: cf.func,
+                name: cf.name,
+                namewhat: cf.namewhat,
+            }),
+            Frame::Lua(lf) => {
+                let name = lf
+                    .call_meta
+                    .map(|(nw, nm)| (nw, Box::from(nm)))
+                    .or_else(|| {
+                        if idx > 0 {
+                            frames[idx - 1].lua().and_then(|caller| {
+                                caller
+                                    .proto
+                                    .call_names
+                                    .get(caller.pc.wrapping_sub(1))
+                                    .cloned()
+                                    .flatten()
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                Some(LevelFrame::Lua {
+                    proto: lf.proto.clone(),
+                    pc: lf.pc,
+                    closure: lf.closure,
+                    tailcall: lf.tailcall,
+                    name,
+                })
+            }
+        }
+    }
+
+    fn info_set(&mut self, tid: TableId, name: &str, v: Value) {
+        let k = self.new_string(name.as_bytes());
+        self.tables[tid.0 as usize].set(k, v).unwrap();
+    }
+
+    /// C-boundary frame info: the same shape as a native function, but with
+    /// the call-site name PUC reports (`name`/`namewhat`).
+    fn fill_c_info(&mut self, tid: TableId, func: Value, name: &str, namewhat: &str, what: &[u8]) {
+        self.fill_native_info(tid, func, what);
+        if what.contains(&b'n') {
+            // A synthetic frame for a returning/called native carries no
+            // call-site name; derive it from the native itself (PUC names
+            // such functions, e.g. "sethook"/"yield").
+            let name = if name.is_empty() {
+                match func {
+                    Value::Native(n) => self.natives[n.0 as usize].name.clone(),
+                    _ => String::new(),
+                }
+            } else {
+                name.to_string()
+            };
+            let nv = self.new_string(name.as_bytes());
+            self.info_set(tid, "name", nv);
+            let nw = self.new_string(namewhat.as_bytes());
+            self.info_set(tid, "namewhat", nw);
+        }
+    }
+
+    fn fill_native_info(&mut self, tid: TableId, func: Value, what: &[u8]) {
+        if what.contains(&b'S') {
+            let src = self.new_string(b"=[C]");
+            self.info_set(tid, "source", src);
+            let ss = self.new_string(b"[C]");
+            self.info_set(tid, "short_src", ss);
+            self.info_set(tid, "linedefined", Value::Int(-1));
+            self.info_set(tid, "lastlinedefined", Value::Int(-1));
+            let w = self.new_string(b"C");
+            self.info_set(tid, "what", w);
+        }
+        if what.contains(&b'l') {
+            self.info_set(tid, "currentline", Value::Int(-1));
+        }
+        if what.contains(&b'u') {
+            self.info_set(tid, "nups", Value::Int(0));
+            self.info_set(tid, "nparams", Value::Int(0));
+            self.info_set(tid, "isvararg", Value::Bool(true));
+        }
+        if what.contains(&b't') {
+            self.info_set(tid, "istailcall", Value::Bool(false));
+        }
+        if what.contains(&b'r') {
+            // No hook/transfer model: like a plain PUC call, both are zero.
+            self.info_set(tid, "ftransfer", Value::Int(0));
+            self.info_set(tid, "ntransfer", Value::Int(0));
+        }
+        if what.contains(&b'n') {
+            self.info_set(tid, "name", Value::Nil);
+            let nw = self.new_string(b"");
+            self.info_set(tid, "namewhat", nw);
+        }
+        if what.contains(&b'f') {
+            self.info_set(tid, "func", func);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_lua_info(
+        &mut self,
+        tid: TableId,
+        proto: &Proto,
+        func: Value,
+        currentline: i64,
+        istailcall: bool,
+        name: Option<(&'static str, Box<str>)>,
+        what: &[u8],
+    ) {
+        if what.contains(&b'S') {
+            let src = self.new_string(proto.source.as_bytes());
+            self.info_set(tid, "source", src);
+            let ss = self.new_string(short_source(&proto.source).as_bytes());
+            self.info_set(tid, "short_src", ss);
+            self.info_set(tid, "linedefined", Value::Int(proto.linedefined as i64));
+            self.info_set(
+                tid,
+                "lastlinedefined",
+                Value::Int(proto.lastlinedefined as i64),
+            );
+            let w = if proto.linedefined == 0 {
+                "main"
+            } else {
+                "Lua"
+            };
+            let wv = self.new_string(w.as_bytes());
+            self.info_set(tid, "what", wv);
+        }
+        if what.contains(&b'l') {
+            self.info_set(tid, "currentline", Value::Int(currentline));
+        }
+        if what.contains(&b'u') {
+            self.info_set(tid, "nups", Value::Int(proto.upvals.len() as i64));
+            self.info_set(tid, "nparams", Value::Int(proto.nparams as i64));
+            self.info_set(tid, "isvararg", Value::Bool(proto.is_vararg));
+        }
+        if what.contains(&b't') {
+            self.info_set(tid, "istailcall", Value::Bool(istailcall));
+        }
+        if what.contains(&b'r') {
+            // Transfers describe hook/call argument movement; slew has no
+            // hooks and never sets CIST_TRAN, so PUC reports zero here.
+            self.info_set(tid, "ftransfer", Value::Int(0));
+            self.info_set(tid, "ntransfer", Value::Int(0));
+        }
+        if what.contains(&b'n') {
+            let namev = match &name {
+                Some((_, nm)) => self.new_string(nm.as_bytes()),
+                None => Value::Nil,
+            };
+            self.info_set(tid, "name", namev);
+            let nw = self.new_string(name.map_or("", |(nw, _)| nw).as_bytes());
+            self.info_set(tid, "namewhat", nw);
+        }
+        if what.contains(&b'f') {
+            self.info_set(tid, "func", func);
+        }
+        if what.contains(&b'L') {
+            let t = self.new_table();
+            let Value::Table(at) = t else { unreachable!() };
+            for &line in &proto.lines {
+                self.tables[at.0 as usize]
+                    .set(Value::Int(line as i64), Value::Bool(true))
+                    .ok();
+            }
+            self.info_set(tid, "activelines", t);
+        }
+    }
+
+    fn debug_getinfo_fn(&mut self) -> Value {
+        let d = self.get_global("debug");
+        let k = self.new_string(b"getinfo");
+        self.table_get(d, k)
+    }
+
+    /// `debug.traceback([thread,] [message [, level]])`.
+    fn debug_traceback(
+        &mut self,
+        th: &Thread,
+        target: Option<ThreadId>,
+        message: Value,
+        level: Option<Value>,
+        argno: usize,
+    ) -> Result<Value, String> {
+        let (msg, has_msg) = match message {
+            Value::Nil => (String::new(), false),
+            Value::Str(s) => (self.strings.get_str_lossy(s).into_owned(), true),
+            // A non-string message is returned untouched; PUC skips level
+            // validation in that case.
+            other => return Ok(other),
+        };
+        let level = match level {
+            None | Some(Value::Nil) => {
+                if target.is_none() {
+                    1
+                } else {
+                    0
+                }
+            }
+            Some(v) => self.debug_check_int(Some(v), argno, "debug.traceback")?,
+        };
+        let current = target.is_none() || target == Some(self.current_thread);
+        let frames: &[Frame] = match target {
+            Some(t) if t != self.current_thread => match self.threads.get(t.0 as usize) {
+                Some(x) => &x.frames,
+                None => &[],
+            },
+            _ => &th.frames,
+        };
+        let mut out = String::new();
+        if has_msg {
+            out.push_str(&msg);
+            out.push('\n');
+        }
+        out.push_str("stack traceback:");
+        // Level 0 is the running frame of `target`; for the current thread it
+        // behaves like level 1. Synthetic C frames occupy their own level, as
+        // in PUC. A level past the stack shows no frames (PUC `luaL_traceback`).
+        let first = if current {
+            frames.len().checked_sub(level.max(1) as usize)
+        } else {
+            frames.len().checked_sub(1 + level.max(0) as usize)
+        };
+        let Some(first) = first else {
+            return Ok(self.new_string(out.as_bytes()));
+        };
+        for idx in (0..=first).rev() {
+            match &frames[idx] {
+                Frame::C(cf) => {
+                    out.push_str("\n\t[C]: in ");
+                    if cf.namewhat == "metamethod" {
+                        out.push_str(&format!("metamethod '{}'", cf.name));
+                    } else if cf.name.is_empty() {
+                        out.push('?');
+                    } else {
+                        out.push_str(&format!("function '{}'", cf.name));
+                    }
+                }
+                Frame::Lua(fr) => {
+                    let line = fr
+                        .proto
+                        .lines
+                        .get(fr.pc.wrapping_sub(1))
+                        .copied()
+                        .unwrap_or(0);
+                    let src = short_source(&fr.proto.source);
+                    out.push_str(&format!("\n\t{src}:{line}: in "));
+                    let name: Option<(&'static str, Box<str>)> = fr
+                        .call_meta
+                        .map(|(nw, nm)| (nw, Box::from(nm)))
+                        .or_else(|| {
+                            if idx > 0 {
+                                frames[idx - 1].lua().and_then(|caller| {
+                                    caller
+                                        .proto
+                                        .call_names
+                                        .get(caller.pc.wrapping_sub(1))
+                                        .cloned()
+                                        .flatten()
+                                })
+                            } else {
+                                None
+                            }
+                        });
+                    match name {
+                        Some(("metamethod", nm)) => {
+                            out.push_str(&format!("metamethod '{nm}'"));
+                        }
+                        Some((nw, nm)) => out.push_str(&format!("function '{nm}' ({nw})")),
+                        None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
+                        None => out.push_str(&format!("function <{src}:{}>", fr.proto.linedefined)),
+                    }
+                }
+            }
+        }
+        Ok(self.new_string(out.as_bytes()))
+    }
+
+    fn debug_getupvalue(&mut self, th: &Thread, cid: ClosId, n: i64) -> Option<(String, Value)> {
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return None;
+        }
+        let name = c
+            .proto
+            .upval_names
+            .get(n as usize - 1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(...)".to_string());
+        let uid = c.upvals[n as usize - 1];
+        let val = self.read_upval(self.current_thread, th, uid);
+        Some((name, val))
+    }
+
+    fn debug_setupvalue(
+        &mut self,
+        th: &mut Thread,
+        cid: ClosId,
+        n: i64,
+        v: Value,
+    ) -> Option<String> {
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return None;
+        }
+        let name = c
+            .proto
+            .upval_names
+            .get(n as usize - 1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(...)".to_string());
+        let uid = c.upvals[n as usize - 1];
+        let tid = self.current_thread;
+        self.write_upval(tid, th, uid, v);
+        Some(name)
+    }
+
+    fn debug_upvalueid(&self, cid: ClosId, n: i64) -> Value {
+        let c = &self.closures[cid.0 as usize];
+        if n < 1 || n as usize > c.upvals.len() {
+            return Value::Nil;
+        }
+        Value::Int(c.upvals[n as usize - 1].0 as i64)
+    }
+
+    /// PUC's `checkupval` for the upvalue APIs: the index has already been
+    /// coerced; a native (C) function is a valid function but has no
+    /// upvalues, so any index on it is "invalid upvalue index". `argf` and
+    /// `argnup` are 1-based argument positions for PUC's error wording.
+    fn debug_check_upval(
+        &self,
+        f: Value,
+        n: i64,
+        argf: usize,
+        argnup: usize,
+        who: &str,
+    ) -> Result<ClosId, String> {
+        let cid = match f {
+            Value::Closure(cid) => cid,
+            Value::Native(_) => {
+                return Err(format!(
+                    "bad argument #{argnup} to '{who}' (invalid upvalue index)"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "bad argument #{argf} to '{who}' (function expected, got {})",
+                    other.type_name()
+                ));
+            }
+        };
+        if n < 1 || n as usize > self.closures[cid.0 as usize].upvals.len() {
+            return Err(format!(
+                "bad argument #{argnup} to '{who}' (invalid upvalue index)"
+            ));
+        }
+        Ok(cid)
+    }
+
+    fn debug_upvaluejoin(
+        &mut self,
+        c1: ClosId,
+        n1: i64,
+        c2: ClosId,
+        n2: i64,
+    ) -> Result<(), String> {
+        if n1 < 1 || n1 as usize > self.closures[c1.0 as usize].upvals.len() {
+            return Err("bad argument #2 to 'debug.upvaluejoin' (invalid upvalue index)".into());
+        }
+        if n2 < 1 || n2 as usize > self.closures[c2.0 as usize].upvals.len() {
+            return Err("bad argument #4 to 'debug.upvaluejoin' (invalid upvalue index)".into());
+        }
+        let uid = self.closures[c2.0 as usize].upvals[n2 as usize - 1];
+        self.closures[c1.0 as usize].upvals[n1 as usize - 1] = uid;
+        Ok(())
     }
 
     /// Metatable field lookup by name (for natives like setmetatable).
@@ -682,9 +1846,19 @@ impl Lua {
 
     pub(crate) fn metamethod(&self, v: Value, mm: Mm) -> Value {
         match self.get_metatable(v) {
-            Some(mt) => {
-                self.tables[mt.0 as usize].get(Value::Str(self.mm_names[mm as usize]))
-            }
+            Some(mt) => self.tables[mt.0 as usize].get(Value::Str(self.mm_names[mm as usize])),
+            None => Value::Nil,
+        }
+    }
+
+    /// Metatable field lookup by name that never interns, so it is safe to
+    /// call while a collection is in progress (`__gc`, `__close`).
+    fn raw_metafield(&self, v: Value, name: &str) -> Value {
+        let Some(k) = self.strings.lookup(name.as_bytes()) else {
+            return Value::Nil;
+        };
+        match self.get_metatable(v) {
+            Some(mt) => self.tables[mt.0 as usize].get(Value::Str(k)),
             None => Value::Nil,
         }
     }
@@ -695,6 +1869,82 @@ impl Lua {
             return m;
         }
         self.metamethod(b, mm)
+    }
+
+    // ---- debug hooks (`debug.sethook`) ----
+
+    /// Whether any hook event should fire right now: a hook is set and no
+    /// hook frame is currently on the stack (PUC's `allowhook`).
+    fn hook_any(&self, th: &Thread) -> bool {
+        th.hook.is_some()
+            && !th
+                .frames
+                .iter()
+                .any(|f| matches!(f, Frame::Lua(lf) if lf.is_hook))
+    }
+
+    /// Whether a specific event class (call/return/line) is enabled.
+    fn hook_on(&self, th: &Thread, bit: u8) -> bool {
+        self.hook_any(th) && th.hook_mask & bit != 0
+    }
+
+    /// Calls the current hook as an ordinary function, so it runs through the
+    /// regular (suspendable) machinery and can itself call `pcall` etc. An
+    /// optional synthetic C frame below it makes `debug.getinfo(2)` name a
+    /// native that is returning or being called (PUC keeps the C CallInfo).
+    fn fire_hook(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        event: &str,
+        line: i64,
+        synth: Option<Value>,
+    ) -> Result<(), VmError> {
+        let Some(hook) = th.hook else {
+            return Ok(());
+        };
+        if let Some(func) = synth {
+            let base = th.frames.last().map(|_| scratch_base(th)).unwrap_or(th.top);
+            th.frames.push(Frame::C(CFrame {
+                func,
+                name: "",
+                namewhat: "",
+                base,
+                pending: Vec::new(),
+                boundary: None,
+            }));
+        }
+        let ev = self.new_string(event.as_bytes());
+        let ln = if line < 0 {
+            Value::Nil
+        } else {
+            Value::Int(line)
+        };
+        let before = th.frames.len();
+        let scratch = scratch_base(th);
+        // Installing the hook frame must not itself trigger a call hook.
+        self.hook_suppress += 1;
+        let r = self.call_value(th, hook, &[ev, ln], scratch, 1, RetShape::Normal, fuel);
+        self.hook_suppress -= 1;
+        r?;
+        if th.frames.len() > before
+            && let Some(Frame::Lua(lf)) = th.frames.last_mut()
+        {
+            lf.is_hook = true;
+        }
+        Ok(())
+    }
+
+    /// Completes a deferred `coroutine.yield`: marks the thread suspended,
+    /// delivers its values to the resumer, and schedules the switch.
+    fn perform_yield(&mut self, th: &mut Thread, job: YieldJob) {
+        th.status = CoStatus::Suspended;
+        th.yield_ret = Some((job.ret_to, job.nres, job.shape));
+        let parent = job.parent;
+        let parent_th = &mut self.threads[parent.0 as usize];
+        parent_th.status = CoStatus::Running;
+        deliver_resume(parent_th, job.rr, true, &job.args);
+        self.switch_to = Some(parent);
     }
 
     // ---- dispatch ----
@@ -734,48 +1984,75 @@ impl Lua {
                         }
                     }
                 }
-                Err(mut e) => loop {
-                    // error escaped this thread entirely; close its open
-                    // upvalues (closures may outlive the thread) and kill it
-                    self.close_upvals(&mut th, 0);
-                    th.frames.clear();
-                    th.status = CoStatus::Dead;
-                    let parent = th.parent.take();
-                    let rr = th.resume_ret.take();
-                    th.stack.clear();
-                    self.threads[cur.0 as usize] = th;
-                    match parent {
-                        None => return Err(self.materialize_error(e)),
-                        Some(p) => {
-                            cur = p;
-                            self.current_thread = cur;
-                            th = std::mem::take(&mut self.threads[cur.0 as usize]);
-                            th.status = CoStatus::Running;
-                            let rr = rr.unwrap();
-                            if rr.wrap {
-                                // wrap propagates the error into the resumer
-                                match self.recover(&mut th, e) {
-                                    Ok(()) => break,
-                                    Err(e2) => {
-                                        e = e2;
-                                        continue;
+                Err(mut e) => {
+                    let mut root_line = None;
+                    loop {
+                        // capture the root script's own position before the
+                        // frames are cleared below (on coroutine propagation
+                        // this is the resume call site; for root-origin
+                        // errors the frames are already gone and the
+                        // dispatcher's `root_line` stands)
+                        if root_line.is_none() && th.parent.is_none() {
+                            root_line = Some(
+                                th.frames
+                                    .first()
+                                    .and_then(|f| f.lua())
+                                    .map(frame_line)
+                                    .unwrap_or(e.root_line),
+                            );
+                        }
+                        // error escaped this thread entirely; close its open
+                        // upvalues (closures may outlive the thread) and kill it
+                        self.close_upvals(&mut th, 0);
+                        th.frames.clear();
+                        th.status = CoStatus::Dead;
+                        let parent = th.parent.take();
+                        let rr = th.resume_ret.take();
+                        th.stack.clear();
+                        let death_err = self.err_value(&e);
+                        self.threads[cur.0 as usize] = th;
+                        self.threads[cur.0 as usize].close_error = Some(death_err);
+                        match parent {
+                            None => {
+                                let root_line = root_line.unwrap_or(e.line);
+                                return Err(self.materialize_error(e, root_line));
+                            }
+                            Some(p) => {
+                                cur = p;
+                                self.current_thread = cur;
+                                th = std::mem::take(&mut self.threads[cur.0 as usize]);
+                                th.status = CoStatus::Running;
+                                let rr = rr.unwrap();
+                                if rr.wrap {
+                                    // wrap propagates the error into the resumer
+                                    match self.recover(&mut th, fuel, e) {
+                                        Ok(()) => break,
+                                        Err(e2) => {
+                                            e = e2;
+                                            continue;
+                                        }
                                     }
+                                } else {
+                                    let errv = self.err_value(&e);
+                                    deliver_resume(&mut th, rr, false, &[errv]);
+                                    break;
                                 }
-                            } else {
-                                let errv = self.err_value(&e);
-                                deliver_resume(&mut th, rr, false, &[errv]);
-                                break;
                             }
                         }
                     }
-                },
+                }
             }
         }
     }
 
-    fn materialize_error(&mut self, e: VmError) -> RuntimeError {
+    fn materialize_error(&mut self, e: VmError, root_line: u32) -> RuntimeError {
         let value = self.err_value(&e);
-        RuntimeError { message: self.display_value(value), value, line: e.line }
+        RuntimeError {
+            message: self.display_value(value),
+            value,
+            line: e.line,
+            root_line,
+        }
     }
 
     fn err_value(&mut self, e: &VmError) -> Value {
@@ -801,10 +2078,26 @@ impl Lua {
             if *fuel <= 0 {
                 return Ok(DispatchEnd::Pending);
             }
+            self.service_finalizers(tid, th, fuel)?;
+            if *fuel <= 0 {
+                return Ok(DispatchEnd::Pending);
+            }
             match self.exec_one(tid, th, fuel) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Finished(vals)) => return Ok(DispatchEnd::Finished(vals)),
-                Err(e) => self.recover(th, e)?,
+                Err(mut e) => {
+                    // capture the script's own call site before `recover`
+                    // pops the frames it unwinds
+                    if e.root_line == 0 {
+                        e.root_line = th
+                            .frames
+                            .first()
+                            .and_then(|f| f.lua())
+                            .map(frame_line)
+                            .unwrap_or(0);
+                    }
+                    self.recover(th, fuel, e)?;
+                }
             }
             if let Some(next) = self.switch_to.take() {
                 return Ok(DispatchEnd::Switch(next));
@@ -812,47 +2105,183 @@ impl Lua {
         }
     }
 
-    /// Unwinds to the nearest protected frame; re-raises if none exists.
-    /// Recovery is staged as pendings on the frame below the protection
-    /// boundary: first any `__close` handlers of unwound to-be-closed
-    /// variables (with the error object), then error delivery (directly or
-    /// via the xpcall handler).
-    fn recover(&mut self, th: &mut Thread, e: VmError) -> Result<(), VmError> {
+    /// Handles an error: runs the nearest message handler at the error point
+    /// when it can (so the handler sees the erroring frames, as PUC's
+    /// `luaG_errormsg` does), otherwise unwinds to the nearest protected frame.
+    fn recover(&mut self, th: &mut Thread, fuel: &mut i64, e: VmError) -> Result<(), VmError> {
+        // A frame that already carries a staged `DeliverError` is a recovery
+        // chain in progress: the error just raised came from a `__close`
+        // handler while unwinding. PUC's `luaD_closeprotected` keeps closing
+        // instead of unwinding past the chain, passing the newest error object
+        // to the remaining handlers and the final delivery. Fold it in.
+        let staged = th.frames.last().is_some_and(|f| {
+            f.pending()
+                .iter()
+                .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
+        });
+        if staged {
+            self.fold_staged(th, &e, Vec::new());
+            return Ok(());
+        }
+        // An error raised *by* a message handler: PUC reports
+        // "error in error handling" at the boundary that owns it.
+        if self.handler_unwind.take().is_some() {
+            let msg = self.new_string(b"error in error handling");
+            let e2 = VmError {
+                val: ErrVal::Val(msg),
+                line: 0,
+                root_line: 0,
+                source: None,
+            };
+            return self.unwind(th, e2, true);
+        }
+        // Run the message handler now, before unwinding, when the error came
+        // from a directly-invoked `__close` metamethod and no `__close`
+        // handlers remain: PUC calls the handler at the error site, so
+        // `debug.traceback` shows the close frame as `metamethod 'close'`.
+        if let Some(idx) = th.frames.iter().rposition(|f| f.is_protected()) {
+            let (handler, guard) = frame_boundary(&th.frames[idx]);
+            if let Some(h) = handler
+                && !guard
+                && !th.frames[idx..].iter().any(frame_has_tbc)
+                && th.frames[idx..].iter().any(frame_close_meta)
+            {
+                let errv = self.err_value(&e);
+                let result_slot = scratch_base(th);
+                ensure_len(&mut th.stack, result_slot + 1);
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::UnwindAfterHandler { result_slot });
+                self.handler_unwind = Some(HandlerUnwind);
+                *fuel -= 2;
+                return self.call_value(th, h, &[errv], result_slot, 2, RetShape::Normal, fuel);
+            }
+        }
+        self.unwind(th, e, false)
+    }
+
+    /// Folds a `__close`-during-unwind error into an already staged recovery
+    /// chain, refreshing the error object and prepending the newly unwound
+    /// to-be-closed values.
+    fn fold_staged(&mut self, th: &mut Thread, e: &VmError, to_close: Vec<Value>) {
+        let new_err = self.err_value(e);
+        let f = th.frames.last_mut().unwrap();
+        for p in f.pending_mut().iter_mut() {
+            match p {
+                Pending::CallClose { err, .. }
+                | Pending::DeliverError { err, .. }
+                | Pending::Reraise { err } => {
+                    *err = new_err;
+                }
+                _ => {}
+            }
+        }
+        for v in to_close.into_iter().rev() {
+            f.pending_mut().push(Pending::CallClose { v, err: new_err });
+        }
+    }
+
+    /// Unwinds to the nearest protected frame, staging `__close` handlers and
+    /// error delivery on the frame below. With `skip_handler` the error is
+    /// delivered directly (`false, err`) instead of via the boundary handler.
+    fn unwind(&mut self, th: &mut Thread, e: VmError, skip_handler: bool) -> Result<(), VmError> {
         // values of to-be-closed variables in unwound frames, innermost first
         let mut to_close: Vec<Value> = Vec::new();
         loop {
+            // A frame carrying a staged `DeliverError` is a recovery chain in
+            // progress: the error came from a `__close` handler while
+            // unwinding. Fold it into the chain and keep closing.
+            let staged = th.frames.last().is_some_and(|f| {
+                f.pending()
+                    .iter()
+                    .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
+            });
+            if staged {
+                self.fold_staged(th, &e, to_close);
+                return Ok(());
+            }
             match th.frames.last() {
-                None => return Err(e),
-                Some(f) if f.protected => break,
+                None => {
+                    if to_close.is_empty() {
+                        return Err(e);
+                    }
+                    // The error escaped every frame: PUC still runs the
+                    // to-be-closed handlers before the thread dies. There is no
+                    // frame below to stage them on, so synthesize one, run the
+                    // closes, then re-raise the error.
+                    let errv = self.err_value(&e);
+                    th.frames.push(Frame::C(CFrame {
+                        func: Value::Nil,
+                        name: "",
+                        namewhat: "",
+                        base: th.top,
+                        pending: Vec::new(),
+                        boundary: None,
+                    }));
+                    let f = th.frames.last_mut().unwrap();
+                    f.pending_mut().push(Pending::Reraise { err: errv });
+                    for v in to_close.into_iter().rev() {
+                        f.pending_mut().push(Pending::CallClose { v, err: errv });
+                    }
+                    return Ok(());
+                }
+                Some(f) if f.is_protected() => break,
                 Some(_) => {
                     let f = th.frames.pop().unwrap();
-                    for &r in f.tbc.iter().rev() {
-                        to_close.push(th.stack[f.base + r as usize]);
+                    if let Frame::Lua(lf) = &f {
+                        for &r in lf.tbc.iter().rev() {
+                            to_close.push(th.stack[lf.base + r as usize]);
+                        }
+                        self.close_upvals(th, lf.base);
                     }
-                    self.close_upvals(th, f.base);
                 }
             }
         }
         let pf = th.frames.pop().unwrap();
-        for &r in pf.tbc.iter().rev() {
-            to_close.push(th.stack[pf.base + r as usize]);
-        }
-        self.close_upvals(th, pf.base);
+        let (pf_ret_to, pf_nres, pf_handler, pf_guard) = match &pf {
+            Frame::Lua(f) => {
+                for &r in f.tbc.iter().rev() {
+                    to_close.push(th.stack[f.base + r as usize]);
+                }
+                self.close_upvals(th, f.base);
+                (f.ret_to, f.nres, f.handler, f.handler_guard)
+            }
+            Frame::C(c) => {
+                let b = c
+                    .boundary
+                    .as_ref()
+                    .expect("protected C frame carries a boundary");
+                (b.ret_to, b.nres, b.handler, false)
+            }
+        };
         let errv = self.err_value(&e);
         let Some(below) = th.frames.last_mut() else {
             // a protected root frame shouldn't exist (pcall always pushes
             // below an existing frame), but fail safe
             return Err(e);
         };
-        below.pending.push(Pending::DeliverError {
-            ret_to: pf.ret_to,
-            nres: pf.nres,
-            err: errv,
-            handler: pf.handler,
-        });
+        if pf_guard {
+            // The error came from a message handler: PUC reports
+            // "error in error handling" rather than running another handler.
+            below.pending_mut().push(Pending::DeliverErrErr {
+                ret_to: pf_ret_to,
+                nres: pf_nres,
+            });
+        } else {
+            below.pending_mut().push(Pending::DeliverError {
+                ret_to: pf_ret_to,
+                nres: pf_nres,
+                err: errv,
+                handler: if skip_handler { None } else { pf_handler },
+            });
+        }
         // outermost closes are pushed first so the innermost pops first
         for v in to_close.into_iter().rev() {
-            below.pending.push(Pending::CallClose { v, err: errv });
+            below
+                .pending_mut()
+                .push(Pending::CallClose { v, err: errv });
         }
         Ok(())
     }
@@ -864,10 +2293,29 @@ impl Lua {
         fuel: &mut i64,
     ) -> Result<Flow, VmError> {
         *fuel -= 1;
+        // A synthetic C frame whose continuations have all run is finished:
+        // pop it so the Lua frame below (owner of the protected call's result
+        // slots) resumes. C frames are only ever the innermost frame while
+        // they carry continuations.
+        while th.frames.last().is_some_and(|f| f.is_c())
+            && th.frames.last().unwrap().pending().is_empty()
+        {
+            th.frames.pop();
+        }
+        // A coroutine whose body was a protected call (`coroutine.create(pcall)`)
+        // has no Lua frame below its synthetic boundary: the delivered results
+        // at slot 0 are the coroutine's return values.
+        if th.frames.is_empty() {
+            let top = th.top.min(th.stack.len());
+            let vals = th.stack[..top].to_vec();
+            th.stack.clear();
+            th.top = 0;
+            return Ok(Flow::Finished(vals));
+        }
         // run continuations (e.g. a concat interrupted by a metamethod call,
         // staged __close handlers) before fetching the next instruction
-        if !th.frames.last().unwrap().pending.is_empty() {
-            let p = th.frames.last_mut().unwrap().pending.pop().unwrap();
+        if !th.frames.last().unwrap().pending().is_empty() {
+            let p = th.frames.last_mut().unwrap().pending_mut().pop().unwrap();
             match p {
                 Pending::Concat { dst, base, n } => self.concat_run(th, fuel, dst, base, n)?,
                 Pending::CloseTbc { from, err } => self.run_close_tbc(th, fuel, from, err)?,
@@ -878,16 +2326,61 @@ impl Lua {
                         self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel)?;
                     }
                 }
-                Pending::DeliverError { ret_to, nres, err, handler } => match handler {
+                Pending::DeliverError {
+                    ret_to,
+                    nres,
+                    err,
+                    handler,
+                } => match handler {
                     None => {
                         place_results(th, ret_to, nres, &[Value::Bool(false), err]);
                     }
                     Some(h) => {
-                        self.call_value(th, h, &[err], ret_to, nres, RetShape::PrependFalse, fuel)?;
+                        // Run the message handler under its own protection so
+                        // that an error *inside* it (e.g. a stack overflow
+                        // while it recurses) reports PUC's "error in error
+                        // handling" instead of escaping the xpcall.
+                        let before = th.frames.len();
+                        let wb = scratch_base(th);
+                        ensure_len(&mut th.stack, wb + 2);
+                        th.stack[wb] = h;
+                        th.stack[wb + 1] = err;
+                        let r = self.do_call(
+                            th,
+                            fuel,
+                            CallSpec {
+                                func_abs: wb,
+                                argc: 1,
+                                ret_to,
+                                nres,
+                                shape: RetShape::PrependFalse,
+                                protected: true,
+                                handler: None,
+                                native_caller: true,
+                            },
+                        );
+                        match r {
+                            Ok(()) => {
+                                if th.frames.len() > before
+                                    && let Some(Frame::Lua(lf)) = th.frames.last_mut()
+                                {
+                                    lf.handler_guard = true;
+                                }
+                            }
+                            Err(_) => {
+                                let msg = self.new_string(b"error in error handling");
+                                place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
+                            }
+                        }
                     }
                 },
+                Pending::DeliverErrErr { ret_to, nres } => {
+                    let msg = self.new_string(b"error in error handling");
+                    place_results(th, ret_to, nres, &[Value::Bool(false), msg]);
+                }
                 Pending::FinishReturn { start, count } => {
                     let frame = th.frames.pop().unwrap();
+                    let frame = frame.as_lua();
                     self.close_upvals(th, frame.base);
                     if th.frames.is_empty() {
                         let vals = th.stack[start..start + count].to_vec();
@@ -895,13 +2388,152 @@ impl Lua {
                         th.top = 0;
                         return Ok(Flow::Finished(vals));
                     }
-                    deliver_return(th, &frame, start, count);
+                    deliver_return(th, frame, start, count);
+                }
+                Pending::TailReturn { start } => {
+                    let count = th.top.saturating_sub(start);
+                    let frame = th.frames.pop().unwrap();
+                    let frame = frame.as_lua();
+                    self.close_upvals(th, frame.base);
+                    if th.frames.is_empty() {
+                        let vals = th.stack[start..start + count].to_vec();
+                        th.stack.clear();
+                        th.top = 0;
+                        return Ok(Flow::Finished(vals));
+                    }
+                    deliver_return(th, frame, start, count);
+                }
+                Pending::CloseStep => self.close_step(th, fuel)?,
+                Pending::PrintStep => self.print_step(th, fuel)?,
+                Pending::FinishTostring {
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot,
+                } => {
+                    let v = th.stack[result_slot];
+                    let sv = match v {
+                        Value::Str(_) => v,
+                        Value::Int(_) | Value::Float(_) => {
+                            let s = crate::value::fmt_number(v);
+                            self.new_string(s.as_bytes())
+                        }
+                        _ => {
+                            return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                        }
+                    };
+                    place_shaped(th, ret_to, nres, shape, &[sv]);
+                }
+                Pending::FormatStep => self.format_step(th, fuel)?,
+                Pending::PrependShape {
+                    ret_to,
+                    nres,
+                    shape,
+                } => {
+                    let count = if nres == 0 {
+                        th.top.saturating_sub(ret_to)
+                    } else {
+                        (nres - 1) as usize
+                    };
+                    let vals: Vec<Value> = th.stack[ret_to..ret_to + count].to_vec();
+                    place_shaped(th, ret_to, nres, shape, &vals);
+                }
+                Pending::ReturnHookFire => {
+                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                        self.fire_hook(th, fuel, "return", -1, None)?;
+                    }
+                }
+                Pending::Reraise { err } => {
+                    return Err(VmError {
+                        val: ErrVal::Val(err),
+                        line: 0,
+                        root_line: 0,
+                        source: None,
+                    });
+                }
+                Pending::YieldStep => {
+                    let mut job = th.yield_job.take().expect("yield job staged");
+                    let yield_fn = job.func;
+                    match job.stage {
+                        0 => {
+                            job.stage = 1;
+                            th.yield_job = Some(job);
+                            // re-arm below the hook frame so the next stage (or
+                            // the yield itself) runs once the hook returns
+                            th.frames
+                                .last_mut()
+                                .unwrap()
+                                .pending_mut()
+                                .push(Pending::YieldStep);
+                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                                self.fire_hook(th, fuel, "call", -1, Some(yield_fn))?;
+                            }
+                        }
+                        1 => {
+                            job.stage = 2;
+                            th.yield_job = Some(job);
+                            th.frames
+                                .last_mut()
+                                .unwrap()
+                                .pending_mut()
+                                .push(Pending::YieldStep);
+                            if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                                self.fire_hook(th, fuel, "return", -1, Some(yield_fn))?;
+                            }
+                        }
+                        _ => self.perform_yield(th, job),
+                    }
+                }
+                Pending::UnwindAfterHandler { result_slot } => {
+                    if self.handler_unwind.take().is_some() {
+                        let v = th.stack[result_slot];
+                        let e = VmError {
+                            val: ErrVal::Val(v),
+                            line: 0,
+                            root_line: 0,
+                            source: None,
+                        };
+                        self.unwind(th, e, true)?;
+                    }
                 }
             }
             return Ok(Flow::Continue);
         }
+        // Debug hooks that fire before the next instruction: the call hook an
+        // asynchronously-started coroutine body still owes, then count and
+        // line events. Each runs the hook as a frame, so this returns; the
+        // instruction is only fetched on the following dispatch.
+        if th.pending_call_hook {
+            th.pending_call_hook = false;
+            if self.hook_on(th, HOOK_CALL) {
+                self.fire_hook(th, fuel, "call", -1, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
+        if th.hook_count > 0 && self.hook_any(th) {
+            th.hook_counter -= 1;
+            if th.hook_counter <= 0 {
+                th.hook_counter = th.hook_count;
+                let line = line_of(th) as i64;
+                self.fire_hook(th, fuel, "count", line, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
+        if self.hook_on(th, HOOK_LINE) {
+            let line = line_of(th) as i64;
+            // Line 0 means "no line info" (e.g. a synthetic prologue
+            // instruction); PUC only reports real source lines.
+            if line > 0
+                && let Frame::Lua(lf) = th.frames.last_mut().unwrap()
+                && lf.last_line != line
+            {
+                lf.last_line = line;
+                self.fire_hook(th, fuel, "line", line, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
         let (instr, base) = {
-            let f = th.frames.last_mut().unwrap();
+            let f = th.frames.last_mut().unwrap().as_lua_mut();
             let i = f.proto.code[f.pc];
             f.pc += 1;
             (i, f.base)
@@ -961,13 +2593,22 @@ impl Lua {
                 th.stack[base + dst as usize] = self.new_table();
                 self.maybe_gc(tid, th)?;
             }
-            Instr::SetList { obj, base: b, n, start } => {
+            Instr::SetList {
+                obj,
+                base: b,
+                n,
+                start,
+            } => {
                 let t = match th.stack[base + obj as usize] {
                     Value::Table(t) => t,
                     _ => unreachable!("SetList on non-table"),
                 };
                 let first = base + b as usize;
-                let count = if n == 0 { th.top.saturating_sub(first) } else { n as usize };
+                let count = if n == 0 {
+                    th.top.saturating_sub(first)
+                } else {
+                    n as usize
+                };
                 *fuel -= count as i64;
                 for i in 0..count {
                     let v = th.stack[first + i];
@@ -984,6 +2625,41 @@ impl Lua {
                     Err(msg) => {
                         let mm = self.binary_mm(a, b, mm_of_arith(op));
                         if mm == Value::Nil {
+                            let msg = if msg == "number has no integer representation"
+                                && matches!(
+                                    op,
+                                    ArithOp::BAnd
+                                        | ArithOp::BOr
+                                        | ArithOp::BXor
+                                        | ArithOp::Shl
+                                        | ArithOp::Shr
+                                ) {
+                                // PUC-style varinfo: name the offending operand
+                                // when it was loaded from a constant field.
+                                let reg = if matches!(a, Value::Float(_)) {
+                                    Some(lhs)
+                                } else if matches!(b, Value::Float(_)) {
+                                    Some(rhs)
+                                } else {
+                                    None
+                                };
+                                let f = th.frames.last().unwrap().as_lua();
+                                match reg.and_then(|r| {
+                                    name_for_register(
+                                        &self.strings,
+                                        &f.proto,
+                                        f.pc.wrapping_sub(1),
+                                        r,
+                                    )
+                                }) {
+                                    Some(v) => {
+                                        format!("number ({v}) has no integer representation")
+                                    }
+                                    None => msg,
+                                }
+                            } else {
+                                msg
+                            };
                             return Err(self.rt_err(th, msg));
                         }
                         self.call_value(
@@ -1019,7 +2695,11 @@ impl Lua {
                     jump(th, off);
                 }
             }
-            Instr::Call { base: b, nargs, nres } => {
+            Instr::Call {
+                base: b,
+                nargs,
+                nres,
+            } => {
                 let func_abs = base + b as usize;
                 let argc = if nargs == 0 {
                     th.top.saturating_sub(func_abs + 1)
@@ -1041,34 +2721,94 @@ impl Lua {
                     },
                 )?;
             }
+            Instr::TailCall { base: b, nargs } => {
+                let fb = th.frames.last().unwrap().as_lua().base;
+                let func_abs = fb + b as usize;
+                let argc = if nargs == 0 {
+                    th.top.saturating_sub(func_abs + 1)
+                } else {
+                    (nargs - 1) as usize
+                };
+                let (callee, func_abs, argc) = self.resolve_callable(th, func_abs, argc)?;
+                match callee {
+                    Value::Closure(cid) => {
+                        self.tail_replace_frame(th, cid, func_abs, argc)?;
+                    }
+                    Value::Native(nid) => {
+                        // Natives do not own a Lua frame, so there is nothing
+                        // to reuse: run the call with an open result window,
+                        // then finish the frame's return via a continuation
+                        // (the callee may itself push frames, e.g. pcall).
+                        let ret_slot = fb + b as usize;
+                        th.frames
+                            .last_mut()
+                            .unwrap()
+                            .pending_mut()
+                            .push(Pending::TailReturn { start: ret_slot });
+                        self.call_native(
+                            th,
+                            fuel,
+                            nid,
+                            func_abs,
+                            argc,
+                            ret_slot,
+                            0,
+                            RetShape::Normal,
+                            false,
+                        )?;
+                    }
+                    _ => unreachable!("resolve_callable returns a callable"),
+                }
+            }
             Instr::Return { base: b, n } => {
-                if !th.frames.last().unwrap().tbc.is_empty() {
+                if !th.frames.last().unwrap().as_lua().tbc.is_empty() {
                     // run __close handlers before completing the return;
                     // snapshot the value window now (closes may clobber top)
-                    let fb = th.frames.last().unwrap().base;
+                    let fb = th.frames.last().unwrap().as_lua().base;
                     let start = fb + b as usize;
-                    let count =
-                        if n == 0 { th.top.saturating_sub(start) } else { (n - 1) as usize };
-                    let f = th.frames.last_mut().unwrap();
+                    let count = if n == 0 {
+                        th.top.saturating_sub(start)
+                    } else {
+                        (n - 1) as usize
+                    };
+                    let f = th.frames.last_mut().unwrap().as_lua_mut();
                     f.pending.push(Pending::FinishReturn { start, count });
-                    f.pending.push(Pending::CloseTbc { from: 0, err: Value::Nil });
+                    // Fire the return hook after every __close handler has run
+                    // (PUC's order): the hook may even be *set* by one of them.
+                    f.pending.push(Pending::ReturnHookFire);
+                    f.pending.push(Pending::CloseTbc {
+                        from: 0,
+                        err: Value::Nil,
+                    });
+                    return Ok(Flow::Continue);
+                }
+                let frame_base = th.frames.last().unwrap().as_lua().base;
+                let start = frame_base + b as usize;
+                let count = if n == 0 {
+                    th.top.saturating_sub(start)
+                } else {
+                    (n - 1) as usize
+                };
+                if self.hook_on(th, HOOK_RETURN) {
+                    let f = th.frames.last_mut().unwrap().as_lua_mut();
+                    f.pending.push(Pending::FinishReturn { start, count });
+                    self.fire_hook(th, fuel, "return", -1, None)?;
                     return Ok(Flow::Continue);
                 }
                 let frame = th.frames.pop().unwrap();
+                let frame = frame.as_lua();
                 self.close_upvals(th, frame.base);
-                let start = frame.base + b as usize;
-                let count =
-                    if n == 0 { th.top.saturating_sub(start) } else { (n - 1) as usize };
                 if th.frames.is_empty() {
                     let vals = th.stack[start..start + count].to_vec();
                     th.stack.clear();
                     th.top = 0;
                     return Ok(Flow::Finished(vals));
                 }
-                deliver_return(th, &frame, start, count);
+                deliver_return(th, frame, start, count);
             }
             Instr::Vararg { dst, n } => {
-                let varargs = std::mem::take(&mut th.frames.last_mut().unwrap().varargs);
+                let varargs =
+                    std::mem::take(&mut th.frames.last_mut().unwrap().as_lua_mut().varargs);
                 let first = base + dst as usize;
                 if n == 0 {
                     ensure_len(&mut th.stack, first + varargs.len());
@@ -1081,11 +2821,11 @@ impl Lua {
                         th.stack[first + i] = varargs.get(i).copied().unwrap_or(Value::Nil);
                     }
                 }
-                th.frames.last_mut().unwrap().varargs = varargs;
+                th.frames.last_mut().unwrap().as_lua_mut().varargs = varargs;
             }
             Instr::Closure { dst, p } => {
                 *fuel -= 2;
-                let proto = th.frames.last().unwrap().proto.protos[p as usize].clone();
+                let proto = th.frames.last().unwrap().as_lua().proto.protos[p as usize].clone();
                 let mut ups = Vec::with_capacity(proto.upvals.len());
                 for d in &proto.upvals {
                     match *d {
@@ -1094,7 +2834,7 @@ impl Lua {
                             ups.push(self.find_or_create_open(tid, th, abs));
                         }
                         UpvalDesc::Upval(i) => {
-                            let cur = th.frames.last().unwrap().closure;
+                            let cur = th.frames.last().unwrap().as_lua().closure;
                             ups.push(self.closures[cur.0 as usize].upvals[i as usize]);
                         }
                     }
@@ -1107,21 +2847,21 @@ impl Lua {
                 self.close_upvals(th, base + from as usize);
                 self.run_close_tbc(th, fuel, from, Value::Nil)?;
             }
-            Instr::Tbc { reg } => {
+            Instr::Tbc { reg, name } => {
                 let v = th.stack[base + reg as usize];
                 match v {
                     Value::Nil | Value::Bool(false) => {}
                     _ if self.metamethod(v, Mm::Close) != Value::Nil => {
-                        th.frames.last_mut().unwrap().tbc.push(reg);
+                        th.frames.last_mut().unwrap().as_lua_mut().tbc.push(reg);
                     }
                     _ => {
-                        return Err(self.rt_err(
-                            th,
-                            format!(
-                                "variable of a <close> declaration got a non-closable {} value",
-                                v.type_name()
-                            ),
-                        ))
+                        let vname = match kval(th, name) {
+                            Value::Str(id) => self.strings.get_str_lossy(id).into_owned(),
+                            _ => "?".to_string(),
+                        };
+                        return Err(
+                            self.rt_err(th, format!("variable '{vname}' got a non-closable value"))
+                        );
                     }
                 }
             }
@@ -1153,7 +2893,7 @@ impl Lua {
             }
             Instr::TForLoop { base: b, off } => {
                 let a = base + b as usize;
-                let v = th.stack[a + 3];
+                let v = th.stack[a + 4];
                 if v != Value::Nil {
                     th.stack[a + 2] = v;
                     jump(th, off);
@@ -1199,8 +2939,16 @@ impl Lua {
 
     fn do_call(&mut self, th: &mut Thread, fuel: &mut i64, spec: CallSpec) -> Result<(), VmError> {
         *fuel -= 2;
-        let CallSpec { mut func_abs, mut argc, ret_to, nres, shape, protected, handler, native_caller } =
-            spec;
+        let CallSpec {
+            mut func_abs,
+            mut argc,
+            ret_to,
+            nres,
+            shape,
+            protected,
+            handler,
+            native_caller,
+        } = spec;
         for _ in 0..MAX_META_CHAIN {
             match th.stack[func_abs] {
                 Value::Closure(cid) => {
@@ -1220,7 +2968,7 @@ impl Lua {
                     for i in argc..np {
                         th.stack[new_base + i] = Value::Nil;
                     }
-                    th.frames.push(Frame {
+                    th.frames.push(Frame::Lua(LuaFrame {
                         closure: cid,
                         proto,
                         pc: 0,
@@ -1230,10 +2978,19 @@ impl Lua {
                         shape,
                         protected,
                         handler,
+                        handler_guard: false,
                         pending: Vec::new(),
                         tbc: Vec::new(),
                         varargs,
-                    });
+                        tailcall: false,
+                        call_meta: None,
+                        last_line: -1,
+                        is_hook: false,
+                    }));
+                    if self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL) {
+                        let callee = th.stack[func_abs];
+                        self.fire_hook(th, fuel, "call", -1, Some(callee))?;
+                    }
                     return Ok(());
                 }
                 Value::Native(nid) => {
@@ -1253,21 +3010,124 @@ impl Lua {
                     // __call: f(args...) becomes mm(f, args...)
                     let mm = self.metamethod(other, Mm::Call);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to call a {} value", other.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
                     }
-                    let wb = scratch_base(th).max(func_abs + 1 + argc);
+                    // Prepend `mm`, keeping the window pinned at the frame's
+                    // scratch base. Repeated chases then shift in place (the
+                    // window stays put) instead of growing the stack by one
+                    // slot per level.
+                    let sb = scratch_base(th);
+                    let wb = func_abs.max(sb);
                     ensure_len(&mut th.stack, wb + 2 + argc);
-                    th.stack[wb] = mm;
                     th.stack.copy_within(func_abs..func_abs + 1 + argc, wb + 1);
+                    th.stack[wb] = mm;
                     func_abs = wb;
                     argc += 1;
                 }
             }
         }
         Err(self.rt_err(th, "'__call' chain too long".into()))
+    }
+
+    /// Resolves the callee at `func_abs`, chasing `__call` metamethod
+    /// chains, without starting any call. Returns the final callable and the
+    /// (possibly relocated) argument window.
+    fn resolve_callable(
+        &mut self,
+        th: &mut Thread,
+        mut func_abs: usize,
+        mut argc: usize,
+    ) -> Result<(Value, usize, usize), VmError> {
+        for _ in 0..MAX_META_CHAIN {
+            match th.stack[func_abs] {
+                v @ (Value::Closure(_) | Value::Native(_)) => return Ok((v, func_abs, argc)),
+                other => {
+                    // __call: f(args...) becomes mm(f, args...)
+                    let mm = self.metamethod(other, Mm::Call);
+                    if mm == Value::Nil {
+                        return Err(self
+                            .rt_err(th, format!("attempt to call a {} value", other.type_name())));
+                    }
+                    // Prepend `mm`, keeping the window pinned at the frame's
+                    // scratch base. Repeated chases then shift in place (the
+                    // window stays put) instead of growing the stack by one
+                    // slot per level.
+                    let sb = scratch_base(th);
+                    let wb = func_abs.max(sb);
+                    ensure_len(&mut th.stack, wb + 2 + argc);
+                    th.stack.copy_within(func_abs..func_abs + 1 + argc, wb + 1);
+                    th.stack[wb] = mm;
+                    func_abs = wb;
+                    argc += 1;
+                }
+            }
+        }
+        Err(self.rt_err(th, "'__call' chain too long".into()))
+    }
+
+    /// Replaces the current frame with a call to `cid`, moving the callee and
+    /// its arguments down over the old frame's base so the stack does not
+    /// grow across tail calls. The new frame inherits the replaced frame's
+    /// return destination, expected count, shape, and protection boundary.
+    fn tail_replace_frame(
+        &mut self,
+        th: &mut Thread,
+        cid: ClosId,
+        func_abs: usize,
+        argc: usize,
+    ) -> Result<(), VmError> {
+        let old = th.frames.last().unwrap().as_lua();
+        let fb = old.base;
+        let ret_to = old.ret_to;
+        let nres = old.nres;
+        let shape = old.shape;
+        let protected = old.protected;
+        let handler = old.handler;
+        // upvalues captured by the discarded frame must be closed before its
+        // registers are overwritten
+        self.close_upvals(th, fb);
+        let proto = self.closures[cid.0 as usize].proto.clone();
+        let np = proto.nparams as usize;
+        // Move `[func, args...]` down to occupy the old frame's function slot
+        // (if there is one), so tail recursion reuses the same stack region.
+        let new_func_abs = match fb.checked_sub(1) {
+            Some(dst) => {
+                th.stack.copy_within(func_abs..func_abs + 1 + argc, dst);
+                dst
+            }
+            None => func_abs,
+        };
+        let new_base = new_func_abs + 1;
+        let mut varargs = Vec::new();
+        if proto.is_vararg && argc > np {
+            varargs.extend_from_slice(&th.stack[new_base + np..new_base + argc]);
+        }
+        ensure_len(&mut th.stack, new_base + proto.max_regs as usize);
+        for i in argc..np {
+            th.stack[new_base + i] = Value::Nil;
+        }
+        th.frames.pop();
+        th.frames.push(Frame::Lua(LuaFrame {
+            closure: cid,
+            proto,
+            pc: 0,
+            base: new_base,
+            ret_to,
+            nres,
+            shape,
+            protected,
+            handler,
+            handler_guard: false,
+            pending: Vec::new(),
+            tbc: Vec::new(),
+            varargs,
+            tailcall: true,
+            call_meta: None,
+            last_line: -1,
+            is_hook: false,
+        }));
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1285,13 +3145,18 @@ impl Lua {
     ) -> Result<(), VmError> {
         match self.natives[nid.0 as usize].kind {
             NativeKind::Plain(f) => {
+                let fv = th.stack[func_abs];
                 let args = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let res = f(self, &args).map_err(|message| VmError {
                     val: ErrVal::Msg(message),
                     line: line_of(th),
+                    root_line: 0,
                     source: None,
                 })?;
                 place_shaped(th, ret_to, nres, shape, &res);
+                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                }
                 Ok(())
             }
             NativeKind::Intrinsic(i) => self.call_intrinsic(
@@ -1321,9 +3186,14 @@ impl Lua {
         shape: RetShape,
         native_caller: bool,
     ) -> Result<(), VmError> {
-        let arg = |th: &Thread, i: usize| -> Value {
-            if i < argc { th.stack[func_abs + 1 + i] } else { Value::Nil }
+        let arg_opt = |th: &Thread, i: usize| -> Option<Value> {
+            if i < argc {
+                Some(th.stack[func_abs + 1 + i])
+            } else {
+                None
+            }
         };
+        let arg = |th: &Thread, i: usize| -> Value { arg_opt(th, i).unwrap_or(Value::Nil) };
         match i {
             Intrinsic::Error => {
                 let v = arg(th, 0);
@@ -1338,23 +3208,41 @@ impl Lua {
                 let val = match v {
                     Value::Str(s) if level > 0 && !native_caller => {
                         let fidx = th.frames.len().saturating_sub(level as usize);
-                        let (line, src) = match th.frames.get(fidx) {
+                        let (line, src) = match th.frames.get(fidx).and_then(|f| f.lua()) {
                             Some(f) => (
-                                f.proto.lines.get(f.pc.wrapping_sub(1)).copied().unwrap_or(0),
+                                f.proto
+                                    .lines
+                                    .get(f.pc.wrapping_sub(1))
+                                    .copied()
+                                    .unwrap_or(0),
                                 f.proto.source.clone(),
                             ),
-                            None => (line_of(th), th.frames.last().unwrap().proto.source.clone()),
+                            None => (
+                                line_of(th),
+                                th.frames
+                                    .last()
+                                    .and_then(|f| f.lua())
+                                    .map(|f| f.proto.source.clone())
+                                    .unwrap_or_default(),
+                            ),
                         };
                         let msg = format!("{src}:{line}: {}", self.strings.get_str_lossy(s));
                         self.new_string(msg.as_bytes())
                     }
                     _ => v,
                 };
-                Err(VmError { val: ErrVal::Val(val), line: line_of(th), source: None })
+                Err(VmError {
+                    val: ErrVal::Val(val),
+                    line: line_of(th),
+                    root_line: 0,
+                    source: None,
+                })
             }
             Intrinsic::Assert => {
                 if argc == 0 {
-                    return Err(self.rt_err(th, "bad argument #1 to 'assert' (value expected)".into()));
+                    return Err(
+                        self.rt_err(th, "bad argument #1 to 'assert' (value expected)".into())
+                    );
                 }
                 if arg(th, 0).truthy() {
                     let res = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
@@ -1366,17 +3254,22 @@ impl Lua {
                             let source = if native_caller {
                                 None
                             } else {
-                                th.frames.last().map(|f| f.proto.source.clone())
+                                th.frames
+                                    .last()
+                                    .and_then(|f| f.lua())
+                                    .map(|f| f.proto.source.clone())
                             };
                             Err(VmError {
                                 val: ErrVal::Msg("assertion failed!".into()),
                                 line: line_of(th),
+                                root_line: 0,
                                 source,
                             })
                         }
                         v => Err(VmError {
                             val: ErrVal::Val(v),
                             line: line_of(th),
+                            root_line: 0,
                             source: None,
                         }),
                     }
@@ -1386,14 +3279,73 @@ impl Lua {
                 let v = arg(th, 0);
                 let mm = self.metamethod(v, Mm::ToString);
                 if mm == Value::Nil {
-                    let s = self.display_value(v);
+                    let s = self.tostring_default(v);
                     let sv = self.new_string(s.as_bytes());
                     place_shaped(th, ret_to, nres, shape, &[sv]);
                     Ok(())
                 } else {
-                    // shape composition: tostring under pcall keeps PrependTrue
-                    self.call_value(th, mm, &[v], ret_to, nres, shape, fuel)
+                    // PUC's `luaL_tolstring` requires the metamethod result to
+                    // be a string (numbers are accepted by `lua_isstring` and
+                    // converted). Validate after it returns.
+                    let result_slot = scratch_base(th);
+                    ensure_len(&mut th.stack, result_slot + 1);
+                    th.frames
+                        .last_mut()
+                        .unwrap()
+                        .pending_mut()
+                        .push(Pending::FinishTostring {
+                            ret_to,
+                            nres,
+                            shape,
+                            result_slot,
+                        });
+                    self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel)
                 }
+            }
+            Intrinsic::Format => {
+                let nargs = argc;
+                let fmt = if nargs == 0 {
+                    return Err(self.rt_err(
+                        th,
+                        "bad argument #1 to 'format' (string expected, got no value)".into(),
+                    ));
+                } else {
+                    match arg(th, 0) {
+                        Value::Str(id) => self.strings.get(id).to_vec(),
+                        v @ (Value::Int(_) | Value::Float(_)) => {
+                            crate::value::fmt_number(v).into_bytes()
+                        }
+                        other => {
+                            return Err(self.rt_err(
+                                th,
+                                format!(
+                                    "bad argument #1 to 'format' (string expected, got {})",
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    }
+                };
+                let args: Vec<Value> = (0..nargs).map(|i| arg(th, i)).collect();
+                self.format_job = Some(FormatJob {
+                    fmt,
+                    pos: 0,
+                    arg: 1,
+                    args,
+                    out: Vec::new(),
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot: 0,
+                    awaiting: false,
+                    saved: None,
+                });
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::FormatStep);
+                Ok(())
             }
             Intrinsic::Pcall => {
                 if argc == 0 {
@@ -1401,25 +3353,71 @@ impl Lua {
                         self.rt_err(th, "bad argument #1 to 'pcall' (value expected)".into())
                     );
                 }
-                self.protected_call(th, fuel, func_abs + 1, argc - 1, ret_to, nres, None)
+                let pcall_fn = th.stack[func_abs];
+                if shape == RetShape::PrependTrue
+                    && let Some(f @ Frame::C(_)) = th.frames.last_mut()
+                {
+                    f.pending_mut().push(Pending::PrependShape {
+                        ret_to,
+                        nres,
+                        shape,
+                    });
+                }
+                self.protected_call(
+                    th,
+                    fuel,
+                    func_abs + 1,
+                    argc - 1,
+                    ret_to,
+                    nres,
+                    None,
+                    Some(CSpec {
+                        name: "pcall",
+                        namewhat: "global",
+                        func: pcall_fn,
+                    }),
+                )
             }
             Intrinsic::Xpcall => {
                 if argc < 2 {
-                    return Err(self.rt_err(
-                        th,
-                        "bad argument #2 to 'xpcall' (value expected)".into(),
-                    ));
+                    return Err(
+                        self.rt_err(th, "bad argument #2 to 'xpcall' (value expected)".into())
+                    );
                 }
                 let handler = arg(th, 1);
                 // rebuild a contiguous window: [f, args...] (handler sits
                 // between f and the args in the original window)
                 let f = arg(th, 0);
+                let xpcall_fn = th.stack[func_abs];
                 let wb = scratch_base(th).max(func_abs + 1 + argc);
                 let n_args = argc - 2;
                 ensure_len(&mut th.stack, wb + 1 + n_args);
                 th.stack[wb] = f;
-                th.stack.copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
-                self.protected_call(th, fuel, wb, n_args, ret_to, nres, Some(handler))
+                th.stack
+                    .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
+                if shape == RetShape::PrependTrue
+                    && let Some(cf @ Frame::C(_)) = th.frames.last_mut()
+                {
+                    cf.pending_mut().push(Pending::PrependShape {
+                        ret_to,
+                        nres,
+                        shape,
+                    });
+                }
+                self.protected_call(
+                    th,
+                    fuel,
+                    wb,
+                    n_args,
+                    ret_to,
+                    nres,
+                    Some(handler),
+                    Some(CSpec {
+                        name: "xpcall",
+                        namewhat: "global",
+                        func: xpcall_fn,
+                    }),
+                )
             }
             Intrinsic::Resume => {
                 let co = arg(th, 0);
@@ -1440,27 +3438,134 @@ impl Lua {
                 self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, true)
             }
             Intrinsic::Yield => {
+                // Non-yieldable C boundary (e.g. inside a `table.sort`
+                // comparator or `string.gsub` replacement): PUC reports a
+                // cross-boundary yield, unless we are on the main thread, which
+                // reports "outside a coroutine" instead.
+                if th.non_yieldable > 0 && !th.is_main {
+                    return Err(self.rt_err(th, "attempt to yield across a C-call boundary".into()));
+                }
                 let Some(parent) = th.parent else {
-                    return Err(
-                        self.rt_err(th, "attempt to yield from outside a coroutine".into())
-                    );
+                    return Err(self.rt_err(th, "attempt to yield from outside a coroutine".into()));
                 };
                 *fuel -= 3;
                 let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let rr = th.resume_ret.expect("resumed thread has resume_ret");
-                th.status = CoStatus::Suspended;
-                // the next resume's arguments become this yield call's results
-                th.yield_ret = Some((ret_to, nres, shape));
-                let parent_th = &mut self.threads[parent.0 as usize];
-                parent_th.status = CoStatus::Running;
-                deliver_resume(parent_th, rr, true, &args);
-                self.switch_to = Some(parent);
+                let yield_fn = th.stack[func_abs];
+                let want_call = self.hook_suppress == 0 && self.hook_on(th, HOOK_CALL);
+                let want_ret = self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN);
+                let job = YieldJob {
+                    parent,
+                    rr,
+                    ret_to,
+                    nres,
+                    shape,
+                    args,
+                    func: yield_fn,
+                    stage: 0,
+                };
+                if want_call || want_ret {
+                    // `yield` is a C function: emit its call/return hook events
+                    // before the thread actually suspends. Each hook runs as a
+                    // frame, so the suspension is deferred through `YieldStep`.
+                    th.yield_job = Some(job);
+                    th.frames
+                        .last_mut()
+                        .unwrap()
+                        .pending_mut()
+                        .push(Pending::YieldStep);
+                    return Ok(());
+                }
+                self.perform_yield(th, job);
+                Ok(())
+            }
+            Intrinsic::EnterNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_add(1);
+                place_shaped(th, ret_to, nres, shape, &[]);
+                Ok(())
+            }
+            Intrinsic::LeaveNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_sub(1);
+                place_shaped(th, ret_to, nres, shape, &[]);
                 Ok(())
             }
             Intrinsic::IsYieldable => {
-                let r = Value::Bool(th.parent.is_some());
-                place_shaped(th, ret_to, nres, shape, &[r]);
+                // Optional `co` argument: true for any coroutine (even a dead
+                // or never-started one), false for the main thread or a thread
+                // currently inside a non-yieldable C boundary.
+                let r = match arg_opt(th, 0) {
+                    None => !th.is_main && th.non_yieldable == 0,
+                    // the running thread is taken out of the arena, so read
+                    // its flag from the live `th`, not the placeholder
+                    Some(Value::Thread(t)) if t == self.current_thread => {
+                        !th.is_main && th.non_yieldable == 0
+                    }
+                    Some(Value::Thread(t)) => {
+                        let other = &self.threads[t.0 as usize];
+                        !other.is_main && other.non_yieldable == 0
+                    }
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'isyieldable' (thread expected, got {})",
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                place_shaped(th, ret_to, nres, shape, &[Value::Bool(r)]);
                 Ok(())
+            }
+            Intrinsic::CollectGarbage => {
+                // An intrinsic so the running thread (taken out of the arena
+                // during dispatch) can be passed as a GC root.
+                let r = self
+                    .gc_command(
+                        th,
+                        arg(th, 0),
+                        (argc > 1).then(|| arg(th, 1)),
+                        func_abs + 1 + argc,
+                    )
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &r);
+                Ok(())
+            }
+            Intrinsic::Print => {
+                let items: Vec<Value> = (0..argc).map(|i| arg(th, i)).collect();
+                self.print_job = Some(PrintJob {
+                    items,
+                    idx: 0,
+                    out: Vec::new(),
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot: 0,
+                    awaiting: false,
+                });
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::PrintStep);
+                Ok(())
+            }
+            Intrinsic::CoroutineClose => {
+                let co = arg_opt(th, 0);
+                let Value::Thread(co) = co.unwrap_or(Value::Nil) else {
+                    let got = match co {
+                        Some(v) => v.type_name().to_string(),
+                        None => "no value".to_string(),
+                    };
+                    return Err(self.rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'coroutine.close' (thread expected, got {got})"
+                        ),
+                    ));
+                };
+                let close_fn = th.stack[func_abs];
+                self.begin_close(th, fuel, co, ret_to, nres, shape, close_fn)
             }
             Intrinsic::Running => {
                 let cur = Value::Thread(self.current_thread);
@@ -1468,7 +3573,316 @@ impl Lua {
                 place_shaped(th, ret_to, nres, shape, &[cur, is_main]);
                 Ok(())
             }
+            Intrinsic::DebugGetinfo => {
+                let a0 = arg_opt(th, 0);
+                let (target, base) = match a0 {
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let f = arg_opt(th, base);
+                let what = arg(th, base + 1);
+                let r = self
+                    .debug_getinfo(th, target, f, what, base + 1)
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugTraceback => {
+                let a0 = arg_opt(th, 0);
+                let (target, base) = match a0 {
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let message = arg(th, base);
+                let level = arg_opt(th, base + 1);
+                let r = self
+                    .debug_traceback(th, target, message, level, base + 2)
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugGetupvalue => {
+                // PUC checks the index (arg #2) before the function (arg #1).
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.getupvalue")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let f = arg(th, 0);
+                match f {
+                    Value::Closure(cid) => match self.debug_getupvalue(th, cid, n) {
+                        Some((name, val)) => {
+                            let nv = self.new_string(name.as_bytes());
+                            place_shaped(th, ret_to, nres, shape, &[nv, val]);
+                        }
+                        // Out of range: PUC returns no values.
+                        None => place_shaped(th, ret_to, nres, shape, &[]),
+                    },
+                    // A native is a C function: it is a valid function with no
+                    // upvalues, so `lua_getupvalue` returns NULL -> zero values.
+                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Intrinsic::DebugSetupvalue => {
+                // PUC checks the value (arg #3), then index (#2), then
+                // function (#1).
+                if arg_opt(th, 2).is_none() {
+                    return Err(self.rt_err(
+                        th,
+                        "bad argument #3 to 'debug.setupvalue' (value expected)".into(),
+                    ));
+                }
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.setupvalue")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let v = arg(th, 2);
+                let f = arg(th, 0);
+                match f {
+                    Value::Closure(cid) => match self.debug_setupvalue(th, cid, n, v) {
+                        Some(name) => {
+                            let nv = self.new_string(name.as_bytes());
+                            place_shaped(th, ret_to, nres, shape, &[nv]);
+                        }
+                        None => place_shaped(th, ret_to, nres, shape, &[]),
+                    },
+                    // Native (C) functions have no upvalues: `lua_setupvalue`
+                    // returns NULL, and the API reports zero values.
+                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Intrinsic::DebugUpvalueid => {
+                let n = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvalueid")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let f = arg(th, 0);
+                let r = match f {
+                    Value::Closure(cid) => self.debug_upvalueid(cid, n),
+                    // `lua_upvalueid` returns NULL for a C function (no
+                    // upvalues); PUC pushes fail (nil) as a single value.
+                    Value::Native(_) => Value::Nil,
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugUpvaluejoin => {
+                // PUC's `checkupval` validates each (function, index) pair in
+                // order: index (#2/#4) then function (#1/#3) then upvalue
+                // existence. A native has no upvalues, so it fails the index
+                // check; a non-function fails the type check.
+                let n1 = self
+                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let c1 = self
+                    .debug_check_upval(arg(th, 0), n1, 1, 2, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let n2 = self
+                    .debug_check_int(arg_opt(th, 3), 4, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
+                let c2 = self
+                    .debug_check_upval(arg(th, 2), n2, 3, 4, "debug.upvaluejoin")
+                    .map_err(|m| self.rt_err(th, m))?;
+                self.debug_upvaluejoin(c1, n1, c2, n2)
+                    .map_err(|m| self.rt_err(th, m))?;
+                place_shaped(th, ret_to, nres, shape, &[]);
+                Ok(())
+            }
+            Intrinsic::DebugGetmetatable => {
+                let v = arg(th, 0);
+                let r = match self.get_metatable(v) {
+                    Some(mt) => Value::Table(mt),
+                    None => Value::Nil,
+                };
+                place_shaped(th, ret_to, nres, shape, &[r]);
+                Ok(())
+            }
+            Intrinsic::DebugSetmetatable => {
+                let v = arg(th, 0);
+                let mt = match arg(th, 1) {
+                    Value::Nil => None,
+                    Value::Table(t) => Some(t),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                self.set_raw_metatable(v, mt);
+                place_shaped(th, ret_to, nres, shape, &[v]);
+                Ok(())
+            }
+            Intrinsic::DebugGetregistry => {
+                place_shaped(th, ret_to, nres, shape, &[Value::Table(self.globals)]);
+                Ok(())
+            }
+            Intrinsic::DebugGethook => {
+                let target = match arg_opt(th, 0) {
+                    None | Some(Value::Nil) => None,
+                    Some(Value::Thread(t)) => Some(t),
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #1 to 'gethook' (thread expected, got {})",
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let (hook, mask, count) = match target {
+                    Some(t) if t != self.current_thread => {
+                        let o = &self.threads[t.0 as usize];
+                        (o.hook.unwrap_or(Value::Nil), o.hook_mask, o.hook_count)
+                    }
+                    _ => (th.hook.unwrap_or(Value::Nil), th.hook_mask, th.hook_count),
+                };
+                // PUC returns a single `nil` (fail) when no hook is set,
+                // otherwise the hook, its mask string, and the count.
+                if hook == Value::Nil {
+                    place_shaped(th, ret_to, nres, shape, &[Value::Nil]);
+                    return Ok(());
+                }
+                let mut s = String::new();
+                if mask & HOOK_CALL != 0 {
+                    s.push('c');
+                }
+                if mask & HOOK_RETURN != 0 {
+                    s.push('r');
+                }
+                if mask & HOOK_LINE != 0 {
+                    s.push('l');
+                }
+                let sv = self.new_string(s.as_bytes());
+                place_shaped(th, ret_to, nres, shape, &[hook, sv, Value::Int(count)]);
+                Ok(())
+            }
+            Intrinsic::DebugSethook => {
+                // `debug.sethook([thread,] hook, mask [, count])`
+                let (target, base_index) = match arg_opt(th, 0) {
+                    Some(Value::Thread(t)) => (Some(t), 1usize),
+                    _ => (None, 0usize),
+                };
+                let hook_opt = match arg(th, base_index) {
+                    Value::Nil => None,
+                    v @ (Value::Closure(_) | Value::Native(_)) => Some(v),
+                    other => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (function expected, got {})",
+                                base_index + 1,
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let mut bits = 0u8;
+                match arg_opt(th, base_index + 1) {
+                    None | Some(Value::Nil) => {}
+                    Some(Value::Str(sid)) => {
+                        for &c in self.strings.get(sid) {
+                            match c {
+                                b'c' => bits |= HOOK_CALL,
+                                b'r' => bits |= HOOK_RETURN,
+                                b'l' => bits |= HOOK_LINE,
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (string expected, got {})",
+                                base_index + 2,
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                }
+                let count = match arg_opt(th, base_index + 2) {
+                    None | Some(Value::Nil) => 0,
+                    Some(Value::Int(n)) => n,
+                    Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
+                    Some(v) => {
+                        return Err(self.rt_err(
+                            th,
+                            format!(
+                                "bad argument #{} to 'sethook' (number expected, got {})",
+                                base_index + 3,
+                                v.type_name()
+                            ),
+                        ));
+                    }
+                };
+                let apply = |t: &mut Thread| {
+                    t.hook = hook_opt;
+                    t.hook_mask = bits;
+                    t.hook_count = count.max(0);
+                    t.hook_counter = count.max(0);
+                };
+                match target {
+                    Some(t) if t != self.current_thread => {
+                        apply(&mut self.threads[t.0 as usize]);
+                    }
+                    _ => apply(th),
+                }
+                // `debug.sethook` is itself a C function: if a return hook is
+                // now active on this thread, its return fires the hook (and the
+                // hook it just set observes it). A clearing call has already
+                // removed the hook, so nothing fires.
+                let fv = th.stack[func_abs];
+                place_shaped(th, ret_to, nres, shape, &[]);
+                if self.hook_suppress == 0 && self.hook_on(th, HOOK_RETURN) {
+                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// Number of resumers above `parent` in the live coroutine chain.
+    fn coroutine_depth(&self, parent: Option<ThreadId>) -> usize {
+        let mut depth = 0;
+        let mut cur = parent;
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > 1000 {
+                break;
+            }
+            cur = self.threads[p.0 as usize].parent;
+        }
+        depth
     }
 
     /// Shared by `coroutine.resume` and wrapped coroutines.
@@ -1496,6 +3910,12 @@ impl Lua {
         if co == self.current_thread {
             return fail(self, th, "cannot resume non-suspended coroutine");
         }
+        // PUC bounds the chain of nested resumes with its C-stack limit; the
+        // classic `function(a) coroutine.wrap(a)(a) end` loop must fail with
+        // "C stack overflow" rather than allocate coroutines without bound.
+        if self.coroutine_depth(th.parent) >= 190 {
+            return fail(self, th, "C stack overflow");
+        }
         let status = self.threads[co.0 as usize].status;
         match status {
             CoStatus::Dead => fail(self, th, "cannot resume dead coroutine"),
@@ -1504,7 +3924,13 @@ impl Lua {
             }
             CoStatus::Start | CoStatus::Suspended => {
                 *fuel -= 3;
-                let rr = ResumeRet { ret_to, nres, shape, status_bool: !wrap, wrap };
+                let rr = ResumeRet {
+                    ret_to,
+                    nres,
+                    shape,
+                    status_bool: !wrap,
+                    wrap,
+                };
                 {
                     let co_th = &mut self.threads[co.0 as usize];
                     co_th.resume_ret = Some(rr);
@@ -1532,7 +3958,7 @@ impl Lua {
                                 Vec::new()
                             };
                             co_th.status = CoStatus::Running;
-                            co_th.frames.push(Frame {
+                            co_th.frames.push(Frame::Lua(LuaFrame {
                                 closure: cid,
                                 proto,
                                 pc: 0,
@@ -1542,38 +3968,156 @@ impl Lua {
                                 shape: RetShape::Normal,
                                 protected: false,
                                 handler: None,
+                                handler_guard: false,
                                 pending: Vec::new(),
                                 tbc: Vec::new(),
                                 varargs,
-                            });
+                                tailcall: false,
+                                call_meta: None,
+                                last_line: -1,
+                                is_hook: false,
+                            }));
+                            // A hook set on this coroutine before it started
+                            // must see the body's "call" event.
+                            co_th.pending_call_hook = true;
                         }
                         Value::Native(nid) => {
-                            // native coroutine body: cannot yield; run it to
-                            // completion right here
-                            let co_th = &mut self.threads[co.0 as usize];
-                            co_th.status = CoStatus::Dead;
-                            co_th.parent = None;
-                            co_th.resume_ret = None;
-                            let kind_result = match &self.natives[nid.0 as usize].kind {
-                                NativeKind::Plain(f) => f(self, args),
-                                NativeKind::Intrinsic(_) => {
-                                    Err("cannot use this builtin as a coroutine body".into())
-                                }
-                            };
-                            return match kind_result {
-                                Ok(res) => {
-                                    let mut all = Vec::with_capacity(res.len() + 1);
-                                    if !wrap {
-                                        all.push(Value::Bool(true));
-                                        all.extend_from_slice(&res);
-                                        place_shaped(th, ret_to, nres, shape, &all);
-                                    } else {
-                                        place_shaped(th, ret_to, nres, shape, &res);
+                            let is_pcall = matches!(
+                                self.natives[nid.0 as usize].kind,
+                                NativeKind::Intrinsic(Intrinsic::Pcall)
+                            );
+                            let is_xpcall = matches!(
+                                self.natives[nid.0 as usize].kind,
+                                NativeKind::Intrinsic(Intrinsic::Xpcall)
+                            );
+                            if is_pcall || is_xpcall {
+                                // `coroutine.create(pcall)` / `(xpcall)`: run the
+                                // protected call inside the coroutine thread. The
+                                // protected frame stays on the coroutine stack, so
+                                // a yield from the callee suspends and resumes it
+                                // as usual.
+                                let mut co_th = std::mem::take(&mut self.threads[co.0 as usize]);
+                                let extra = if is_xpcall {
+                                    if args.len() < 2 {
+                                        self.threads[co.0 as usize] = co_th;
+                                        return fail(
+                                            self,
+                                            th,
+                                            "bad argument #2 to 'xpcall' (value expected)",
+                                        );
                                     }
-                                    Ok(())
+                                    args.len() - 2
+                                } else {
+                                    if args.is_empty() {
+                                        self.threads[co.0 as usize] = co_th;
+                                        return fail(
+                                            self,
+                                            th,
+                                            "bad argument #1 to 'pcall' (value expected)",
+                                        );
+                                    }
+                                    args.len() - 1
+                                };
+                                ensure_len(&mut co_th.stack, 3 + extra);
+                                co_th.stack[0] = Value::Native(nid);
+                                co_th.stack[1] = args[0];
+                                if is_xpcall {
+                                    co_th.stack[2..2 + extra].copy_from_slice(&args[2..]);
+                                } else {
+                                    co_th.stack[2..2 + extra].copy_from_slice(&args[1..]);
                                 }
-                                Err(msg) => fail(self, th, &msg),
-                            };
+                                co_th.top = 2 + extra;
+                                co_th.status = CoStatus::Running;
+                                let handler = if is_xpcall { Some(args[1]) } else { None };
+                                let name = if is_xpcall { "xpcall" } else { "pcall" };
+                                let r = self.protected_call(
+                                    &mut co_th,
+                                    fuel,
+                                    1,
+                                    extra,
+                                    0,
+                                    0,
+                                    handler,
+                                    Some(CSpec {
+                                        name,
+                                        namewhat: "global",
+                                        func: Value::Native(nid),
+                                    }),
+                                );
+                                self.threads[co.0 as usize] = co_th;
+                                r?;
+                            } else {
+                                // native coroutine body: cannot yield; run it to
+                                // completion right here
+                                let co_th = &mut self.threads[co.0 as usize];
+                                co_th.status = CoStatus::Dead;
+                                co_th.parent = None;
+                                co_th.resume_ret = None;
+                                let native_is_error = matches!(
+                                    self.natives[nid.0 as usize].kind,
+                                    NativeKind::Intrinsic(Intrinsic::Error)
+                                );
+                                if native_is_error {
+                                    // `coroutine.create(error)`; error() with a
+                                    // non-string argument raises that value.
+                                    let errv = args.first().copied().unwrap_or(Value::Nil);
+                                    self.threads[co.0 as usize].close_error = Some(errv);
+                                    if wrap {
+                                        return Err(VmError {
+                                            val: ErrVal::Val(errv),
+                                            line: 0,
+                                            root_line: 0,
+                                            source: None,
+                                        });
+                                    }
+                                    place_shaped(
+                                        th,
+                                        ret_to,
+                                        nres,
+                                        shape,
+                                        &[Value::Bool(false), errv],
+                                    );
+                                    return Ok(());
+                                }
+                                let native_is_print = matches!(
+                                    self.natives[nid.0 as usize].kind,
+                                    NativeKind::Intrinsic(Intrinsic::Print)
+                                );
+                                let kind_result = if native_is_print {
+                                    // `coroutine.create(print)`: render directly
+                                    // (no frame is available to drive
+                                    // `__tostring` here).
+                                    let line = args
+                                        .iter()
+                                        .map(|v| self.tostring_default(*v))
+                                        .collect::<Vec<_>>()
+                                        .join("\t");
+                                    println!("{line}");
+                                    Ok(Vec::new())
+                                } else {
+                                    match &self.natives[nid.0 as usize].kind {
+                                        NativeKind::Plain(f) => f(self, args),
+                                        NativeKind::Intrinsic(_) => {
+                                            Err("cannot use this builtin as a coroutine body"
+                                                .into())
+                                        }
+                                    }
+                                };
+                                return match kind_result {
+                                    Ok(res) => {
+                                        let mut all = Vec::with_capacity(res.len() + 1);
+                                        if !wrap {
+                                            all.push(Value::Bool(true));
+                                            all.extend_from_slice(&res);
+                                            place_shaped(th, ret_to, nres, shape, &all);
+                                        } else {
+                                            place_shaped(th, ret_to, nres, shape, &res);
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(msg) => fail(self, th, &msg),
+                                };
+                            }
                         }
                         _ => return fail(self, th, "cannot resume dead coroutine"),
                     }
@@ -1581,8 +4125,10 @@ impl Lua {
                     // deliver resume args as the pending yield's results
                     let co_th = &mut self.threads[co.0 as usize];
                     co_th.status = CoStatus::Running;
-                    let (yret, ynres, yshape) =
-                        co_th.yield_ret.take().expect("suspended thread has yield_ret");
+                    let (yret, ynres, yshape) = co_th
+                        .yield_ret
+                        .take()
+                        .expect("suspended thread has yield_ret");
                     place_shaped(co_th, yret, ynres, yshape, args);
                 }
                 th.status = CoStatus::Normal;
@@ -1590,6 +4136,292 @@ impl Lua {
                 Ok(())
             }
         }
+    }
+
+    /// Starts `coroutine.close(co)`. Dead-and-clean and to-be-closed-free
+    /// coroutines resolve immediately; otherwise a [`CloseJob`] is installed
+    /// and driven by [`Pending::CloseStep`].
+    #[allow(clippy::too_many_arguments)]
+    fn begin_close(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        co: ThreadId,
+        ret_to: usize,
+        nres: u8,
+        shape: RetShape,
+        func: Value,
+    ) -> Result<(), VmError> {
+        // Closing the running/normal coroutine is an error (catchable with
+        // pcall), not a `false, msg` result.
+        if co == self.current_thread {
+            return Err(self.rt_err(th, "cannot close a running coroutine".into()));
+        }
+        match self.threads[co.0 as usize].status {
+            CoStatus::Running => Err(self.rt_err(th, "cannot close a running coroutine".into())),
+            CoStatus::Normal => Err(self.rt_err(th, "cannot close a normal coroutine".into())),
+            CoStatus::Dead => {
+                let err = self.threads[co.0 as usize].close_error.take();
+                match err {
+                    Some(e) => place_shaped(th, ret_to, nres, shape, &[Value::Bool(false), e]),
+                    None => place_shaped(th, ret_to, nres, shape, &[Value::Bool(true)]),
+                }
+                Ok(())
+            }
+            CoStatus::Start | CoStatus::Suspended => {
+                let mut items = Vec::new();
+                {
+                    let ct = &self.threads[co.0 as usize];
+                    for f in ct.frames.iter().rev() {
+                        let Some(f) = f.lua() else { continue };
+                        for &r in f.tbc.iter().rev() {
+                            items.push(ct.stack[f.base + r as usize]);
+                        }
+                    }
+                }
+                if items.is_empty() {
+                    self.finish_close(co);
+                    place_shaped(th, ret_to, nres, shape, &[Value::Bool(true)]);
+                    return Ok(());
+                }
+                // Mark running so a reentrant close from inside a __close
+                // handler reports "cannot close a running coroutine".
+                self.threads[co.0 as usize].status = CoStatus::Running;
+                self.close_job = Some(CloseJob {
+                    target: co,
+                    func,
+                    items,
+                    idx: 0,
+                    err: Value::Nil,
+                    failed: false,
+                    ret_to,
+                    nres,
+                    shape,
+                    result_slot: 0,
+                    awaiting: false,
+                });
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::CloseStep);
+                *fuel -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// One step of the [`CloseJob`] state machine: consume a pending result,
+    /// then either call the next `__close` (protected, staged through
+    /// `Pending::CloseStep`) or deliver the final `true`/`false, err`.
+    fn close_step(&mut self, th: &mut Thread, fuel: &mut i64) -> Result<(), VmError> {
+        let Some(mut job) = self.close_job.take() else {
+            return Ok(());
+        };
+        if job.awaiting {
+            job.awaiting = false;
+            if th.stack[job.result_slot] == Value::Bool(false) {
+                job.err = th.stack[job.result_slot + 1];
+                job.failed = true;
+            }
+        }
+        if job.idx < job.items.len() {
+            let item = job.items[job.idx];
+            job.idx += 1;
+            let mm = self.metamethod_pub(item, "__close");
+            if mm == Value::Nil {
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::CloseStep);
+                self.close_job = Some(job);
+                return Ok(());
+            }
+            let scratch = scratch_base(th);
+            ensure_len(&mut th.stack, scratch + 3);
+            th.stack[scratch] = mm;
+            th.stack[scratch + 1] = item;
+            th.stack[scratch + 2] = job.err;
+            let result_slot = scratch + 3;
+            ensure_len(&mut th.stack, result_slot + 2);
+            job.result_slot = result_slot;
+            job.awaiting = true;
+            let close_fn = job.func;
+            th.frames
+                .last_mut()
+                .unwrap()
+                .pending_mut()
+                .push(Pending::CloseStep);
+            self.close_job = Some(job);
+            *fuel -= 1;
+            // nres = 0 (multret) so an error's `false, err` pair both land.
+            return self.protected_call(
+                th,
+                fuel,
+                scratch,
+                2,
+                result_slot,
+                0,
+                None,
+                Some(CSpec {
+                    name: "coroutine.close",
+                    namewhat: "global",
+                    func: close_fn,
+                }),
+            );
+        }
+        // all handlers ran: kill the target and report
+        self.finish_close(job.target);
+        let results: [Value; 2] = [Value::Bool(!job.failed), job.err];
+        let slice: &[Value] = if job.failed { &results } else { &results[..1] };
+        place_shaped(th, job.ret_to, job.nres, job.shape, slice);
+        self.close_job = None;
+        Ok(())
+    }
+
+    /// One step of the [`PrintJob`] state machine: consume a `__tostring`
+    /// result, then either call the next one or emit the line.
+    fn print_step(&mut self, th: &mut Thread, fuel: &mut i64) -> Result<(), VmError> {
+        let Some(mut job) = self.print_job.take() else {
+            return Ok(());
+        };
+        if job.awaiting {
+            job.awaiting = false;
+            let v = th.stack[job.result_slot];
+            match v {
+                Value::Str(s) => job.out.push(self.strings.get(s).to_vec()),
+                _ => {
+                    self.print_job = Some(job);
+                    return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                }
+            }
+        }
+        while job.idx < job.items.len() {
+            let v = job.items[job.idx];
+            job.idx += 1;
+            let mm = self.metamethod(v, Mm::ToString);
+            if mm != Value::Nil {
+                let result_slot = scratch_base(th);
+                ensure_len(&mut th.stack, result_slot + 1);
+                job.result_slot = result_slot;
+                job.awaiting = true;
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::PrintStep);
+                self.print_job = Some(job);
+                // nres = 2 -> exactly one result
+                return self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel);
+            }
+            job.out.push(self.tostring_default(v).into_bytes());
+        }
+        let line = job
+            .out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+            .join("\t");
+        // Deviation: `print` writes to the process stdout directly, not through
+        // the installed host's `stdout_write` sink. This matches PUC (whose
+        // `print` targets C `stdout`) and keeps tests that install a capturing
+        // host — or run without one — working unchanged; hosts that want to
+        // capture `print` output should use `io.write`/`io.stdout` instead.
+        println!("{line}");
+        place_shaped(th, job.ret_to, job.nres, job.shape, &[]);
+        self.print_job = None;
+        Ok(())
+    }
+
+    /// One step of the [`FormatJob`] state machine. Consumes a resolved
+    /// `__tostring` result when one is pending, then renders format items
+    /// left-to-right until the whole string is built or another `%s` needs
+    /// `__tostring`.
+    fn format_step(&mut self, th: &mut Thread, fuel: &mut i64) -> Result<(), VmError> {
+        let Some(mut job) = self.format_job.take() else {
+            return Ok(());
+        };
+        if job.awaiting {
+            job.awaiting = false;
+            let v = th.stack[job.result_slot];
+            let bytes = match v {
+                Value::Str(id) => self.strings.get(id).to_vec(),
+                Value::Int(_) | Value::Float(_) => crate::value::fmt_number(v).into_bytes(),
+                _ => {
+                    self.format_job = Some(job);
+                    return Err(self.rt_err(th, "'__tostring' must return a string".into()));
+                }
+            };
+            let (spec, arg, argi) = job.saved.take().expect("saved spec while awaiting");
+            let piece = crate::stdlib::string::render_spec(self, &spec, arg, argi, Some(bytes))
+                .map_err(|m| self.rt_err(th, m))?;
+            job.out.extend_from_slice(&piece);
+        }
+        while job.pos < job.fmt.len() {
+            let c = job.fmt[job.pos];
+            if c != b'%' {
+                job.out.push(c);
+                job.pos += 1;
+                continue;
+            }
+            if job.fmt.get(job.pos + 1) == Some(&b'%') {
+                job.out.push(b'%');
+                job.pos += 2;
+                continue;
+            }
+            job.arg += 1;
+            if job.arg > job.args.len() {
+                let arg = job.arg;
+                self.format_job = Some(job);
+                return Err(self.rt_err(th, format!("bad argument #{arg} to 'format' (no value)")));
+            }
+            let Some(spec) = crate::stdlib::string::parse_spec(&job.fmt, job.pos)
+                .map_err(|m| self.rt_err(th, m))?
+            else {
+                break;
+            };
+            let v = job.args[job.arg - 1];
+            job.pos = spec.next;
+            if spec.conv == b's' {
+                let mm = self.metamethod(v, Mm::ToString);
+                if mm != Value::Nil {
+                    let result_slot = scratch_base(th);
+                    ensure_len(&mut th.stack, result_slot + 1);
+                    job.result_slot = result_slot;
+                    job.awaiting = true;
+                    let argi = job.arg;
+                    job.saved = Some((spec, v, argi));
+                    th.frames
+                        .last_mut()
+                        .unwrap()
+                        .pending_mut()
+                        .push(Pending::FormatStep);
+                    self.format_job = Some(job);
+                    return self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel);
+                }
+            }
+            let piece = crate::stdlib::string::render_spec(self, &spec, v, job.arg, None)
+                .map_err(|m| self.rt_err(th, m))?;
+            job.out.extend_from_slice(&piece);
+        }
+        let sv = self.new_string(&job.out);
+        place_shaped(th, job.ret_to, job.nres, job.shape, &[sv]);
+        self.format_job = None;
+        Ok(())
+    }
+
+    /// Puts a coroutine into the dead state, dropping its frames and stack.
+    fn finish_close(&mut self, co: ThreadId) {
+        let ct = &mut self.threads[co.0 as usize];
+        ct.status = CoStatus::Dead;
+        ct.frames.clear();
+        ct.stack.clear();
+        ct.open_upvals.clear();
+        ct.parent = None;
+        ct.resume_ret = None;
+        ct.yield_ret = None;
+        ct.close_error = None;
     }
 
     /// Calls the value at `f_abs` under error protection: results arrive as
@@ -1605,7 +4437,30 @@ impl Lua {
         ret_to: usize,
         nres: u8,
         handler: Option<Value>,
+        c_frame: Option<CSpec>,
     ) -> Result<(), VmError> {
+        // Push the synthetic C frame *below* the protected callee: it is the
+        // boundary PUC keeps on the stack while `__close` handlers run during
+        // unwinding, so `debug.getinfo` sees it as the callee's caller.
+        if let Some(spec) = c_frame {
+            let base = th.frames.last().map(|_| scratch_base(th)).unwrap_or(th.top);
+            // A native callee has no Lua frame to carry the protection flag,
+            // so this C frame is itself the boundary for any continuation it
+            // later stages (e.g. `pcall(tostring, v)` calling `__tostring`).
+            let native_boundary = !matches!(th.stack[f_abs], Value::Closure(_));
+            th.frames.push(Frame::C(CFrame {
+                func: spec.func,
+                name: spec.name,
+                namewhat: spec.namewhat,
+                base,
+                pending: Vec::new(),
+                boundary: native_boundary.then_some(CBoundary {
+                    ret_to,
+                    nres,
+                    handler,
+                }),
+            }));
+        }
         let r = self.do_call(
             th,
             fuel,
@@ -1682,10 +4537,8 @@ impl Lua {
                 _ => {
                     let mm = self.metamethod(cur, Mm::Index);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to index a {} value", cur.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
                     }
                     mm
                 }
@@ -1732,10 +4585,8 @@ impl Lua {
                 _ => {
                     let mm = self.metamethod(cur, Mm::NewIndex);
                     if mm == Value::Nil {
-                        return Err(self.rt_err(
-                            th,
-                            format!("attempt to index a {} value", cur.type_name()),
-                        ));
+                        return Err(self
+                            .rt_err(th, format!("attempt to index a {} value", cur.type_name())));
                     }
                     mm
                 }
@@ -1764,13 +4615,21 @@ impl Lua {
     ) -> Result<(), VmError> {
         match op {
             CmpOp::Eq | CmpOp::Ne => {
-                let shape = if op == CmpOp::Eq { RetShape::ToBool } else { RetShape::ToNotBool };
+                let shape = if op == CmpOp::Eq {
+                    RetShape::ToBool
+                } else {
+                    RetShape::ToNotBool
+                };
                 if values_equal(a, b) {
                     th.stack[dst_abs] = Value::Bool(op == CmpOp::Eq);
                     return Ok(());
                 }
-                // __eq fires only for table/table (or userdata) raw-unequal pairs
-                if let (Value::Table(_), Value::Table(_)) = (a, b) {
+                // __eq fires only for table/table or userdata/userdata
+                // raw-unequal pairs.
+                if matches!(
+                    (a, b),
+                    (Value::Table(_), Value::Table(_)) | (Value::Userdata(_), Value::Userdata(_))
+                ) {
                     let mm = self.binary_mm(a, b, Mm::Eq);
                     if mm != Value::Nil {
                         return self.call_value(th, mm, &[a, b], dst_abs, 2, shape, fuel);
@@ -1787,8 +4646,7 @@ impl Lua {
                         Ok(())
                     }
                     None => {
-                        let mm =
-                            self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
+                        let mm = self.binary_mm(a, b, if or_equal { Mm::Le } else { Mm::Lt });
                         if mm == Value::Nil {
                             return Err(self.rt_err(
                                 th,
@@ -1816,22 +4674,49 @@ impl Lua {
         from: u8,
         err: Value,
     ) -> Result<(), VmError> {
-        loop {
-            let f = th.frames.last_mut().unwrap();
-            match f.tbc.last() {
-                Some(&r) if r >= from => {
-                    f.tbc.pop();
-                    let v = th.stack[f.base + r as usize];
-                    let mm = self.metamethod(v, Mm::Close);
-                    if mm == Value::Nil {
-                        continue; // metatable changed since Tbc; skip
-                    }
-                    th.frames.last_mut().unwrap().pending.push(Pending::CloseTbc { from, err });
-                    let scratch = scratch_base(th);
-                    return self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel);
+        let f = th.frames.last_mut().unwrap().as_lua_mut();
+        match f.tbc.last() {
+            Some(&r) if r >= from => {
+                f.tbc.pop();
+                let v = th.stack[f.base + r as usize];
+                let mm = self.metamethod(v, Mm::Close);
+                if mm == Value::Nil {
+                    // PUC reports the missing metamethod at close time.
+                    return Err(self.rt_err(
+                        th,
+                        "attempt to call a nil value (metamethod 'close')".into(),
+                    ));
                 }
-                _ => return Ok(()),
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::CloseTbc { from, err });
+                let scratch = scratch_base(th);
+                let before = th.frames.len();
+                let callable = match mm {
+                    Value::Closure(_) | Value::Native(_) => true,
+                    other => self.metamethod(other, Mm::Call) != Value::Nil,
+                };
+                let r = self.call_value(th, mm, &[v, err], scratch, 1, RetShape::Normal, fuel);
+                if r.is_ok()
+                    && th.frames.len() > before
+                    && let Some(Frame::Lua(lf)) = th.frames.last_mut()
+                {
+                    // PUC resolves this call site (an `OP_CLOSE`) to the
+                    // `close` metamethod, shown by tracebacks.
+                    lf.call_meta = Some(("metamethod", "close"));
+                }
+                if callable {
+                    r
+                } else {
+                    r.map_err(|mut e| {
+                        annotate_metamethod_error(&mut e, "close");
+                        e
+                    })
+                }
             }
+            _ => Ok(()),
         }
     }
 
@@ -1846,7 +4731,7 @@ impl Lua {
         b: u8,
         n: u8,
     ) -> Result<(), VmError> {
-        let base = th.frames.last().unwrap().base;
+        let base = th.frames.last().unwrap().as_lua().base;
         let first = base + b as usize;
         let mut n = n as usize;
         loop {
@@ -1887,10 +4772,17 @@ impl Lua {
             let (ret_abs, pending) = if n - 1 == 1 {
                 (base + dst as usize, None)
             } else {
-                (first + n - 2, Some(Pending::Concat { dst, base: b, n: (n - 1) as u8 }))
+                (
+                    first + n - 2,
+                    Some(Pending::Concat {
+                        dst,
+                        base: b,
+                        n: (n - 1) as u8,
+                    }),
+                )
             };
             if let Some(p) = pending {
-                th.frames.last_mut().unwrap().pending.push(p);
+                th.frames.last_mut().unwrap().pending_mut().push(p);
             }
             return self.call_value(th, mm, &[x, y], ret_abs, 2, RetShape::Normal, fuel);
         }
@@ -1911,57 +4803,76 @@ impl Lua {
     }
 
     fn for_prep(&mut self, th: &mut Thread, a: usize, off: i32) -> Result<(), VmError> {
-        let init = th.stack[a];
-        let limit = th.stack[a + 1];
-        let step = th.stack[a + 2];
-        let num = |me: &Self, v: Value, what: &str| -> Result<Value, VmError> {
-            match v {
-                Value::Int(_) | Value::Float(_) => Ok(v),
-                _ => Err(me.rt_err(th, format!("'for' {what} must be a number"))),
+        // PUC `forprep`: the integer path is taken only when the *control*
+        // and *step* are actual integers; any numeric string (even when
+        // integral) forces the float path.
+        if let (Value::Int(i0), Value::Int(s)) = (th.stack[a], th.stack[a + 2]) {
+            if s == 0 {
+                return Err(self.rt_err(th, "'for' step is zero".into()));
             }
-        };
-        let init = num(self, init, "initial value")?;
-        let limit = num(self, limit, "limit")?;
-        let step = num(self, step, "step")?;
-        match (init, step) {
-            (Value::Int(i0), Value::Int(s)) => {
-                if s == 0 {
-                    return Err(self.rt_err(th, "'for' step is zero".into()));
+            match self.for_limit(th, a + 1, s > 0)? {
+                Some(l) if (s > 0 && i0 <= l) || (s < 0 && i0 >= l) => {
+                    th.stack[a + 1] = Value::Int(l);
+                    th.stack[a + 3] = Value::Int(i0);
                 }
-                let l = match limit {
-                    Value::Int(l) => Some(l),
-                    Value::Float(f) => for_int_limit(f, s > 0),
-                    _ => unreachable!(),
-                };
-                match l {
-                    Some(l) if (s > 0 && i0 <= l) || (s < 0 && i0 >= l) => {
-                        th.stack[a + 1] = Value::Int(l);
-                        th.stack[a + 3] = Value::Int(i0);
-                    }
-                    _ => jump(th, off),
-                }
+                _ => jump(th, off),
             }
-            _ => {
-                let to_f = |v: Value| match v {
-                    Value::Int(i) => i as f64,
-                    Value::Float(f) => f,
-                    _ => unreachable!(),
-                };
-                let (i0, l, s) = (to_f(init), to_f(limit), to_f(step));
-                if s == 0.0 {
-                    return Err(self.rt_err(th, "'for' step is zero".into()));
-                }
-                if (s > 0.0 && i0 <= l) || (s < 0.0 && i0 >= l) {
-                    th.stack[a] = Value::Float(i0);
-                    th.stack[a + 1] = Value::Float(l);
-                    th.stack[a + 2] = Value::Float(s);
-                    th.stack[a + 3] = Value::Float(i0);
-                } else {
-                    jump(th, off);
-                }
+        } else {
+            // PUC checks limit, then step, then initial value.
+            let limit = self.for_number(th, a + 1, "limit")?;
+            let step = self.for_number(th, a + 2, "step")?;
+            let init = self.for_number(th, a, "initial value")?;
+            if step == 0.0 {
+                return Err(self.rt_err(th, "'for' step is zero".into()));
+            }
+            if (step > 0.0 && init <= limit) || (step < 0.0 && init >= limit) {
+                th.stack[a] = Value::Float(init);
+                th.stack[a + 1] = Value::Float(limit);
+                th.stack[a + 2] = Value::Float(step);
+                th.stack[a + 3] = Value::Float(init);
+            } else {
+                jump(th, off);
             }
         }
         Ok(())
+    }
+
+    /// PUC `forprep`'s `tonumber`: numbers pass through and numeric strings
+    /// are parsed, all converted to `lua_Number` (f64). Anything else raises
+    /// `'for' <what> must be a number`.
+    fn for_number(&self, th: &Thread, idx: usize, what: &str) -> Result<f64, VmError> {
+        let n = match th.stack[idx] {
+            Value::Int(i) => Some(i as f64),
+            Value::Float(f) => Some(f),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(Value::Int(i)) => Some(i as f64),
+                Some(Value::Float(f)) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        };
+        n.ok_or_else(|| self.rt_err(th, format!("'for' {what} must be a number")))
+    }
+
+    /// PUC `forlimit`: coerce an integer loop's limit. Numeric strings are
+    /// parsed; a float limit is rounded toward the loop interior (or clamped)
+    /// by `for_int_limit`. `None` means the loop must not run.
+    fn for_limit(
+        &self,
+        th: &Thread,
+        idx: usize,
+        step_positive: bool,
+    ) -> Result<Option<i64>, VmError> {
+        match th.stack[idx] {
+            Value::Int(l) => Ok(Some(l)),
+            Value::Float(f) => Ok(for_int_limit(f, step_positive)),
+            Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
+                Some(Value::Int(l)) => Ok(Some(l)),
+                Some(Value::Float(f)) => Ok(for_int_limit(f, step_positive)),
+                _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+            },
+            _ => Err(self.rt_err(th, "'for' limit must be a number".into())),
+        }
     }
 
     fn unary(
@@ -1980,22 +4891,34 @@ impl Lua {
                 Value::Str(s) => match crate::stdlib::parse_number(self.strings.get(s)) {
                     Some(Value::Int(i)) => (Some(Value::Int(i.wrapping_neg())), None),
                     Some(Value::Float(f)) => (Some(Value::Float(-f)), None),
-                    _ => (None, Some((Mm::Unm, format!(
-                        "attempt to perform arithmetic on a {} value",
-                        v.type_name()
-                    )))),
+                    _ => (
+                        None,
+                        Some((
+                            Mm::Unm,
+                            format!("attempt to perform arithmetic on a {} value", v.type_name()),
+                        )),
+                    ),
                 },
-                _ => (None, Some((Mm::Unm, format!(
-                    "attempt to perform arithmetic on a {} value",
-                    v.type_name()
-                )))),
+                _ => (
+                    None,
+                    Some((
+                        Mm::Unm,
+                        format!("attempt to perform arithmetic on a {} value", v.type_name()),
+                    )),
+                ),
             },
             UnaryOp::BNot => match to_int(v) {
                 Some(i) => (Some(Value::Int(!i)), None),
-                None => (None, Some((Mm::BNot, format!(
-                    "attempt to perform bitwise operation on a {} value",
-                    v.type_name()
-                )))),
+                None => (
+                    None,
+                    Some((
+                        Mm::BNot,
+                        format!(
+                            "attempt to perform bitwise operation on a {} value",
+                            v.type_name()
+                        ),
+                    )),
+                ),
             },
             UnaryOp::Len => match v {
                 Value::Str(s) => (Some(Value::Int(self.strings.get(s).len() as i64)), None),
@@ -2004,14 +4927,20 @@ impl Lua {
                     if mm == Value::Nil {
                         (Some(Value::Int(self.tables[t.0 as usize].length())), None)
                     } else {
-                        self.call_value(th, mm, &[v], dst_abs, 2, RetShape::Normal, fuel)?;
+                        // PUC calls unary metamethods with the operand twice
+                        // (`luaT_callTMres`), and `events.lua` observes the
+                        // argument list __len is invoked with.
+                        self.call_value(th, mm, &[v, v], dst_abs, 2, RetShape::Normal, fuel)?;
                         return Ok(());
                     }
                 }
-                _ => (None, Some((Mm::Len, format!(
-                    "attempt to get length of a {} value",
-                    v.type_name()
-                )))),
+                _ => (
+                    None,
+                    Some((
+                        Mm::Len,
+                        format!("attempt to get length of a {} value", v.type_name()),
+                    )),
+                ),
             },
         };
         if let Some(r) = result {
@@ -2033,15 +4962,21 @@ impl Lua {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => Some(if or_equal { x <= y } else { x < y }),
             (Value::Float(x), Value::Float(y)) => Some(if or_equal { x <= y } else { x < y }),
-            (Value::Int(x), Value::Float(y)) => {
-                Some(if or_equal { int_le_float(x, y) } else { int_lt_float(x, y) })
-            }
+            (Value::Int(x), Value::Float(y)) => Some(if or_equal {
+                int_le_float(x, y)
+            } else {
+                int_lt_float(x, y)
+            }),
             (Value::Float(x), Value::Int(y)) => {
                 if x.is_nan() {
                     return Some(false);
                 }
                 // x < y  <=>  not (y <= x);  x <= y  <=>  not (y < x)
-                Some(if or_equal { !int_lt_float(y, x) } else { !int_le_float(y, x) })
+                Some(if or_equal {
+                    !int_lt_float(y, x)
+                } else {
+                    !int_le_float(y, x)
+                })
             }
             (Value::Str(x), Value::Str(y)) => {
                 let (xs, ys) = (self.strings.get(x), self.strings.get(y));
@@ -2052,7 +4987,7 @@ impl Lua {
     }
 
     fn frame_upval(&self, th: &Thread, up: u8) -> UpvalId {
-        let cur = th.frames.last().unwrap().closure;
+        let cur = th.frames.last().unwrap().as_lua().closure;
         self.closures[cur.0 as usize].upvals[up as usize]
     }
 
@@ -2104,8 +5039,17 @@ impl Lua {
     }
 
     fn rt_err(&self, th: &Thread, message: String) -> VmError {
-        let source = th.frames.last().map(|f| f.proto.source.clone());
-        VmError { val: ErrVal::Msg(message), line: line_of(th), source }
+        let source = th
+            .frames
+            .last()
+            .and_then(|f| f.lua())
+            .map(|f| f.proto.source.clone());
+        VmError {
+            val: ErrVal::Msg(message),
+            line: line_of(th),
+            root_line: 0,
+            source,
+        }
     }
 
     // ---- garbage collection ----
@@ -2131,6 +5075,56 @@ impl Lua {
         self.memory_used()
     }
 
+    /// Runs queued `__gc` handlers, one per call, as protected calls so that
+    /// an erroring finalizer cannot escape into the running program. Returns
+    /// after setting up one handler call (the dispatch loop invokes us again
+    /// once it returns). `__gc` handlers execute on the running thread, which
+    /// matches PUC's "called from a C function" context.
+    fn service_finalizers(
+        &mut self,
+        tid: ThreadId,
+        th: &mut Thread,
+        fuel: &mut i64,
+    ) -> Result<(), VmError> {
+        if let Some(depth) = self.finalizer_depth {
+            if th.frames.len() < depth || self.current_thread != tid {
+                self.finalizer_depth = None;
+            } else {
+                return Ok(());
+            }
+        }
+        if th.frames.is_empty() {
+            return Ok(());
+        }
+        while let Some(v) = self.pending_finalizers.pop() {
+            let mm = self.raw_metafield(v, "__gc");
+            if mm == Value::Nil {
+                continue;
+            }
+            let scratch = scratch_base(th);
+            ensure_len(&mut th.stack, scratch + 2);
+            th.stack[scratch] = mm;
+            th.stack[scratch + 1] = v;
+            let discard = scratch + 2;
+            ensure_len(&mut th.stack, discard + 2);
+            let frames_before = th.frames.len();
+            self.protected_call(th, fuel, scratch, 1, discard, 0, None, None)?;
+            // A Lua-closure handler pushes a frame that is still running when
+            // `protected_call` returns, so hold the depth guard until it
+            // unwinds. A native handler (e.g. the file `__gc`) runs to
+            // completion inside `protected_call` and leaves no frame; keeping
+            // the guard set in that case would stall the driver forever and
+            // leave `pending_finalizers` permanently rooted.
+            self.finalizer_depth = if th.frames.len() > frames_before {
+                Some(th.frames.len())
+            } else {
+                None
+            };
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Approximate live heap footprint in bytes.
     pub fn memory_used(&self) -> usize {
         let mut total = self.strings.bytes() + self.strings.live_count() * 40;
@@ -2144,7 +5138,10 @@ impl Lua {
                 total += 128
                     + th.stack.capacity() * 16
                     + th.frames.len() * 192
-                    + th.frames.iter().map(|f| f.varargs.len() * 16).sum::<usize>();
+                    + th.frames
+                        .iter()
+                        .map(|f| f.lua().map_or(0, |l| l.varargs.len() * 16))
+                        .sum::<usize>();
             }
         }
         for (i, c) in self.closures.iter().enumerate() {
@@ -2154,6 +5151,11 @@ impl Lua {
         }
         total += self.upvals.len() * 24;
         total += self.natives.len() * 56;
+        for (i, u) in self.userdata.iter().enumerate() {
+            if self.userdata_live.get(i).copied().unwrap_or(true) {
+                total += 64 + u.read_buf.capacity();
+            }
+        }
         total
     }
 
@@ -2161,11 +5163,12 @@ impl Lua {
     /// `th` is the running thread (moved out of the arena), which must be
     /// traced as an extra root. Enforces the memory ceiling.
     fn maybe_gc(&mut self, tid: ThreadId, th: &Thread) -> Result<(), VmError> {
-        let due = self.gc_alloc_threshold != 0
+        let due = self.gc_running
+            && self.gc_alloc_threshold != 0
             && (self.allocs_since_gc >= self.gc_alloc_threshold
                 || self.strings.bytes() > self.str_bytes_at_gc + (8 << 20));
         if due {
-            self.collect(Some((tid, th)));
+            self.collect(Some((tid, th, 0)));
         }
         if let Some(limit) = self.memory_limit {
             // only re-measured at collection points; cheap proxy otherwise
@@ -2176,43 +5179,304 @@ impl Lua {
         Ok(())
     }
 
-    fn collect(&mut self, extra: Option<(ThreadId, &Thread)>) {
+    /// Implements `collectgarbage([opt [, arg]])`. See `n_collectgarbage`'s
+    /// PUC-compatible option set; because the collector is a stop-the-world
+    /// mark-sweep, "collect"/"step" run a full collection (with the running
+    /// thread as an extra root).
+    fn gc_command(
+        &mut self,
+        th: &Thread,
+        opt: Value,
+        arg1: Option<Value>,
+        call_top: usize,
+    ) -> Result<Vec<Value>, String> {
+        let opt = match opt {
+            Value::Str(s) => self.strings.get(s).to_vec(),
+            Value::Nil => b"collect".to_vec(),
+            // PUC's `luaL_checkoption` coerces numbers to strings before
+            // matching, so `collectgarbage(5)` reports an invalid option
+            // rather than a type error.
+            Value::Int(_) | Value::Float(_) => self.display_value(opt).into_bytes(),
+            v => {
+                return Err(format!(
+                    "bad argument #1 to 'collectgarbage' (string expected, got {})",
+                    v.type_name()
+                ));
+            }
+        };
+        // PUC marks its GC state "running a collection" for the whole cycle,
+        // including `__gc` handlers, and `lua_gc` reports every option as
+        // invalid (-1) there; `luaB_collectgarbage` then returns a single nil
+        // instead of the option's result. Option #1 was already validated
+        // above; option #2 for the numeric options is coerced before `lua_gc`
+        // sees the reentrancy, so mirror that too.
+        let opt = String::from_utf8_lossy(&opt).into_owned();
+        let int_arg = |v: Option<Value>| -> Result<i64, String> {
+            match v {
+                None | Some(Value::Nil) => Ok(0),
+                Some(Value::Int(i)) => Ok(i),
+                Some(Value::Float(f)) => Ok(f as i64),
+                Some(v) => Err(format!(
+                    "bad argument #2 to 'collectgarbage' (number expected, got {})",
+                    v.type_name()
+                )),
+            }
+        };
+        if self.finalizer_depth.is_some() {
+            if matches!(opt.as_str(), "step" | "setpause" | "setstepmul") {
+                let _ = int_arg(arg1)?;
+            }
+            return Ok(vec![Value::Nil]);
+        }
+        let collect_now = |me: &mut Self| me.collect(Some((me.current_thread, th, call_top)));
+        match opt.as_str() {
+            "collect" => {
+                collect_now(self);
+                Ok(vec![Value::Int(0)])
+            }
+            "step" => {
+                // The collector is a stop-the-world mark-sweep with no
+                // resumable phases, so one "step" is a bounded full
+                // collection: a cycle always completes, and PUC's contract
+                // ("true if the step finished a collection cycle") is
+                // therefore always satisfied. `n` is validated like PUC but
+                // cannot select a partial amount of work; see DESIGN.md.
+                let _ = int_arg(arg1)?;
+                collect_now(self);
+                Ok(vec![Value::Bool(true)])
+            }
+            "stop" => {
+                self.gc_running = false;
+                Ok(vec![Value::Int(0)])
+            }
+            "restart" => {
+                self.gc_running = true;
+                Ok(vec![Value::Int(0)])
+            }
+            "count" => Ok(vec![Value::Float(self.memory_used() as f64 / 1024.0)]),
+            "isrunning" => Ok(vec![Value::Bool(self.gc_running)]),
+            "incremental" => {
+                let prev = self.gc_mode == 0;
+                self.gc_mode = 0;
+                Ok(vec![self.new_string(if prev {
+                    b"incremental"
+                } else {
+                    b"generational"
+                })])
+            }
+            "generational" => {
+                let prev = self.gc_mode == 1;
+                self.gc_mode = 1;
+                Ok(vec![self.new_string(if prev {
+                    b"generational"
+                } else {
+                    b"incremental"
+                })])
+            }
+            "setpause" => {
+                let v = int_arg(arg1)?;
+                let prev = self.gc_pause;
+                self.gc_pause = v;
+                Ok(vec![Value::Int(prev)])
+            }
+            "setstepmul" => {
+                let v = int_arg(arg1)?;
+                let prev = self.gc_stepmul;
+                self.gc_stepmul = v;
+                Ok(vec![Value::Int(prev)])
+            }
+            other => Err(format!(
+                "bad argument #1 to 'collectgarbage' (invalid option '{other}')"
+            )),
+        }
+    }
+
+    fn collect(&mut self, extra: Option<(ThreadId, &Thread, usize)>) {
+        let table_count = self.tables.len();
         let mut m = Marks {
             strings: vec![false; self.strings.len()],
-            tables: vec![false; self.tables.len()],
+            tables: vec![false; table_count],
             closures: vec![false; self.closures.len()],
             natives: vec![false; self.natives.len()],
             upvals: vec![false; self.upvals.len()],
             threads: vec![false; self.threads.len()],
+            userdata: vec![false; self.userdata.len()],
         };
+        let weak = self.weak_kinds(table_count);
+        let gc_name = self.strings.lookup(b"__gc");
         let mut work: Vec<Value> = Vec::with_capacity(64);
+        let mut ephemerons: Vec<usize> = Vec::new();
         // roots
         work.push(Value::Table(self.globals));
-        work.push(self.builtin_next);
-        work.push(self.builtin_ipairs_iter);
         if let Some(sm) = self.string_meta {
             work.push(Value::Table(sm));
         }
+        for mt in self.type_metas.iter().flatten() {
+            work.push(Value::Table(*mt));
+        }
+        if let Some(mt) = self.file_meta {
+            work.push(Value::Table(mt));
+        }
+        if let Some(u) = self.io_input {
+            work.push(Value::Userdata(u));
+        }
+        if let Some(u) = self.io_output {
+            work.push(Value::Userdata(u));
+        }
         work.extend_from_slice(&self.anchors);
+        work.extend_from_slice(&self.pending_finalizers);
+        if let Some(job) = &self.close_job {
+            work.push(Value::Thread(job.target));
+            work.extend_from_slice(&job.items);
+            work.push(job.err);
+        }
+        if let Some(job) = &self.print_job {
+            work.extend_from_slice(&job.items);
+        }
+        if let Some(job) = &self.format_job {
+            work.extend_from_slice(&job.args);
+            if let Some((_, v, _)) = &job.saved {
+                work.push(*v);
+            }
+        }
         for (&root, &cur) in &self.exec_roots {
             work.push(Value::Thread(ThreadId(root)));
             work.push(Value::Thread(ThreadId(cur)));
         }
-        if let Some((etid, eth)) = extra {
+        if let Some((etid, eth, extra_top)) = extra {
             m.threads[etid.0 as usize] = true;
-            Self::trace_thread(eth, &mut m, &mut work, &self.upvals);
+            Self::trace_thread(eth, extra_top, &mut m, &mut work, &self.upvals);
         }
+        self.mark_loop(&mut m, &mut work, &weak, &mut ephemerons);
+        self.ephemeron_fixpoint(&mut m, &mut work, &weak, &mut ephemerons);
+        // Finalization: resurrect unreachable objects carrying a `__gc`,
+        // keeping them (and everything they reach) alive for one more cycle
+        // while the handler is queued. Repeat until nothing new surfaces.
+        if let Some(gc_name) = gc_name {
+            loop {
+                let mut found = false;
+                for i in 0..table_count {
+                    if !self.tables_live[i] || m.tables[i] || self.tables[i].finalized {
+                        continue;
+                    }
+                    let has_gc = match self.tables[i].metatable {
+                        Some(mt) => {
+                            self.tables[mt.0 as usize].get(Value::Str(gc_name)) != Value::Nil
+                        }
+                        None => false,
+                    };
+                    if has_gc {
+                        // Do NOT pre-mark here: `mark_loop` must see the
+                        // table unmarked so it also traces its metatable
+                        // (which holds `__gc`) and its whole reachable graph.
+                        self.tables[i].finalized = true;
+                        work.push(Value::Table(TableId(i as u32)));
+                        self.pending_finalizers
+                            .push(Value::Table(TableId(i as u32)));
+                        found = true;
+                    }
+                }
+                // Userdata carrying `__gc` finalize the same way.
+                for i in 0..self.userdata.len() {
+                    if !self.userdata_live[i] || m.userdata[i] || self.userdata[i].finalized {
+                        continue;
+                    }
+                    let has_gc = match self.userdata[i].metatable {
+                        Some(mt) => {
+                            self.tables[mt.0 as usize].get(Value::Str(gc_name)) != Value::Nil
+                        }
+                        None => false,
+                    };
+                    if has_gc {
+                        self.userdata[i].finalized = true;
+                        let v = Value::Userdata(UserdataId(i as u32));
+                        work.push(v);
+                        self.pending_finalizers.push(v);
+                        found = true;
+                    }
+                }
+                if !found {
+                    break;
+                }
+                self.mark_loop(&mut m, &mut work, &weak, &mut ephemerons);
+                self.ephemeron_fixpoint(&mut m, &mut work, &weak, &mut ephemerons);
+            }
+        }
+        self.clear_weak(&mut m, &weak);
+        self.sweep(&m);
+        self.allocs_since_gc = 0;
+        self.str_bytes_at_gc = self.strings.bytes();
+    }
+
+    /// Weakness of every table index, derived from each metatable's `__mode`.
+    fn weak_kinds(&self, table_count: usize) -> Vec<WeakKind> {
+        let mut weak = vec![WeakKind::Strong; table_count];
+        let Some(mode_key) = self.strings.lookup(b"__mode") else {
+            return weak;
+        };
+        for (i, w) in weak.iter_mut().enumerate() {
+            if !self.tables_live.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(mt) = self.tables[i].metatable else {
+                continue;
+            };
+            let Value::Str(mode) = self.tables[mt.0 as usize].get(Value::Str(mode_key)) else {
+                continue;
+            };
+            let bytes = self.strings.get(mode);
+            let k = bytes.contains(&b'k');
+            let v = bytes.contains(&b'v');
+            *w = match (k, v) {
+                (true, true) => WeakKind::Both,
+                (true, false) => WeakKind::Keys,
+                (false, true) => WeakKind::Values,
+                (false, false) => WeakKind::Strong,
+            };
+        }
+        weak
+    }
+
+    /// Drains the mark worklist, honouring weak tables: strong tables are
+    /// traced fully, weak-value tables trace only their keys, weak-key tables
+    /// become ephemerons, weak-both trace nothing here.
+    fn mark_loop(
+        &self,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        weak: &[WeakKind],
+        ephemerons: &mut Vec<usize>,
+    ) {
         while let Some(v) = work.pop() {
             match v {
-                Value::Str(s) => m.strings[s.0 as usize] = true,
+                Value::Str(s) => {
+                    if let Some(slot) = m.strings.get_mut(s.obj.0 as usize) {
+                        *slot = true;
+                    }
+                    if let Some(slot) = m.strings.get_mut(s.content.0 as usize) {
+                        *slot = true;
+                    }
+                }
                 Value::Table(t) => {
                     let i = t.0 as usize;
-                    if !m.tables[i] {
-                        m.tables[i] = true;
-                        self.tables[i].trace(|v| work.push(v));
-                        if let Some(mt) = self.tables[i].metatable {
-                            work.push(Value::Table(mt));
+                    if m.tables[i] {
+                        continue;
+                    }
+                    m.tables[i] = true;
+                    if let Some(mt) = self.tables[i].metatable {
+                        work.push(Value::Table(mt));
+                    }
+                    match weak[i] {
+                        WeakKind::Strong => {
+                            self.tables[i].trace(|v| work.push(v));
                         }
+                        WeakKind::Values => {
+                            for (k, _) in self.tables[i].entries() {
+                                work.push(k);
+                            }
+                        }
+                        WeakKind::Keys => ephemerons.push(i),
+                        WeakKind::Both => {}
                     }
                 }
                 Value::Closure(c) => {
@@ -2220,7 +5484,7 @@ impl Lua {
                     if !m.closures[i] {
                         m.closures[i] = true;
                         for &uid in &self.closures[i].upvals {
-                            mark_upval(uid, &mut m, &mut work, &self.upvals);
+                            mark_upval(uid, m, work, &self.upvals);
                         }
                     }
                 }
@@ -2239,48 +5503,182 @@ impl Lua {
                     let i = t.0 as usize;
                     if !m.threads[i] {
                         m.threads[i] = true;
-                        Self::trace_thread(&self.threads[i], &mut m, &mut work, &self.upvals);
+                        Self::trace_thread(&self.threads[i], 0, m, work, &self.upvals);
+                    }
+                }
+                Value::Userdata(u) => {
+                    let i = u.0 as usize;
+                    if !m.userdata[i] {
+                        m.userdata[i] = true;
+                        if let Some(mt) = self.userdata[i].metatable {
+                            work.push(Value::Table(mt));
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        self.sweep(&m);
-        self.allocs_since_gc = 0;
-        self.str_bytes_at_gc = self.strings.bytes();
     }
 
-    fn trace_thread(th: &Thread, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
-        for &v in &th.stack {
-            work.push(v);
-        }
-        for f in &th.frames {
-            work.push(Value::Closure(f.closure));
-            if let Some(h) = f.handler {
-                work.push(h);
-            }
-            for &v in &f.varargs {
-                work.push(v);
-            }
-            for p in &f.pending {
-                match *p {
-                    Pending::CallClose { v, err } => {
-                        work.push(v);
-                        work.push(err);
+    /// Ephemeron fixpoint: for weak-key/strong-value tables a value is only
+    /// reachable through its key, so iterate until no new value is marked.
+    fn ephemeron_fixpoint(
+        &self,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        weak: &[WeakKind],
+        ephemerons: &mut Vec<usize>,
+    ) {
+        loop {
+            let mut changed = false;
+            let mut i = 0;
+            while i < ephemerons.len() {
+                let ti = ephemerons[i];
+                for (k, v) in self.tables[ti].entries() {
+                    if !self.value_marked(m, k) {
+                        continue;
                     }
-                    Pending::DeliverError { err, handler, .. } => {
-                        work.push(err);
-                        if let Some(h) = handler {
+                    if !self.value_marked(m, v) {
+                        work.push(v);
+                        changed = true;
+                    }
+                }
+                i += 1;
+            }
+            if !changed {
+                break;
+            }
+            self.mark_loop(m, work, weak, ephemerons);
+        }
+    }
+
+    /// True when `v` is alive for weak-reference purposes: non-collectable
+    /// values and strings always are (PUC never collects a string through a
+    /// weak table); everything else must be marked.
+    fn value_marked(&self, m: &Marks, v: Value) -> bool {
+        match v {
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
+            Value::Table(t) => m.tables[t.0 as usize],
+            Value::Closure(c) => m.closures[c.0 as usize],
+            Value::Native(n) => m.natives[n.0 as usize],
+            Value::Thread(t) => m.threads[t.0 as usize],
+            Value::Userdata(u) => m.userdata[u.0 as usize],
+        }
+    }
+
+    fn weak_dead(&self, m: &Marks, v: Value) -> bool {
+        matches!(
+            v,
+            Value::Table(_)
+                | Value::Closure(_)
+                | Value::Native(_)
+                | Value::Thread(_)
+                | Value::Userdata(_)
+        ) && !self.value_marked(m, v)
+    }
+
+    /// Removes entries whose weak component died, and marks string keys/values
+    /// of surviving entries so they are not swept while still referenced.
+    fn clear_weak(&mut self, m: &mut Marks, weak: &[WeakKind]) {
+        for (i, &kind) in weak.iter().enumerate().take(self.tables.len()) {
+            if kind == WeakKind::Strong || !m.tables[i] {
+                continue;
+            }
+            let keys_weak = matches!(kind, WeakKind::Keys | WeakKind::Both);
+            let values_weak = matches!(kind, WeakKind::Values | WeakKind::Both);
+            for (k, v) in self.tables[i].entries() {
+                let key_dead = keys_weak && self.weak_dead(m, k);
+                let val_dead = values_weak && self.weak_dead(m, v);
+                if key_dead || val_dead {
+                    self.tables[i].remove(k);
+                } else {
+                    if let Value::Str(s) = k {
+                        m.strings[s.obj.0 as usize] = true;
+                        m.strings[s.content.0 as usize] = true;
+                    }
+                    if let Value::Str(s) = v {
+                        m.strings[s.obj.0 as usize] = true;
+                        m.strings[s.content.0 as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn trace_thread(
+        th: &Thread,
+        extra_top: usize,
+        m: &mut Marks,
+        work: &mut Vec<Value>,
+        upvals: &[Upval],
+    ) {
+        let stack_len = th.stack.len();
+        if th.frames.is_empty() {
+            // e.g. a created-but-never-resumed coroutine: the body lives at
+            // stack[0] with no frame to bound the window, and a finished
+            // coroutine may leave results behind.
+            let top = th.top.max(extra_top).min(stack_len);
+            work.extend_from_slice(&th.stack[..top]);
+        } else {
+            // Mark each frame's live register window only. Slots above the
+            // current instruction's extent are dead temporaries, and gaps left
+            // by popped/tail-replaced frames stay unmarked.
+            for f in &th.frames {
+                match f {
+                    Frame::Lua(lf) => {
+                        let end = (lf.base + frame_reg_extent(lf)).min(stack_len);
+                        if lf.base < end {
+                            work.extend_from_slice(&th.stack[lf.base..end]);
+                        }
+                        work.push(Value::Closure(lf.closure));
+                        if let Some(h) = lf.handler {
                             work.push(h);
                         }
+                        for &v in &lf.varargs {
+                            work.push(v);
+                        }
+                        mark_pending(&lf.pending, th, work, stack_len);
                     }
-                    Pending::CloseTbc { err, .. } => work.push(err),
-                    Pending::Concat { .. } | Pending::FinishReturn { .. } => {}
+                    Frame::C(cf) => {
+                        work.push(cf.func);
+                        if let Some(b) = &cf.boundary
+                            && let Some(h) = b.handler
+                        {
+                            work.push(h);
+                        }
+                        mark_pending(&cf.pending, th, work, stack_len);
+                    }
+                }
+            }
+            // A native/intrinsic call that triggered the collection may hold
+            // open multret arguments above the top frame's window.
+            if extra_top > 0 {
+                let start = th
+                    .frames
+                    .last()
+                    .and_then(|f| f.lua())
+                    .map(|f| f.base)
+                    .unwrap_or(0);
+                let end = extra_top.min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
                 }
             }
         }
         for &(_, uid) in &th.open_upvals {
             mark_upval(uid, m, work, upvals);
+        }
+        if let Some(e) = th.close_error {
+            work.push(e);
+        }
+        if let Some(h) = th.hook {
+            work.push(h);
+        }
+        if let Some(job) = &th.yield_job {
+            work.push(job.func);
+            for &v in &job.args {
+                work.push(v);
+            }
         }
         if let Some(p) = th.parent {
             work.push(Value::Thread(p));
@@ -2297,7 +5695,11 @@ impl Lua {
             let ou = std::mem::take(&mut self.threads[i].open_upvals);
             for (idx, uid) in ou {
                 if m.upvals[uid.0 as usize] {
-                    let v = self.threads[i].stack.get(idx).copied().unwrap_or(Value::Nil);
+                    let v = self.threads[i]
+                        .stack
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(Value::Nil);
                     self.upvals[uid.0 as usize] = Upval::Closed(v);
                 }
             }
@@ -2313,8 +5715,10 @@ impl Lua {
             if !m.closures[i] && self.closures_live[i] {
                 self.closures_live[i] = false;
                 self.closures_free.push(i as u32);
-                self.closures[i] =
-                    LuaClosure { proto: self.empty_proto.clone(), upvals: Vec::new() };
+                self.closures[i] = LuaClosure {
+                    proto: self.empty_proto.clone(),
+                    upvals: Vec::new(),
+                };
             }
         }
         for i in 0..self.upvals.len() {
@@ -2335,7 +5739,24 @@ impl Lua {
             if !m.natives[i] && self.natives_live[i] {
                 self.natives_live[i] = false;
                 self.natives_free.push(i as u32);
-                self.natives[i] = Native { name: String::new(), kind: NativeKind::Plain(n_dead) };
+                self.natives[i] = Native {
+                    name: String::new(),
+                    kind: NativeKind::Plain(n_dead),
+                };
+            }
+        }
+        // Dead userdata: release any host resource it still owns.
+        for i in 0..self.userdata.len() {
+            if !m.userdata[i] && self.userdata_live[i] {
+                let ud = std::mem::take(&mut self.userdata[i]);
+                self.userdata_live[i] = false;
+                self.userdata_free.push(i as u32);
+                if !ud.closed
+                    && let HostObject::File(h) = ud.object
+                    && let Some(host) = self.host.as_mut()
+                {
+                    let _ = host.close(h);
+                }
             }
         }
         self.strings.sweep(&m.strings);
@@ -2353,6 +5774,51 @@ struct Marks {
     natives: Vec<bool>,
     upvals: Vec<bool>,
     threads: Vec<bool>,
+    userdata: Vec<bool>,
+}
+
+/// Marks the values reachable only from a frame's staged continuations.
+fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_len: usize) {
+    for p in pending {
+        match *p {
+            Pending::CallClose { v, err } => {
+                work.push(v);
+                work.push(err);
+            }
+            Pending::DeliverError { err, handler, .. } => {
+                work.push(err);
+                if let Some(h) = handler {
+                    work.push(h);
+                }
+            }
+            Pending::CloseTbc { err, .. } => work.push(err),
+            Pending::Reraise { err } => work.push(err),
+            // Return values staged above the register window must survive
+            // while their `__close` handlers run.
+            Pending::FinishReturn { start, count } => {
+                let end = (start + count).min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::TailReturn { start } => {
+                let end = th.top.min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::Concat { .. }
+            | Pending::DeliverErrErr { .. }
+            | Pending::CloseStep
+            | Pending::PrintStep
+            | Pending::FinishTostring { .. }
+            | Pending::FormatStep
+            | Pending::UnwindAfterHandler { .. }
+            | Pending::PrependShape { .. }
+            | Pending::ReturnHookFire
+            | Pending::YieldStep => {}
+        }
+    }
 }
 
 fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
@@ -2420,6 +5886,7 @@ impl Execution {
                 message: "execution already finished".into(),
                 value: Value::Nil,
                 line: 0,
+                root_line: 0,
             }));
         }
         let budget = fuel.min(i64::MAX as u64) as i64;
@@ -2464,7 +5931,7 @@ impl Execution {
     /// run next, for debuggers and tracers. `None` once it has finished.
     pub fn current_location(&self, lua: &Lua) -> Option<(String, u32)> {
         let th = lua.threads.get(self.current.0 as usize)?;
-        let f = th.frames.last()?;
+        let f = th.frames.iter().rev().find_map(|f| f.lua())?;
         let line = f.proto.lines.get(f.pc).copied().unwrap_or(0);
         Some((f.proto.source.to_string(), line))
     }
@@ -2472,18 +5939,136 @@ impl Execution {
 
 // ---- free helpers ----
 
+/// A resolved `debug.getinfo` level: the running C function (current thread
+/// level 0), a synthetic C boundary frame, or a Lua frame's snapshot.
+enum LevelFrame {
+    Native,
+    C {
+        func: Value,
+        name: &'static str,
+        namewhat: &'static str,
+    },
+    Lua {
+        proto: Rc<Proto>,
+        pc: usize,
+        closure: ClosId,
+        tailcall: bool,
+        name: Option<(&'static str, Box<str>)>,
+    },
+}
+
+/// PUC's `luaO_chunkid`-style short source name, used by `debug.getinfo` and
+/// `debug.traceback`. `LUA_IDSIZE` is 60.
+fn short_source(src: &str) -> String {
+    const MAX_ID: usize = 60;
+    if let Some(rest) = src.strip_prefix('=') {
+        rest.chars().take(MAX_ID - 1).collect()
+    } else if let Some(rest) = src.strip_prefix('@') {
+        let n = rest.chars().count();
+        if n < MAX_ID {
+            rest.to_string()
+        } else {
+            let tail: String = rest.chars().skip(n - (MAX_ID - 4)).collect();
+            format!("...{tail}")
+        }
+    } else {
+        let first = src.lines().next().unwrap_or("");
+        let max = MAX_ID.saturating_sub(15);
+        let truncated: String = first.chars().take(max).collect();
+        format!("[string \"{truncated}\"]")
+    }
+}
+
+/// Primary destination register of an instruction, if it writes one. Used by
+/// the best-effort `varinfo` naming for "number has no integer
+/// representation" errors.
+fn instr_dst(i: &Instr) -> Option<u8> {
+    match *i {
+        Instr::LoadK { dst, .. }
+        | Instr::LoadNil { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::GetUpval { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetField { dst, .. }
+        | Instr::NewTable { dst }
+        | Instr::Arith { dst, .. }
+        | Instr::Unary { dst, .. }
+        | Instr::Cmp { dst, .. }
+        | Instr::Concat { dst, .. }
+        | Instr::Vararg { dst, .. }
+        | Instr::Closure { dst, .. } => Some(dst),
+        Instr::Call { base, .. } | Instr::TailCall { base, .. } => Some(base),
+        Instr::ForLoop { base, .. } => Some(base + 3),
+        Instr::TForLoop { base, .. } => Some(base + 4),
+        _ => None,
+    }
+}
+
+/// Best-effort PUC `varinfo`: name the register `reg` as it was last written
+/// before `before_pc`, returning e.g. `field 'huge'`. Only constant-key
+/// fields, upvalues, and constants are recognized; locals and dynamic keys
+/// yield `None` (in which case callers keep the plain message).
+fn name_for_register(
+    strings: &Strings,
+    proto: &Proto,
+    before_pc: usize,
+    reg: u8,
+) -> Option<String> {
+    let mut pc = before_pc.min(proto.code.len());
+    while pc > 0 {
+        pc -= 1;
+        let instr = proto.code[pc];
+        match instr {
+            Instr::GetField { dst, k, .. } if dst == reg => {
+                return match proto.consts.get(k as usize) {
+                    Some(Value::Str(s)) => Some(format!("field '{}'", strings.get_str_lossy(*s))),
+                    _ => None,
+                };
+            }
+            Instr::GetUpval { dst, up } if dst == reg => {
+                return proto
+                    .upval_names
+                    .get(up as usize)
+                    .map(|n| format!("upvalue '{n}'"));
+            }
+            Instr::LoadK { dst, .. } if dst == reg => return Some("constant".to_string()),
+            _ => {
+                if instr_dst(&instr) == Some(reg) {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
 fn kval(th: &Thread, k: u16) -> Value {
-    th.frames.last().unwrap().proto.consts[k as usize]
+    th.frames.last().unwrap().as_lua().proto.consts[k as usize]
 }
 
 fn jump(th: &mut Thread, off: i32) {
-    let f = th.frames.last_mut().unwrap();
+    let f = th.frames.last_mut().unwrap().as_lua_mut();
     f.pc = (f.pc as i64 + off as i64) as usize;
 }
 
 fn line_of(th: &Thread) -> u32 {
-    let Some(f) = th.frames.last() else { return 0 };
-    f.proto.lines.get(f.pc.wrapping_sub(1)).copied().unwrap_or(0)
+    // When a synthetic C frame is innermost, report its caller's Lua line.
+    th.frames
+        .iter()
+        .rev()
+        .find_map(|f| f.lua())
+        .map(frame_line)
+        .unwrap_or(0)
+}
+
+/// Source line the frame's next instruction belongs to.
+fn frame_line(f: &LuaFrame) -> u32 {
+    f.proto
+        .lines
+        .get(f.pc.wrapping_sub(1))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn ensure_len(stack: &mut Vec<Value>, len: usize) {
@@ -2492,14 +6077,39 @@ fn ensure_len(stack: &mut Vec<Value>, len: usize) {
     }
 }
 
+/// Live register extent (relative to `f.base`) of the instruction a frame is
+/// currently executing. `pc` points at the *next* instruction, so the live one
+/// is `pc - 1`. Slots at or above the returned extent are dead temporaries and
+/// must not be treated as roots.
+fn frame_reg_extent(f: &LuaFrame) -> usize {
+    if f.pc == 0 {
+        // Frame pushed but not yet executing (or a chunk that has not run
+        // yet): nothing above the declared window can be live.
+        return f.proto.max_regs as usize;
+    }
+    let idx = f.pc - 1;
+    let recorded = f
+        .proto
+        .reg_extent
+        .get(idx)
+        .copied()
+        .unwrap_or(f.proto.max_regs) as usize;
+    // Belt and braces: never drop a register the instruction itself names,
+    // even if a future emit order were to under-report `free_reg`.
+    let named = f.proto.code.get(idx).map_or(0, |i| i.reg_high()) as usize;
+    recorded.max(named)
+}
+
 /// First stack slot safely above all live data of the current frame.
 /// Bounded by the frame's register window (plus any active multret run),
 /// so repeated metamethod calls reuse the same scratch space instead of
 /// growing the stack.
 fn scratch_base(th: &Thread) -> usize {
-    let f = th.frames.last().unwrap();
-    let frame_top = f.base + f.proto.max_regs as usize;
-    frame_top.max(th.top)
+    match th.frames.last().unwrap() {
+        Frame::Lua(f) => (f.base + f.proto.max_regs as usize).max(th.top),
+        // A synthetic C frame keeps the scratch base recorded at push time.
+        Frame::C(c) => c.base.max(th.top),
+    }
 }
 
 fn is_concatable(v: Value) -> bool {
@@ -2544,7 +6154,7 @@ fn place_shaped(th: &mut Thread, ret_to: usize, nres: u8, shape: RetShape, res: 
 
 /// Delivers a returning Lua frame's values (in `stack[start..start+count]`)
 /// to its caller per the frame's shape and expected count.
-fn deliver_return(th: &mut Thread, frame: &Frame, start: usize, count: usize) {
+fn deliver_return(th: &mut Thread, frame: &LuaFrame, start: usize, count: usize) {
     let ret_to = frame.ret_to;
     match frame.shape {
         RetShape::Normal => {
@@ -2556,14 +6166,25 @@ fn deliver_return(th: &mut Thread, frame: &Frame, start: usize, count: usize) {
                 let want = (frame.nres - 1) as usize;
                 ensure_len(&mut th.stack, ret_to + want);
                 for i in 0..want {
-                    th.stack[ret_to + i] =
-                        if i < count { th.stack[start + i] } else { Value::Nil };
+                    th.stack[ret_to + i] = if i < count {
+                        th.stack[start + i]
+                    } else {
+                        Value::Nil
+                    };
                 }
             }
         }
         RetShape::ToBool | RetShape::ToNotBool => {
-            let v = if count > 0 { th.stack[start] } else { Value::Nil };
-            let b = if frame.shape == RetShape::ToBool { v.truthy() } else { !v.truthy() };
+            let v = if count > 0 {
+                th.stack[start]
+            } else {
+                Value::Nil
+            };
+            let b = if frame.shape == RetShape::ToBool {
+                v.truthy()
+            } else {
+                !v.truthy()
+            };
             place_results(th, ret_to, frame.nres, &[Value::Bool(b)]);
         }
         RetShape::PrependTrue | RetShape::PrependFalse => {
@@ -2684,12 +6305,13 @@ fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
 
 fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
     use ArithOp::*;
-    let num_err = |v: Value| {
-        format!("attempt to perform arithmetic on a {} value", v.type_name())
-    };
+    let num_err = |v: Value| format!("attempt to perform arithmetic on a {} value", v.type_name());
     let int_err = |v: Value| match v {
         Value::Float(_) => "number has no integer representation".to_string(),
-        _ => format!("attempt to perform bitwise operation on a {} value", v.type_name()),
+        _ => format!(
+            "attempt to perform bitwise operation on a {} value",
+            v.type_name()
+        ),
     };
     let na = to_arith_number(strings, a);
     let nb = to_arith_number(strings, b);
@@ -2728,10 +6350,14 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
         IDiv => match (na, nb) {
             (Some(Value::Int(x)), Some(Value::Int(y))) => {
                 if y == 0 {
-                    return Err("attempt to perform 'n//0'".into());
+                    return Err("attempt to divide by zero".into());
                 }
                 let q = x.wrapping_div(y);
-                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) { q - 1 } else { q };
+                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) {
+                    q - 1
+                } else {
+                    q
+                };
                 Ok(Value::Int(q))
             }
             _ => {
@@ -2746,13 +6372,21 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
                     return Err("attempt to perform 'n%0'".into());
                 }
                 let r = x.wrapping_rem(y);
-                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) { r + y } else { r }))
+                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) {
+                    r + y
+                } else {
+                    r
+                }))
             }
             _ => {
                 let x = as_float(na, a)?;
                 let y = as_float(nb, b)?;
                 let r = x % y;
-                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }))
+                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                    r + y
+                } else {
+                    r
+                }))
             }
         },
         BAnd | BOr | BXor => {
@@ -2770,7 +6404,11 @@ fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, St
             let y = to_int(b).ok_or_else(|| int_err(b))?;
             // Lua shifts are logical; a negative count shifts the other way,
             // and counts >= 64 produce zero
-            let n = if op == Shr { y.checked_neg().unwrap_or(i64::MAX) } else { y };
+            let n = if op == Shr {
+                y.checked_neg().unwrap_or(i64::MAX)
+            } else {
+                y
+            };
             Ok(Value::Int(shift_left_logical(x, n)))
         }
     }

@@ -1,7 +1,11 @@
-//! The `table` library. `table.sort` lives in the Lua prelude (its
-//! comparator is a Lua callback).
+//! The `table` library. `table.sort`, `table.move`, `table.insert` and the
+//! metamethod-aware wrappers around `remove`/`concat`/`unpack` live in the
+//! Lua prelude (they need to call back into Lua or honor metamethods).
+//!
+//! The natives installed here for `concat`/`unpack`/`remove` are the raw
+//! fast paths the prelude delegates to when the table has no metatable.
 
-use crate::value::{fmt_number, Value};
+use crate::value::{Value, fmt_number};
 use crate::vm::Lua;
 
 use super::{arg, check_table, set_field};
@@ -21,7 +25,9 @@ pub fn install(lua: &mut Lua) {
 }
 
 fn table_id(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<u32, String> {
-    let Value::Table(id) = check_table(lua, args, i, who)? else { unreachable!() };
+    let Value::Table(id) = check_table(lua, args, i, who)? else {
+        unreachable!()
+    };
     Ok(id.0)
 }
 
@@ -29,9 +35,14 @@ fn opt_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
     match arg(args, i) {
         Value::Nil => Ok(None),
         Value::Int(n) => Ok(Some(n)),
-        Value::Float(f) => crate::value::float_to_exact_int(f).map(Some).ok_or_else(|| {
-            format!("bad argument #{} to '{who}' (number has no integer representation)", i + 1)
-        }),
+        Value::Float(f) => crate::value::float_to_exact_int(f)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "bad argument #{} to '{who}' (number has no integer representation)",
+                    i + 1
+                )
+            }),
         v => Err(format!(
             "bad argument #{} to '{who}' (number expected, got {})",
             i + 1,
@@ -42,26 +53,23 @@ fn opt_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
 
 fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_id(lua, args, 0, "remove")? as usize;
-    let len = lua.tables[t].length();
-    let pos = opt_int(args, 1, "remove")?.unwrap_or(len);
-    if len == 0 && args.len() < 2 {
-        return Ok(vec![Value::Nil]);
-    }
-    if len + 1 == pos {
-        // removing the (empty) slot just past the border is allowed
-        let v = lua.tables[t].get(Value::Int(pos));
-        lua.tables[t].set(Value::Int(pos), Value::Nil).map_err(|e| e.to_string())?;
-        return Ok(vec![v]);
-    }
-    if pos < 1 || pos > len {
+    let size = lua.tables[t].length();
+    let mut pos = opt_int(args, 1, "remove")?.unwrap_or(size);
+    // PUC: when `pos ~= size`, require (unsigned)pos - 1 <= (unsigned)size.
+    if pos != size && (pos as u64).wrapping_sub(1) > size as u64 {
         return Err("bad argument #2 to 'remove' (position out of bounds)".into());
     }
     let removed = lua.tables[t].get(Value::Int(pos));
-    for i in pos..len {
-        let v = lua.tables[t].get(Value::Int(i + 1));
-        lua.tables[t].set(Value::Int(i), v).map_err(|e| e.to_string())?;
+    while pos < size {
+        let v = lua.tables[t].get(Value::Int(pos + 1));
+        lua.tables[t]
+            .set(Value::Int(pos), v)
+            .map_err(|e| e.to_string())?;
+        pos += 1;
     }
-    lua.tables[t].set(Value::Int(len), Value::Nil).map_err(|e| e.to_string())?;
+    lua.tables[t]
+        .set(Value::Int(pos), Value::Nil)
+        .map_err(|e| e.to_string())?;
     Ok(vec![removed])
 }
 
@@ -75,7 +83,7 @@ fn n_concat(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             return Err(format!(
                 "bad argument #2 to 'concat' (string expected, got {})",
                 v.type_name()
-            ))
+            ));
         }
     };
     let i = opt_int(args, 2, "concat")?.unwrap_or(1);
@@ -89,7 +97,7 @@ fn n_concat(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             _ => {
                 return Err(format!(
                     "invalid value (at index {k}) in table for 'concat'"
-                ))
+                ));
             }
         }
         if k < j {
@@ -108,7 +116,9 @@ fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
             .map_err(|e| e.to_string())?;
     }
     let n = lua.new_string(b"n");
-    lua.tables[id.0 as usize].set(n, Value::Int(args.len() as i64)).map_err(|e| e.to_string())?;
+    lua.tables[id.0 as usize]
+        .set(n, Value::Int(args.len() as i64))
+        .map_err(|e| e.to_string())?;
     Ok(vec![t])
 }
 

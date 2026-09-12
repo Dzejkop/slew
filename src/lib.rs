@@ -7,6 +7,9 @@
 pub mod ast;
 pub mod bytecode;
 pub mod compiler;
+#[cfg(feature = "fs")]
+pub mod fs;
+pub mod host;
 pub mod lexer;
 pub mod parser;
 pub mod pattern;
@@ -16,3 +19,5 @@ pub mod vm;
 
 pub use value::Value;
 pub use vm::{Chunk, Error, Execution, Lua, NativeFn, RuntimeError, Step};
+
+pub use host::{DateParts, Host, HostError, HostObject, SeekWhence, StdHost};

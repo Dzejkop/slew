@@ -51,6 +51,9 @@ pub struct FuncBody {
     pub is_vararg: bool,
     pub body: Block,
     pub line: u32,
+    /// Line of the closing `end`. Feeds `getinfo`'s `lastlinedefined` and the
+    /// line attached to the implicit final `RETURN`.
+    pub end_line: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +121,7 @@ pub enum Stmt {
         label: Box<str>,
         line: u32,
     },
-    Label(Box<str>),
+    Label(Box<str>, u32),
 }
 
 #[derive(Debug, Clone)]

@@ -192,11 +192,18 @@ fn keyword(s: &str) -> Option<Token> {
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a [u8]) -> Self {
-        Lexer { src, pos: 0, line: 1 }
+        Lexer {
+            src,
+            pos: 0,
+            line: 1,
+        }
     }
 
     fn err<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
-        Err(LexError { message: message.into(), line: self.line })
+        Err(LexError {
+            message: message.into(),
+            line: self.line,
+        })
     }
 
     fn peek(&self) -> Option<u8> {
@@ -217,9 +224,11 @@ impl<'a> Lexer<'a> {
     fn newline(&mut self) {
         let first = self.bump().unwrap();
         if let Some(b) = self.peek()
-            && (b == b'\n' || b == b'\r') && b != first {
-                self.pos += 1;
-            }
+            && (b == b'\n' || b == b'\r')
+            && b != first
+        {
+            self.pos += 1;
+        }
         self.line += 1;
     }
 
@@ -234,10 +243,11 @@ impl<'a> Lexer<'a> {
                     self.pos += 2;
                     // long comment?
                     if self.peek() == Some(b'[')
-                        && let Some(level) = self.long_bracket_level() {
-                            self.read_long_string(level)?;
-                            continue;
-                        }
+                        && let Some(level) = self.long_bracket_level()
+                    {
+                        self.read_long_string(level)?;
+                        continue;
+                    }
                     // line comment
                     while let Some(b) = self.peek() {
                         if b == b'\n' || b == b'\r' {
@@ -273,11 +283,13 @@ impl<'a> Lexer<'a> {
     /// The opening bracket must already be consumed.
     fn read_long_string(&mut self, level: usize) -> Result<Box<[u8]>, LexError> {
         // first newline is skipped
-        if let Some(b'\n' | b'\r') = self.peek() { self.newline() }
+        if let Some(b'\n' | b'\r') = self.peek() {
+            self.newline()
+        }
         let mut out = Vec::new();
         loop {
             match self.peek() {
-                None => return self.err("unfinished long string/comment"),
+                None => return self.err_eof("unfinished long string/comment"),
                 Some(b']') => {
                     let mut i = self.pos + 1;
                     let mut l = 0;
@@ -304,17 +316,42 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_short_string(&mut self, quote: u8) -> Result<Box<[u8]>, LexError> {
+    /// Raw source text of the token starting at `start` up to `end`, used for
+    /// PUC Lua's `near '<token text>'` error suffix.
+    fn near_text(&self, start: usize, end: usize) -> String {
+        let end = end.min(self.src.len());
+        String::from_utf8_lossy(&self.src[start..end]).into_owned()
+    }
+
+    /// Errors with a PUC-style `near '<token text>'` suffix.
+    fn err_near<T>(
+        &self,
+        start: usize,
+        end: usize,
+        message: impl Into<String>,
+    ) -> Result<T, LexError> {
+        Err(LexError {
+            message: format!("{} near '{}'", message.into(), self.near_text(start, end)),
+            line: self.line,
+        })
+    }
+
+    /// Errors at end of input, where PUC reports the token as `<eof>`.
+    fn err_eof<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
+        self.err(format!("{} near <eof>", message.into()))
+    }
+
+    fn read_short_string(&mut self, quote: u8, start: usize) -> Result<Box<[u8]>, LexError> {
         let mut out = Vec::new();
         loop {
             let Some(b) = self.bump() else {
-                return self.err("unfinished string");
+                return self.err_eof("unfinished string");
             };
             match b {
-                b'\n' | b'\r' => return self.err("unfinished string"),
+                b'\n' | b'\r' => return self.err_near(start, self.pos - 1, "unfinished string"),
                 b'\\' => {
                     let Some(e) = self.bump() else {
-                        return self.err("unfinished string");
+                        return self.err_eof("unfinished string");
                     };
                     match e {
                         b'a' => out.push(7),
@@ -335,12 +372,16 @@ impl<'a> Lexer<'a> {
                         b'x' => {
                             let mut v: u32 = 0;
                             for _ in 0..2 {
-                                let d = self
-                                    .bump()
-                                    .and_then(|c| (c as char).to_digit(16))
-                                    .ok_or(())
-                                    .or_else(|_| self.err("hexadecimal digit expected"))?;
-                                v = v * 16 + d;
+                                match self.bump().and_then(|c| (c as char).to_digit(16)) {
+                                    Some(d) => v = v * 16 + d,
+                                    None => {
+                                        return self.err_near(
+                                            start,
+                                            self.pos,
+                                            "hexadecimal digit expected",
+                                        );
+                                    }
+                                }
                             }
                             out.push(v as u8);
                         }
@@ -356,7 +397,12 @@ impl<'a> Lexer<'a> {
                                 }
                             }
                             if v > 255 {
-                                return self.err("decimal escape too large");
+                                // PUC folds the character that ended the digit run
+                                // into the `near` text.
+                                if self.peek().is_some() {
+                                    self.pos += 1;
+                                }
+                                return self.err_near(start, self.pos, "decimal escape too large");
                             }
                             out.push(v as u8);
                         }
@@ -369,31 +415,35 @@ impl<'a> Lexer<'a> {
                         },
                         b'u' => {
                             if self.bump() != Some(b'{') {
-                                return self.err("missing '{' in \\u{xxxx}");
+                                return self.err_near(start, self.pos, "missing '{'");
                             }
                             let mut v: u64 = 0;
                             let mut any = false;
-                            while let Some(c) = self.peek() {
-                                if let Some(d) = (c as char).to_digit(16) {
-                                    v = v * 16 + d as u64;
-                                    if v > 0x7FFF_FFFF {
-                                        return self.err("UTF-8 value too large");
-                                    }
-                                    any = true;
-                                    self.pos += 1;
-                                } else {
-                                    break;
+                            while let Some(d) = self.peek().and_then(|c| (c as char).to_digit(16)) {
+                                v = v * 16 + d as u64;
+                                self.pos += 1;
+                                if v > 0x7FFF_FFFF {
+                                    return self.err_near(start, self.pos, "UTF-8 value too large");
                                 }
+                                any = true;
                             }
                             if !any {
-                                return self.err("hexadecimal digit expected");
+                                // Include the offending character in `near`.
+                                if self.peek().is_some() {
+                                    self.pos += 1;
+                                }
+                                return self.err_near(
+                                    start,
+                                    self.pos,
+                                    "hexadecimal digit expected",
+                                );
                             }
                             if self.bump() != Some(b'}') {
-                                return self.err("missing '}' in \\u{xxxx}");
+                                return self.err_near(start, self.pos, "missing '}'");
                             }
                             push_utf8(&mut out, v as u32);
                         }
-                        _ => return self.err("invalid escape sequence"),
+                        _ => return self.err_near(start, self.pos, "invalid escape sequence"),
                     }
                 }
                 _ if b == quote => return Ok(out.into_boxed_slice()),
@@ -465,7 +515,10 @@ impl<'a> Lexer<'a> {
                     _ => break,
                 }
             }
-            if self.peek().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            if self
+                .peek()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
                 return self.err("malformed number");
             }
             let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
@@ -507,8 +560,9 @@ impl<'a> Lexer<'a> {
             b'0'..=b'9' => self.read_number()?,
             b'.' if self.peek2().is_some_and(|c| c.is_ascii_digit()) => self.read_number()?,
             b'"' | b'\'' => {
+                let start = self.pos;
                 self.pos += 1;
-                Token::Str(self.read_short_string(b)?)
+                Token::Str(self.read_short_string(b, start)?)
             }
             b'[' => {
                 if let Some(level) = self.long_bracket_level() {
@@ -718,6 +772,18 @@ mod tests {
         }
     }
 
+    /// Lexes `src` expecting a failure and returns the error message.
+    fn lex_err(src: &str) -> String {
+        let mut l = Lexer::new(src.as_bytes());
+        loop {
+            match l.next_token() {
+                Ok((Token::Eof, _)) => panic!("expected lex error: {src:?}"),
+                Ok(_) => continue,
+                Err(e) => return e.message,
+            }
+        }
+    }
+
     #[test]
     fn names_keywords_symbols() {
         assert_eq!(
@@ -762,29 +828,65 @@ mod tests {
         assert_eq!(lex("34e1"), vec![Token::Float(340.0)]);
         assert_eq!(lex("0x0.1E"), vec![Token::Float(0.1171875)]);
         assert_eq!(lex("0xA23p-4"), vec![Token::Float(162.1875)]);
-        assert_eq!(lex("0X1.921FB54442D18P+1"), vec![Token::Float(std::f64::consts::PI)]);
+        assert_eq!(
+            lex("0X1.921FB54442D18P+1"),
+            vec![Token::Float(std::f64::consts::PI)]
+        );
         // decimal overflow -> float; hex overflow -> wraps
-        assert_eq!(lex("9223372036854775808"), vec![Token::Float(9.223372036854776e18)]);
+        assert_eq!(
+            lex("9223372036854775808"),
+            vec![Token::Float(9.223372036854776e18)]
+        );
         assert_eq!(lex("0xFFFFFFFFFFFFFFFF"), vec![Token::Int(-1)]);
         assert_eq!(lex(".5"), vec![Token::Float(0.5)]);
     }
 
     #[test]
     fn strings() {
-        assert_eq!(lex(r#""hello""#), vec![Token::Str(b"hello".to_vec().into())]);
-        assert_eq!(lex(r#"'a\n\t\\\'b'"#), vec![Token::Str(b"a\n\t\\'b".to_vec().into())]);
-        assert_eq!(lex(r#""\x41\65\66""#), vec![Token::Str(b"AAB".to_vec().into())]);
-        assert_eq!(lex(r#""\u{48}\u{65}""#), vec![Token::Str(b"He".to_vec().into())]);
-        assert_eq!(lex(r#""\u{20AC}""#), vec![Token::Str("€".as_bytes().to_vec().into())]);
-        assert_eq!(lex("\"a\\z  \n  b\""), vec![Token::Str(b"ab".to_vec().into())]);
-        assert_eq!(lex("[[long\nstring]]"), vec![Token::Str(b"long\nstring".to_vec().into())]);
-        assert_eq!(lex("[==[a]=]b]==]"), vec![Token::Str(b"a]=]b".to_vec().into())]);
-        assert_eq!(lex("[[\nskipped]]"), vec![Token::Str(b"skipped".to_vec().into())]);
+        assert_eq!(
+            lex(r#""hello""#),
+            vec![Token::Str(b"hello".to_vec().into())]
+        );
+        assert_eq!(
+            lex(r#"'a\n\t\\\'b'"#),
+            vec![Token::Str(b"a\n\t\\'b".to_vec().into())]
+        );
+        assert_eq!(
+            lex(r#""\x41\65\66""#),
+            vec![Token::Str(b"AAB".to_vec().into())]
+        );
+        assert_eq!(
+            lex(r#""\u{48}\u{65}""#),
+            vec![Token::Str(b"He".to_vec().into())]
+        );
+        assert_eq!(
+            lex(r#""\u{20AC}""#),
+            vec![Token::Str("€".as_bytes().to_vec().into())]
+        );
+        assert_eq!(
+            lex("\"a\\z  \n  b\""),
+            vec![Token::Str(b"ab".to_vec().into())]
+        );
+        assert_eq!(
+            lex("[[long\nstring]]"),
+            vec![Token::Str(b"long\nstring".to_vec().into())]
+        );
+        assert_eq!(
+            lex("[==[a]=]b]==]"),
+            vec![Token::Str(b"a]=]b".to_vec().into())]
+        );
+        assert_eq!(
+            lex("[[\nskipped]]"),
+            vec![Token::Str(b"skipped".to_vec().into())]
+        );
     }
 
     #[test]
     fn comments() {
-        assert_eq!(lex("a -- comment\nb"), vec![Token::Name("a".into()), Token::Name("b".into())]);
+        assert_eq!(
+            lex("a -- comment\nb"),
+            vec![Token::Name("a".into()), Token::Name("b".into())]
+        );
         assert_eq!(
             lex("a --[==[ long\ncomment ]==] b"),
             vec![Token::Name("a".into()), Token::Name("b".into())]
@@ -807,5 +909,54 @@ mod tests {
         assert!(l.next_token().is_err());
         let mut l = Lexer::new(b"3a");
         assert!(l.next_token().is_err());
+    }
+
+    #[test]
+    fn malformed_escapes_report_puc_near_text() {
+        // PUC appends `near '<source text>'` naming the malformed token.
+        assert_eq!(
+            lex_err(r#""\x""#),
+            r#"hexadecimal digit expected near '"\x"'"#
+        );
+        assert_eq!(
+            lex_err(r#""\xG""#),
+            r#"hexadecimal digit expected near '"\xG'"#
+        );
+        // \u{...} diagnostics
+        assert_eq!(lex_err(r#""\u""#), r#"missing '{' near '"\u"'"#);
+        assert_eq!(
+            lex_err(r#""\u{}""#),
+            r#"hexadecimal digit expected near '"\u{}'"#
+        );
+        assert_eq!(lex_err(r#""\u{48""#), r#"missing '}' near '"\u{48"'"#);
+        assert_eq!(
+            lex_err(r#""\u{110000000}""#),
+            r#"UTF-8 value too large near '"\u{110000000'"#
+        );
+        // oversized decimal escapes
+        assert_eq!(
+            lex_err(r#""\256""#),
+            r#"decimal escape too large near '"\256"'"#
+        );
+        assert_eq!(
+            lex_err(r#""\999""#),
+            r#"decimal escape too large near '"\999"'"#
+        );
+        // an unknown escape names the offending character
+        assert_eq!(lex_err(r#""\q""#), r#"invalid escape sequence near '"\q'"#);
+    }
+
+    #[test]
+    fn unfinished_strings_report_near_text_or_eof() {
+        // Hitting a newline reports the text consumed so far.
+        assert_eq!(lex_err("\"a\nb\""), "unfinished string near '\"a'");
+        assert_eq!(lex_err("'x\rY'"), "unfinished string near ''x'");
+        // Running off the end of input reports `<eof>`.
+        assert_eq!(lex_err("\"abc"), "unfinished string near <eof>");
+        assert_eq!(lex_err("\"abc\\"), "unfinished string near <eof>");
+        assert_eq!(
+            lex_err("[[abc"),
+            "unfinished long string/comment near <eof>"
+        );
     }
 }
