@@ -2,6 +2,7 @@
 //! (gmatch/gsub/sort).
 
 use slew::{Lua, Step, Value};
+use test_case::test_case;
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     let chunk = lua
@@ -70,15 +71,12 @@ fn string_basics() {
     assert_eq!(eval("return string.char(104, 105)"), "hi");
 }
 
-#[test]
-fn string_method_syntax() {
-    // strings share a metatable with __index = string
-    assert_eq!(eval("return ('hello'):upper()"), "HELLO");
-    assert_eq!(
-        eval("local s = 'a,b,c' return s:sub(1, 1) .. s:len()"),
-        "a5"
-    );
-    assert_eq!(eval("return ('%d!'):format(42)"), "42!");
+// strings share a metatable with __index = string
+#[test_case("return ('hello'):upper()" => "HELLO"; "upper_method")]
+#[test_case("local s = 'a,b,c' return s:sub(1, 1) .. s:len()" => "a5"; "sub_and_len_method")]
+#[test_case("return ('%d!'):format(42)" => "42!"; "format_method")]
+fn string_method_syntax(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -107,33 +105,11 @@ fn string_find_and_match() {
     assert_eq!(eval("return string.match('aXbXc', 'X.', 3)"), "Xc");
 }
 
-#[test]
-fn string_gmatch() {
-    assert_eq!(
-        eval(
-            "local words = {} \
-             for w in string.gmatch('the quick brown fox', '%a+') do words[#words+1] = w end \
-             return table.concat(words, '|')"
-        ),
-        "the|quick|brown|fox"
-    );
-    assert_eq!(
-        eval(
-            "local sum = 0 \
-             for n in ('10,20,30'):gmatch('%d+') do sum = sum + tonumber(n) end \
-             return sum"
-        ),
-        "60"
-    );
-    // captures in gmatch
-    assert_eq!(
-        eval(
-            "local t = {} \
-             for k, v in ('a=1,b=2'):gmatch('(%w+)=(%w+)') do t[k] = v end \
-             return t.a .. t.b"
-        ),
-        "12"
-    );
+#[test_case("local words = {} for w in string.gmatch('the quick brown fox', '%a+') do words[#words+1] = w end return table.concat(words, '|')" => "the|quick|brown|fox"; "gmatch_words")]
+#[test_case("local sum = 0 for n in ('10,20,30'):gmatch('%d+') do sum = sum + tonumber(n) end return sum" => "60"; "gmatch_sum")]
+#[test_case("local t = {} for k, v in ('a=1,b=2'):gmatch('(%w+)=(%w+)') do t[k] = v end return t.a .. t.b" => "12"; "captures_in_gmatch")]
+fn string_gmatch(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -174,75 +150,42 @@ fn string_gsub() {
     );
 }
 
-#[test]
-fn string_format() {
-    assert_eq!(eval("return string.format('%d/%d', 7, -3)"), "7/-3");
-    assert_eq!(eval("return string.format('%5d|', 42)"), "   42|");
-    assert_eq!(eval("return string.format('%-5d|', 42)"), "42   |");
-    assert_eq!(eval("return string.format('%05d', 42)"), "00042");
-    assert_eq!(eval("return string.format('%+d %+d', 5, -5)"), "+5 -5");
-    assert_eq!(
-        eval("return string.format('%x %X %o', 255, 255, 8)"),
-        "ff FF 10"
-    );
-    assert_eq!(eval("return string.format('%#x', 255)"), "0xff");
-    assert_eq!(eval("return string.format('%c%c', 104, 105)"), "hi");
-    assert_eq!(eval("return string.format('%.2f', 3.14159)"), "3.14");
-    assert_eq!(eval("return string.format('%f', 1)"), "1.000000");
-    assert_eq!(eval("return string.format('%e', 1500.0)"), "1.500000e+03");
-    assert_eq!(eval("return string.format('%g', 0.00001)"), "1e-05");
-    assert_eq!(eval("return string.format('%g', 100000.0)"), "100000");
-    assert_eq!(eval("return string.format('%s=%s', 'a', 1)"), "a=1");
-    assert_eq!(eval("return string.format('%.3s', 'hello')"), "hel");
-    assert_eq!(eval("return string.format('%10s|', 'hi')"), "        hi|");
-    assert_eq!(
-        eval("return string.format('%q', 'he said \"hi\"\\n')"),
-        "\"he said \\\"hi\\\"\\\n\""
-    );
-    assert_eq!(eval("return string.format('%%')"), "%");
-    // C flag/precision behaviour required by strings.lua.
-    assert_eq!(eval("return string.format('%#12o', 10)"), "         012");
-    assert_eq!(eval("return string.format('%2.5d', -100)"), "-00100");
-    assert_eq!(eval("return string.format('%.u', 0)"), "");
-    assert_eq!(
-        eval("return string.format('%+#014.0f', 100)"),
-        "+000000000100."
-    );
+#[test_case("return string.format('%d/%d', 7, -3)" => "7/-3"; "format_d_negative")]
+#[test_case("return string.format('%5d|', 42)" => "   42|"; "format_width_d")]
+#[test_case("return string.format('%-5d|', 42)" => "42   |"; "format_left_align_d")]
+#[test_case("return string.format('%05d', 42)" => "00042"; "format_zero_pad_d")]
+#[test_case("return string.format('%+d %+d', 5, -5)" => "+5 -5"; "format_plus_flag_d")]
+#[test_case("return string.format('%x %X %o', 255, 255, 8)" => "ff FF 10"; "format_x_X_o")]
+#[test_case("return string.format('%#x', 255)" => "0xff"; "format_alt_x")]
+#[test_case("return string.format('%c%c', 104, 105)" => "hi"; "format_c")]
+#[test_case("return string.format('%.2f', 3.14159)" => "3.14"; "format_precision_f")]
+#[test_case("return string.format('%f', 1)" => "1.000000"; "format_f_from_integer")]
+#[test_case("return string.format('%e', 1500.0)" => "1.500000e+03"; "format_e")]
+#[test_case("return string.format('%g', 0.00001)" => "1e-05"; "format_g_small")]
+#[test_case("return string.format('%g', 100000.0)" => "100000"; "format_g_large")]
+#[test_case("return string.format('%s=%s', 'a', 1)" => "a=1"; "format_s_values")]
+#[test_case("return string.format('%.3s', 'hello')" => "hel"; "format_precision_s")]
+#[test_case("return string.format('%10s|', 'hi')" => "        hi|"; "format_width_s")]
+#[test_case("return string.format('%q', 'he said \"hi\"\\n')" => "\"he said \\\"hi\\\"\\\n\""; "format_q")]
+#[test_case("return string.format('%%')" => "%"; "format_percent")]
+// C flag/precision behaviour required by strings.lua.
+#[test_case("return string.format('%#12o', 10)" => "         012"; "format_alt_width_o")]
+#[test_case("return string.format('%2.5d', -100)" => "-00100"; "format_width_precision_d_negative")]
+#[test_case("return string.format('%.u', 0)" => ""; "format_precision_u_zero")]
+#[test_case("return string.format('%+#014.0f', 100)" => "+000000000100."; "format_plus_alt_zero_width_precision_f")]
+fn string_format(src: &str) -> String {
+    eval(src)
 }
 
-#[test]
-fn string_format_s_uses_tolstring() {
-    // `%s` follows PUC's `luaL_tolstring`: `__tostring`, then `__name`, then
-    // the default rendering; precision truncates the rendered bytes.
-    assert_eq!(
-        eval(
-            "local m = setmetatable({}, {__tostring = function() return 'hello' end,\
-             __name = 'hi'})\n\
-             return string.format('%s %.10s', m, m)"
-        ),
-        "hello hello"
-    );
-    assert_eq!(
-        eval(
-            "local m = setmetatable({}, {__name = 'hi'})\n\
-             return string.format('%.4s', m)"
-        ),
-        "hi: "
-    );
-    assert_eq!(eval("return string.format('%s %s', nil, true)"), "nil true");
-    assert_eq!(
-        eval("return string.format('%.3s %.3s', false, true)"),
-        "fal tru"
-    );
-    // A `__tostring` that does not return a string raises, catchable by pcall.
-    assert_eq!(
-        eval(
-            "local m = setmetatable({}, {__tostring = function() return {} end})\n\
-             local ok, err = pcall(string.format, '%s', m)\n\
-             return tostring(not ok and err:find(\"'__tostring' must return a string\") ~= nil)"
-        ),
-        "true"
-    );
+// `%s` follows PUC's `luaL_tolstring`: `__tostring`, then `__name`, then
+// the default rendering; precision truncates the rendered bytes.
+#[test_case("local m = setmetatable({}, {__tostring = function() return 'hello' end,__name = 'hi'})\nreturn string.format('%s %.10s', m, m)" => "hello hello"; "tostring_metamethod_preferred_over_name")]
+#[test_case("local m = setmetatable({}, {__name = 'hi'})\nreturn string.format('%.4s', m)" => "hi: "; "name_fallback_truncated")]
+#[test_case("return string.format('%s %s', nil, true)" => "nil true"; "nil_and_boolean")]
+#[test_case("return string.format('%.3s %.3s', false, true)" => "fal tru"; "boolean_precision")]
+#[test_case("local m = setmetatable({}, {__tostring = function() return {} end})\nlocal ok, err = pcall(string.format, '%s', m)\nreturn tostring(not ok and err:find(\"'__tostring' must return a string\") ~= nil)" => "true"; "tostring_not_returning_string_raises_catchable_by_pcall")]
+fn string_format_s_uses_tolstring(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -288,30 +231,21 @@ fn string_format_validation() {
     assert_eq!(eval(&src), "true");
 }
 
-#[test]
-fn string_format_hex_float() {
-    assert_eq!(eval("return string.format('%a', 1.0)"), "0x1p+0");
-    assert_eq!(eval("return string.format('%a', 0.5)"), "0x1p-1");
-    assert_eq!(eval("return string.format('%a', 0.0)"), "0x0p+0");
-    assert_eq!(eval("return string.format('%a', -0.0)"), "-0x0p+0");
-    assert_eq!(eval("return string.format('%A', 12)"), "0X1.8P+3");
-    assert_eq!(eval("return string.format('%+.2A', 12)"), "+0X1.80P+3");
-    assert_eq!(eval("return string.format('%.4A', -12)"), "-0X1.8000P+3");
-    // full precision round-trips
-    assert_eq!(
-        eval("return tonumber(string.format('%a', 0.1)) == 0.1"),
-        "true"
-    );
-    assert_eq!(
-        eval("return tonumber(string.format('%a', 1e30)) == 1e30"),
-        "true"
-    );
-    assert_eq!(
-        eval("return tonumber(string.format('%a', 1/3)) == 1/3"),
-        "true"
-    );
-    assert_eq!(eval("return string.format('%a', 1/0)"), "inf");
-    assert_eq!(eval("return string.format('%A', -1/0)"), "-INF");
+#[test_case("return string.format('%a', 1.0)" => "0x1p+0"; "hex_float_a_one")]
+#[test_case("return string.format('%a', 0.5)" => "0x1p-1"; "hex_float_a_half")]
+#[test_case("return string.format('%a', 0.0)" => "0x0p+0"; "hex_float_a_zero")]
+#[test_case("return string.format('%a', -0.0)" => "-0x0p+0"; "hex_float_a_negative_zero")]
+#[test_case("return string.format('%A', 12)" => "0X1.8P+3"; "hex_float_upper_A")]
+#[test_case("return string.format('%+.2A', 12)" => "+0X1.80P+3"; "hex_float_plus_precision_upper_A")]
+#[test_case("return string.format('%.4A', -12)" => "-0X1.8000P+3"; "hex_float_precision_upper_A_negative")]
+// full precision round-trips
+#[test_case("return tonumber(string.format('%a', 0.1)) == 0.1" => "true"; "hex_float_round_trip_zero_point_one")]
+#[test_case("return tonumber(string.format('%a', 1e30)) == 1e30" => "true"; "hex_float_round_trip_1e30")]
+#[test_case("return tonumber(string.format('%a', 1/3)) == 1/3" => "true"; "hex_float_round_trip_one_third")]
+#[test_case("return string.format('%a', 1/0)" => "inf"; "hex_float_a_infinity")]
+#[test_case("return string.format('%A', -1/0)" => "-INF"; "hex_float_upper_A_negative_infinity")]
+fn string_format_hex_float(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -451,29 +385,13 @@ fn string_pack_errors() {
 
 // ---- table ----
 
-#[test]
-fn table_insert_remove() {
-    assert_eq!(
-        eval("local t = {1, 2} table.insert(t, 3) return table.concat(t, ',')"),
-        "1,2,3"
-    );
-    assert_eq!(
-        eval("local t = {1, 3} table.insert(t, 2, 2) return table.concat(t, ',')"),
-        "1,2,3"
-    );
-    assert_eq!(
-        eval(
-            "local t = {1, 2, 3} local v = table.remove(t) return v .. ':' .. table.concat(t, ',')"
-        ),
-        "3:1,2"
-    );
-    assert_eq!(
-        eval(
-            "local t = {1, 2, 3} local v = table.remove(t, 1) return v .. ':' .. table.concat(t, ',')"
-        ),
-        "1:2,3"
-    );
-    assert_eq!(eval("return tostring(table.remove({}))"), "nil");
+#[test_case("local t = {1, 2} table.insert(t, 3) return table.concat(t, ',')" => "1,2,3"; "insert_append")]
+#[test_case("local t = {1, 3} table.insert(t, 2, 2) return table.concat(t, ',')" => "1,2,3"; "insert_at_position")]
+#[test_case("local t = {1, 2, 3} local v = table.remove(t) return v .. ':' .. table.concat(t, ',')" => "3:1,2"; "remove_last")]
+#[test_case("local t = {1, 2, 3} local v = table.remove(t, 1) return v .. ':' .. table.concat(t, ',')" => "1:2,3"; "remove_first")]
+#[test_case("return tostring(table.remove({}))" => "nil"; "remove_empty_is_nil")]
+fn table_insert_remove(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -555,34 +473,12 @@ fn table_insert_respects_len_metamethod() {
     assert!(run_err("table.insert({}, 1, 2, 3)").contains("wrong number of arguments"));
 }
 
-#[test]
-fn table_sort() {
-    assert_eq!(
-        eval("local t = {5, 2, 8, 1, 9, 3} table.sort(t) return table.concat(t, ',')"),
-        "1,2,3,5,8,9"
-    );
-    assert_eq!(
-        eval(
-            "local t = {5, 2, 8, 1} table.sort(t, function(a, b) return a > b end) \
-             return table.concat(t, ',')"
-        ),
-        "8,5,2,1"
-    );
-    assert_eq!(
-        eval("local t = {'banana', 'apple', 'cherry'} table.sort(t) return table.concat(t, ',')"),
-        "apple,banana,cherry"
-    );
-    // large-ish sort (quicksort path, comparator through the VM)
-    assert_eq!(
-        eval(
-            "local t = {} \
-             for i = 1, 200 do t[i] = (i * 7919) % 1000 end \
-             table.sort(t) \
-             for i = 2, 200 do assert(t[i-1] <= t[i]) end \
-             return 'sorted'"
-        ),
-        "sorted"
-    );
+#[test_case("local t = {5, 2, 8, 1, 9, 3} table.sort(t) return table.concat(t, ',')" => "1,2,3,5,8,9"; "default_order_numbers")]
+#[test_case("local t = {5, 2, 8, 1} table.sort(t, function(a, b) return a > b end) return table.concat(t, ',')" => "8,5,2,1"; "custom_comparator_descending")]
+#[test_case("local t = {'banana', 'apple', 'cherry'} table.sort(t) return table.concat(t, ',')" => "apple,banana,cherry"; "default_order_strings")]
+#[test_case("local t = {} for i = 1, 200 do t[i] = (i * 7919) % 1000 end table.sort(t) for i = 2, 200 do assert(t[i-1] <= t[i]) end return 'sorted'" => "sorted"; "large_ish_sort_quicksort_path_comparator_through_vm")]
+fn table_sort(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -853,49 +749,16 @@ fn math_random_deterministic() {
     assert_ne!(a[0], c[0]); // overwhelmingly likely
 }
 
-#[test]
-fn math_random_matches_puc_xoshiro() {
-    // PUC 5.4's `math.randomseed(1007)` then `math.random(0)` is
-    // 0x7a7040a5a323c9d6 (asserted by upstream math.lua).
-    assert_eq!(
-        eval("math.randomseed(1007) return math.random(0)"),
-        (0x7a70_40a5_a323_c9d6_u64 as i64).to_string()
-    );
-    // One seed word defaults the second to 0; both reseed identically.
-    assert_eq!(
-        eval(
-            "math.randomseed(1007) local a = math.random(0) \
-              math.randomseed(1007, 0) return math.random(0) == a"
-        ),
-        "true"
-    );
-    // `randomseed` returns the two seed words and reseeding with them repeats.
-    assert_eq!(
-        eval(
-            "local x, y = math.randomseed(123, 456) \
-             local a = math.random(0) \
-             math.randomseed(x, y) \
-             return math.random(0) == a and type(x) == 'number' and type(y) == 'number'"
-        ),
-        "true"
-    );
-    // A single-argument upper bound projects into [1, m] (m == 0 is the full
-    // integer); the two-argument form projects into [low, up].
-    assert_eq!(
-        eval(
-            "math.randomseed(1) \
-             for i = 1, 500 do local r = math.random(7) assert(r >= 1 and r <= 7) end \
-             for i = 1, 500 do local r = math.random(-3, 3) assert(r >= -3 and r <= 3) end \
-             return 'ok'"
-        ),
-        "ok"
-    );
-    // More than two arguments is an error, as in PUC.
-    assert_eq!(eval("return (pcall(math.random, 1, 2, 3))"), "false");
-    assert_eq!(
-        eval("return (pcall(math.random, math.maxinteger, math.maxinteger - 1))"),
-        "false"
-    );
+// PUC 5.4's `math.randomseed(1007)` then `math.random(0)` is
+// 0x7a7040a5a323c9d6 (asserted by upstream math.lua).
+#[test_case("math.randomseed(1007) return math.random(0)" => (0x7a70_40a5_a323_c9d6_u64 as i64).to_string(); "seed_1007_first_random_zero")]
+#[test_case("math.randomseed(1007) local a = math.random(0) math.randomseed(1007, 0) return math.random(0) == a" => "true"; "one_seed_word_defaults_second_to_zero")]
+#[test_case("local x, y = math.randomseed(123, 456) local a = math.random(0) math.randomseed(x, y) return math.random(0) == a and type(x) == 'number' and type(y) == 'number'" => "true"; "randomseed_returns_seed_words_and_reseeding_repeats")]
+#[test_case("math.randomseed(1) for i = 1, 500 do local r = math.random(7) assert(r >= 1 and r <= 7) end for i = 1, 500 do local r = math.random(-3, 3) assert(r >= -3 and r <= 3) end return 'ok'" => "ok"; "single_arg_bound_projects_into_range")]
+#[test_case("return (pcall(math.random, 1, 2, 3))" => "false"; "more_than_two_args_is_error")]
+#[test_case("return (pcall(math.random, math.maxinteger, math.maxinteger - 1))" => "false"; "reversed_maxinteger_bounds_is_error")]
+fn math_random_matches_puc_xoshiro(src: &str) -> String {
+    eval(src)
 }
 
 // ---- integration: stdlib under strict fuel ----

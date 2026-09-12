@@ -1,6 +1,7 @@
 //! M2: metatables/metamethods, pcall/error values, goto.
 
 use slew::{Lua, Step, Value};
+use test_case::test_case;
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     let chunk = lua
@@ -613,37 +614,13 @@ fn goto_basics() {
     );
 }
 
-#[test]
-fn goto_scope_errors() {
+#[test_case("goto skip local x = 1 ::skip:: return x", "jumps into the scope"; "jumps_into_local_scope")]
+#[test_case("goto nowhere", "no visible label"; "unmatched_label")]
+#[test_case("local function f() ::inner:: end goto inner", "no visible label"; "label_in_other_function_invisible")]
+#[test_case("::l:: ::l::", "already defined"; "duplicate_label")]
+fn goto_scope_errors(src: &str, needle: &str) {
     let mut lua = Lua::new();
-    // jumping into the scope of a local
-    assert!(
-        lua.load("goto skip local x = 1 ::skip:: return x")
-            .unwrap_err()
-            .to_string()
-            .contains("jumps into the scope")
-    );
-    // unmatched label
-    assert!(
-        lua.load("goto nowhere")
-            .unwrap_err()
-            .to_string()
-            .contains("no visible label")
-    );
-    // label in another function is not visible
-    assert!(
-        lua.load("local function f() ::inner:: end goto inner")
-            .unwrap_err()
-            .to_string()
-            .contains("no visible label")
-    );
-    // duplicate label in same block
-    assert!(
-        lua.load("::l:: ::l::")
-            .unwrap_err()
-            .to_string()
-            .contains("already defined")
-    );
+    assert!(lua.load(src).unwrap_err().to_string().contains(needle));
 }
 
 #[test]

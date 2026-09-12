@@ -1,6 +1,7 @@
 //! Phase 4: the `utf8` library, the `%z` pattern class, and `%p` formatting.
 
 use slew::{Lua, Step, Value};
+use test_case::test_case;
 
 fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
     let chunk = lua
@@ -89,18 +90,19 @@ fn char_and_codepoint() {
     assert!(eval_multi("return utf8.codepoint('abc', 4, 3)").is_empty());
 }
 
-#[test]
-fn char_and_codepoint_errors() {
-    assert_error("utf8.char(-1)", "value out of range");
-    assert_error("utf8.char(0x80000000)", "value out of range");
-    assert_error(
-        "utf8.codepoint('\\xF4\\x9F\\xBF\\xBF')",
-        "invalid UTF-8 code",
-    );
-    assert_error("utf8.codepoint('abc', 0)", "out of bounds");
-    assert_error("utf8.codepoint('abc', 1, 4)", "out of bounds");
-    assert_error("utf8.codepoint('\\xED\\xA0\\x80')", "invalid UTF-8 code"); // surrogate
-    assert_error("utf8.codepoint('\\xC0\\x80')", "invalid UTF-8 code"); // overlong
+#[test_case("utf8.char(-1)", "value out of range"; "char_negative")]
+#[test_case("utf8.char(0x80000000)", "value out of range"; "char_too_large")]
+#[test_case(
+    "utf8.codepoint('\\xF4\\x9F\\xBF\\xBF')",
+    "invalid UTF-8 code";
+    "codepoint_too_large"
+)]
+#[test_case("utf8.codepoint('abc', 0)", "out of bounds"; "codepoint_start_out_of_bounds")]
+#[test_case("utf8.codepoint('abc', 1, 4)", "out of bounds"; "codepoint_end_out_of_bounds")]
+#[test_case("utf8.codepoint('\\xED\\xA0\\x80')", "invalid UTF-8 code"; "codepoint_surrogate")]
+#[test_case("utf8.codepoint('\\xC0\\x80')", "invalid UTF-8 code"; "codepoint_overlong")]
+fn char_and_codepoint_errors(src: &str, needle: &str) {
+    assert_error(src, needle);
 }
 
 #[test]
@@ -153,17 +155,11 @@ fn codes_iterates_codepoints() {
     );
 }
 
-#[test]
-fn codes_rejects_malformed() {
-    assert_error(
-        "for c in utf8.codes('ab\\xff') do end",
-        "invalid UTF-8 code",
-    );
-    assert_error(
-        "for c in utf8.codes('in\\x80valid') do end",
-        "invalid UTF-8 code",
-    );
-    assert_error("utf8.codes('\\x80')", "invalid UTF-8 code");
+#[test_case("for c in utf8.codes('ab\\xff') do end"; "iterating_after_truncated_sequence")]
+#[test_case("for c in utf8.codes('in\\x80valid') do end"; "iterating_over_stray_continuation")]
+#[test_case("utf8.codes('\\x80')"; "leading_continuation_byte")]
+fn codes_rejects_malformed(src: &str) {
+    assert_error(src, "invalid UTF-8 code");
 }
 
 #[test]
@@ -174,16 +170,13 @@ fn works_via_require() {
 
 // ---- pattern classes ----
 
-#[test]
-fn deprecated_z_class() {
-    // `%z` matches only the zero byte; `%Z` is its complement.
-    assert_eq!(eval("return string.match('a\\0b', '%z') == '\\0'"), "true");
-    assert_eq!(eval("return #string.match('abc', '%Z*')"), "3");
-    assert_eq!(
-        eval("local n = 0 for _ in string.gmatch('\\0a\\0b', '%z') do n = n + 1 end return n"),
-        "2"
-    );
-    assert_eq!(eval("return string.match('ab', '%z') == nil"), "true");
+// `%z` matches only the zero byte; `%Z` is its complement.
+#[test_case("return string.match('a\\0b', '%z') == '\\0'" => "true"; "z_matches_zero_byte")]
+#[test_case("return #string.match('abc', '%Z*')" => "3"; "z_complement_matches_all")]
+#[test_case("local n = 0 for _ in string.gmatch('\\0a\\0b', '%z') do n = n + 1 end return n" => "2"; "gmatch_counts_zero_bytes")]
+#[test_case("return string.match('ab', '%z') == nil" => "true"; "z_absent")]
+fn deprecated_z_class(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -214,58 +207,55 @@ fn all_pattern_classes_cover_ascii() {
     }
 }
 
-#[test]
-fn bracket_classes_and_anchors() {
-    assert_eq!(eval("return #string.match('abc123', '[^%d]+')"), "3");
-    assert_eq!(eval("return string.match('x]y', '[%]]')"), "]");
-    assert_eq!(eval("return string.match('a-b', '[%-]')"), "-");
-    assert_eq!(eval("return #string.match('aaa', '^a+$')"), "3");
-    assert_eq!(eval("return string.find('baaa', '^a') == nil"), "true");
+#[test_case("return #string.match('abc123', '[^%d]+')" => "3"; "negated_class")]
+#[test_case("return string.match('x]y', '[%]]')" => "]"; "escaped_closing_bracket")]
+#[test_case("return string.match('a-b', '[%-]')" => "-"; "escaped_hyphen")]
+#[test_case("return #string.match('aaa', '^a+$')" => "3"; "anchored_repetition")]
+#[test_case("return string.find('baaa', '^a') == nil" => "true"; "caret_anchors_to_start")]
+fn bracket_classes_and_anchors(src: &str) -> String {
+    eval(src)
 }
 
 // ---- string.format %p ----
 
-#[test]
-fn format_pointer() {
-    assert_eq!(eval("return string.format('%p', 4)"), "(null)");
-    assert_eq!(eval("return string.format('%p', true)"), "(null)");
-    assert_eq!(eval("return string.format('%p', nil)"), "(null)");
-    assert_eq!(eval("return string.format('%p', {}) ~= '(null)'"), "true");
-    assert_eq!(
-        eval("return string.format('%p', print) ~= '(null)'"),
-        "true"
-    );
-    // equal strings share an identity; distinct tables do not
-    assert_eq!(
-        eval("local s = 'x' local r = 'x' return string.format('%p', s) == string.format('%p', r)"),
-        "true"
-    );
-    assert_eq!(
-        eval("return string.format('%p', {}) ~= string.format('%p', {})"),
-        "true"
-    );
-    assert_eq!(eval("return #string.format('%90p', {})"), "90");
-    assert_eq!(eval("return #string.format('%-60p', {})"), "60");
-    assert_eq!(
-        eval("return string.format('%10p', false) == string.rep(' ', 10 - 6) .. '(null)'"),
-        "true"
-    );
+#[test_case("return string.format('%p', 4)" => "(null)"; "number_is_null")]
+#[test_case("return string.format('%p', true)" => "(null)"; "boolean_is_null")]
+#[test_case("return string.format('%p', nil)" => "(null)"; "nil_is_null")]
+#[test_case("return string.format('%p', {}) ~= '(null)'" => "true"; "table_is_pointer")]
+#[test_case("return string.format('%p', print) ~= '(null)'" => "true"; "function_is_pointer")]
+// equal strings share an identity; distinct tables do not
+#[test_case(
+    "local s = 'x' local r = 'x' return string.format('%p', s) == string.format('%p', r)" => "true";
+    "equal_strings_share_identity"
+)]
+#[test_case(
+    "return string.format('%p', {}) ~= string.format('%p', {})" => "true";
+    "distinct_tables_do_not"
+)]
+#[test_case("return #string.format('%90p', {})" => "90"; "width_pads_to_90")]
+#[test_case("return #string.format('%-60p', {})" => "60"; "left_align_pads_to_60")]
+#[test_case(
+    "return string.format('%10p', false) == string.rep(' ', 10 - 6) .. '(null)'" => "true";
+    "false_padded_like_null"
+)]
+fn format_pointer(src: &str) -> String {
+    eval(src)
 }
 
 // ---- empty-match semantics (PUC's `lastmatch`) and gmatch `init` ----
 
-#[test]
-fn gsub_rejects_empty_match_after_previous() {
-    assert_eq!(eval("return string.gsub('a b cd', ' *', '-')"), "-a-b-c-d-");
-    assert_eq!(eval("return string.gsub('', '^', 'r')"), "r");
-    assert_eq!(eval("return string.gsub('', '$', 'r')"), "r");
-    assert_eq!(eval("return string.gsub('aaa', 'a*', 'x')"), "x");
-    assert_eq!(eval("return string.gsub('abc', 'x*', '-')"), "-a-b-c-");
-    // no substitution: the result is unchanged
-    assert_eq!(
-        eval("return (string.gsub('abc', 'x*', function() return nil end))"),
-        "abc"
-    );
+#[test_case("return string.gsub('a b cd', ' *', '-')" => "-a-b-c-d-"; "spaces_to_dashes")]
+#[test_case("return string.gsub('', '^', 'r')" => "r"; "empty_start_anchor")]
+#[test_case("return string.gsub('', '$', 'r')" => "r"; "empty_end_anchor")]
+#[test_case("return string.gsub('aaa', 'a*', 'x')" => "x"; "star_matches_whole")]
+#[test_case("return string.gsub('abc', 'x*', '-')" => "-a-b-c-"; "empty_match_between_chars")]
+// no substitution: the result is unchanged
+#[test_case(
+    "return (string.gsub('abc', 'x*', function() return nil end))" => "abc";
+    "no_substitution_leaves_result_unchanged"
+)]
+fn gsub_rejects_empty_match_after_previous(src: &str) -> String {
+    eval(src)
 }
 
 #[test]

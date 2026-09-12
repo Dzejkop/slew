@@ -3,6 +3,7 @@
 //! `constructs.lua` files match on.
 
 use slew::{Lua, Step};
+use test_case::test_case;
 
 /// Compiles `src`, expecting a compile/parse failure, and returns its message.
 fn load_err(src: &str) -> String {
@@ -45,12 +46,12 @@ fn run_ok(src: &str) {
 
 // ---- label visibility & repeated/undefined labels ----
 
-#[test]
-fn label_inside_block_is_invisible() {
-    assert!(load_err("goto l1; do ::l1:: end").contains("label 'l1'"));
-    assert!(load_err("do ::l1:: end goto l1;").contains("label 'l1'"));
-    assert!(load_err("do ::l1:: end goto l1").contains("label 'l1'"));
-    assert!(load_err("goto l1 do ::l1:: end").contains("label 'l1'"));
+#[test_case("goto l1; do ::l1:: end"; "forward_goto_label_in_do_block")]
+#[test_case("do ::l1:: end goto l1;"; "backward_goto_label_in_do_block")]
+#[test_case("do ::l1:: end goto l1"; "backward_goto_label_in_do_block_no_semicolon")]
+#[test_case("goto l1 do ::l1:: end"; "forward_goto_label_in_do_block_no_semicolon")]
+fn label_inside_block_is_invisible(src: &str) {
+    assert!(load_err(src).contains("label 'l1'"));
 }
 
 #[test]

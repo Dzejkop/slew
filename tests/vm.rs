@@ -1,4 +1,5 @@
 use slew::{Lua, Step, Value};
+use test_case::test_case;
 
 /// Runs a script to completion with a generous fuel budget; panics if it
 /// doesn't finish. Returns the script's return values.
@@ -48,44 +49,41 @@ fn run_err(src: &str) -> String {
 
 // ---- arithmetic & 5.4 number semantics ----
 
-#[test]
-fn numbers_54_semantics() {
-    assert_eq!(eval("return 1 + 2"), "3");
-    assert_eq!(eval("return 7 / 2"), "3.5"); // / is always float
-    assert_eq!(eval("return 7 // 2"), "3");
-    assert_eq!(eval("return -7 // 2"), "-4"); // floor division
-    assert_eq!(eval("return 7 % 3"), "1");
-    assert_eq!(eval("return -7 % 3"), "2"); // Lua mod follows divisor sign
-    assert_eq!(eval("return 7.0 // 2"), "3.0"); // float floor div stays float
-    assert_eq!(eval("return 2 ^ 10"), "1024.0"); // ^ is always float
-    assert_eq!(eval("return 1 + 0.5"), "1.5");
-    assert_eq!(
-        eval("return 9223372036854775807 + 1"),
-        "-9223372036854775808"
-    ); // wraps
-    assert_eq!(eval("return 1 == 1.0"), "true");
-    assert_eq!(eval("return 1 < 1.5"), "true");
-    assert_eq!(eval("return 0.0 == -0.0"), "true");
-    assert_eq!(eval("return 10 // 0.0"), "inf");
-    assert_eq!(eval("return 3 & 5"), "1");
-    assert_eq!(eval("return 3 | 5"), "7");
-    assert_eq!(eval("return 3 ~ 5"), "6");
-    assert_eq!(eval("return ~0"), "-1");
-    assert_eq!(eval("return 1 << 4"), "16");
-    assert_eq!(eval("return -1 >> 56"), "255"); // logical shift
-    assert_eq!(eval("return 1 << 64"), "0");
-    assert_eq!(eval("return 2.0 & 3"), "2"); // exact float converts
-    assert_eq!(eval("return 0/0 ~= 0/0"), "true"); // NaN
-    assert_eq!(eval("return (0/0) < 1"), "false");
-    assert_eq!(eval("return 1 < (0/0)"), "false");
+#[test_case("return 1 + 2" => "3"; "integer_add")]
+#[test_case("return 7 / 2" => "3.5"; "division_is_always_float")]
+#[test_case("return 7 // 2" => "3"; "floor_division")]
+#[test_case("return -7 // 2" => "-4"; "negative_floor_division")]
+#[test_case("return 7 % 3" => "1"; "modulo")]
+#[test_case("return -7 % 3" => "2"; "modulo_follows_divisor_sign")]
+#[test_case("return 7.0 // 2" => "3.0"; "float_floor_division_stays_float")]
+#[test_case("return 2 ^ 10" => "1024.0"; "power_is_always_float")]
+#[test_case("return 1 + 0.5" => "1.5"; "mixed_int_float_add")]
+#[test_case("return 9223372036854775807 + 1" => "-9223372036854775808"; "integer_overflow_wraps")]
+#[test_case("return 1 == 1.0" => "true"; "int_float_equality")]
+#[test_case("return 1 < 1.5" => "true"; "int_float_less_than")]
+#[test_case("return 0.0 == -0.0" => "true"; "negative_zero_equals_zero")]
+#[test_case("return 10 // 0.0" => "inf"; "float_division_by_zero_is_inf")]
+#[test_case("return 3 & 5" => "1"; "bitwise_and")]
+#[test_case("return 3 | 5" => "7"; "bitwise_or")]
+#[test_case("return 3 ~ 5" => "6"; "bitwise_xor")]
+#[test_case("return ~0" => "-1"; "bitwise_not")]
+#[test_case("return 1 << 4" => "16"; "shift_left")]
+#[test_case("return -1 >> 56" => "255"; "logical_shift_right")]
+#[test_case("return 1 << 64" => "0"; "shift_left_past_width")]
+#[test_case("return 2.0 & 3" => "2"; "exact_float_converts_to_integer")]
+#[test_case("return 0/0 ~= 0/0" => "true"; "nan_not_equal_to_itself")]
+#[test_case("return (0/0) < 1" => "false"; "nan_less_than_is_false")]
+#[test_case("return 1 < (0/0)" => "false"; "less_than_nan_is_false")]
+fn numbers_54_semantics(src: &str) -> String {
+    eval(src)
 }
 
-#[test]
-fn integer_division_by_zero_errors() {
-    assert!(run_err("return 1 // 0").contains("attempt to divide by zero"));
-    assert!(run_err("return 1 % 0").contains("n%0"));
-    assert!(run_err("return 1.5 & 2").contains("no integer representation"));
-    assert!(run_err("return {} + 1").contains("arithmetic"));
+#[test_case("return 1 // 0", "attempt to divide by zero"; "integer_division_by_zero")]
+#[test_case("return 1 % 0", "n%0"; "modulo_by_zero")]
+#[test_case("return 1.5 & 2", "no integer representation"; "non_integer_bitwise_operand")]
+#[test_case("return {} + 1", "arithmetic"; "table_arithmetic")]
+fn integer_division_by_zero_errors(src: &str, needle: &str) {
+    assert!(run_err(src).contains(needle));
 }
 
 #[test]
@@ -350,104 +348,50 @@ fn long_string_length_and_ordering() {
     );
 }
 
-#[test]
-fn tostring_conversions() {
-    assert_eq!(eval("return tostring(nil)"), "nil");
-    assert_eq!(eval("return tostring(true)"), "true");
-    assert_eq!(eval("return tostring(42)"), "42");
-    assert_eq!(eval("return tostring(1.0)"), "1.0");
-    assert_eq!(eval("return tostring(1/3)"), "0.33333333333333");
-    assert_eq!(eval("return tonumber('42')"), "42");
-    assert_eq!(eval("return tonumber('  -0x10  ')"), "-16");
-    assert_eq!(eval("return tonumber('3.5e2')"), "350.0");
-    assert_eq!(eval("return tonumber('zz', 36)"), "1295");
-    assert_eq!(eval("return tonumber('hello')"), "nil");
-    assert_eq!(
-        eval("return type(3) .. type('') .. type(nil)"),
-        "numberstringnil"
-    );
+#[test_case("return tostring(nil)" => "nil"; "nil")]
+#[test_case("return tostring(true)" => "true"; "boolean")]
+#[test_case("return tostring(42)" => "42"; "integer")]
+#[test_case("return tostring(1.0)" => "1.0"; "float_keeps_point_zero")]
+#[test_case("return tostring(1/3)" => "0.33333333333333"; "float_precision")]
+#[test_case("return tonumber('42')" => "42"; "tonumber_integer_string")]
+#[test_case("return tonumber('  -0x10  ')" => "-16"; "tonumber_hex_with_whitespace")]
+#[test_case("return tonumber('3.5e2')" => "350.0"; "tonumber_exponent")]
+#[test_case("return tonumber('zz', 36)" => "1295"; "tonumber_base_36")]
+#[test_case("return tonumber('hello')" => "nil"; "tonumber_invalid_returns_nil")]
+#[test_case("return type(3) .. type('') .. type(nil)" => "numberstringnil"; "type_concatenation")]
+fn tostring_conversions(src: &str) -> String {
+    eval(src)
 }
 
-#[test]
-fn tonumber_signed_integer_boundaries() {
-    // The sign is parsed together with the digits, so the exact signed
-    // minimum stays an integer (matching PUC's `luaO_str2num`).
-    assert_eq!(
-        eval("return math.type(tonumber('-9223372036854775808'))"),
-        "integer"
-    );
-    assert_eq!(
-        eval("return tonumber('-9223372036854775808') == math.mininteger"),
-        "true"
-    );
-    // One past the signed minimum is a genuine float numeral, positive side too.
-    assert_eq!(
-        eval("return math.type(tonumber('-9223372036854775809'))"),
-        "float"
-    );
-    assert_eq!(
-        eval("return math.type(tonumber('9223372036854775809'))"),
-        "float"
-    );
-    assert_eq!(
-        eval("return tonumber('-9223372036854775809') == -9223372036854775809"),
-        "true"
-    );
-    assert_eq!(
-        eval("return tonumber('9223372036854775809') == 9223372036854775809"),
-        "true"
-    );
-    // No whitespace is allowed between a sign and its digits.
-    assert_eq!(eval("return tonumber('+ 0.01')"), "nil");
-    assert_eq!(eval("return tonumber('- 0.01')"), "nil");
-    assert_eq!(eval("return tonumber('+0.01')"), "0.01");
+#[test_case("return math.type(tonumber('-9223372036854775808'))" => "integer"; "signed_minimum_stays_integer")]
+#[test_case("return tonumber('-9223372036854775808') == math.mininteger" => "true"; "signed_minimum_equals_mininteger")]
+#[test_case("return math.type(tonumber('-9223372036854775809'))" => "float"; "one_past_signed_minimum_is_float")]
+#[test_case("return math.type(tonumber('9223372036854775809'))" => "float"; "positive_one_past_signed_max_is_float")]
+#[test_case("return tonumber('-9223372036854775809') == -9223372036854775809" => "true"; "negative_overflow_float_equality")]
+#[test_case("return tonumber('9223372036854775809') == 9223372036854775809" => "true"; "positive_overflow_float_equality")]
+#[test_case("return tonumber('+ 0.01')" => "nil"; "sign_space_rejected_plus")]
+#[test_case("return tonumber('- 0.01')" => "nil"; "sign_space_rejected_minus")]
+#[test_case("return tonumber('+0.01')" => "0.01"; "sign_without_space_accepted")]
+fn tonumber_signed_integer_boundaries(src: &str) -> String {
+    eval(src)
 }
 
 // ---- control flow ----
 
-#[test]
-fn control_flow() {
-    assert_eq!(
-        eval("local s = 0 for i = 1, 10 do s = s + i end return s"),
-        "55"
-    );
-    assert_eq!(
-        eval("local s = 0 for i = 10, 1, -2 do s = s + i end return s"),
-        "30"
-    );
-    assert_eq!(
-        eval("local s = 0 for i = 1, 0 do s = s + 1 end return s"),
-        "0"
-    );
-    assert_eq!(
-        eval("local s = 0.0 for i = 1.0, 2.0, 0.5 do s = s + i end return s"),
-        "4.5"
-    );
-    assert_eq!(
-        eval("local n, i = 0, 1 while i <= 100 do n = n + i i = i + 1 end return n"),
-        "5050"
-    );
-    assert_eq!(
-        eval("local i = 0 repeat i = i + 1 until i >= 5 return i"),
-        "5"
-    );
-    assert_eq!(
-        eval("local done repeat local x = 5 done = x until done return done"),
-        "5" // until sees body locals
-    );
-    assert_eq!(
-        eval(
-            "local r = '' for i = 1, 10 do if i % 2 == 0 then r = r .. i elseif i == 5 then break end end return r"
-        ),
-        "24"
-    );
-    assert_eq!(
-        eval("if false then return 1 elseif nil then return 2 else return 3 end"),
-        "3"
-    );
-    assert_eq!(eval("return false or nil"), "nil");
-    assert_eq!(eval("return nil and 1 or 2"), "2");
-    assert_eq!(eval("return 0 and 'zero is truthy'"), "zero is truthy");
+#[test_case("local s = 0 for i = 1, 10 do s = s + i end return s" => "55"; "numeric_for_sums")]
+#[test_case("local s = 0 for i = 10, 1, -2 do s = s + i end return s" => "30"; "numeric_for_negative_step")]
+#[test_case("local s = 0 for i = 1, 0 do s = s + 1 end return s" => "0"; "numeric_for_empty_range")]
+#[test_case("local s = 0.0 for i = 1.0, 2.0, 0.5 do s = s + i end return s" => "4.5"; "numeric_for_float_step")]
+#[test_case("local n, i = 0, 1 while i <= 100 do n = n + i i = i + 1 end return n" => "5050"; "while_loop")]
+#[test_case("local i = 0 repeat i = i + 1 until i >= 5 return i" => "5"; "repeat_until")]
+#[test_case("local done repeat local x = 5 done = x until done return done" => "5"; "until_sees_body_locals")]
+#[test_case("local r = '' for i = 1, 10 do if i % 2 == 0 then r = r .. i elseif i == 5 then break end end return r" => "24"; "break_in_loop")]
+#[test_case("if false then return 1 elseif nil then return 2 else return 3 end" => "3"; "if_elseif_else")]
+#[test_case("return false or nil" => "nil"; "or_returns_nil")]
+#[test_case("return nil and 1 or 2" => "2"; "and_or_chain")]
+#[test_case("return 0 and 'zero is truthy'" => "zero is truthy"; "zero_is_truthy")]
+fn control_flow(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
@@ -563,63 +507,33 @@ fn functions_and_recursion() {
     );
 }
 
-#[test]
-fn closures_and_upvalues() {
-    assert_eq!(
-        eval(
-            "local function counter() local n = 0 return function() n = n + 1 return n end end \
-             local c = counter() c() c() return c()"
-        ),
-        "3"
-    );
-    // two closures sharing one upvalue
-    assert_eq!(
-        eval(
-            "local function make() local n = 0 return function() n = n + 1 end, function() return n end end \
-             local inc, get = make() inc() inc() return get()"
-        ),
-        "2"
-    );
-    // each loop iteration captures a fresh variable
-    assert_eq!(
-        eval(
-            "local fs = {} for i = 1, 3 do fs[i] = function() return i end end \
-             return fs[1]() * 100 + fs[2]() * 10 + fs[3]()"
-        ),
-        "123"
-    );
-    // upvalue through two nesting levels
-    assert_eq!(
-        eval(
-            "local x = 1 local function outer() local function inner() x = x + 1 return x end return inner end \
-             return outer()()"
-        ),
-        "2"
-    );
+#[test_case(
+    "local function counter() local n = 0 return function() n = n + 1 return n end end \
+             local c = counter() c() c() return c()" => "3"; "closure_state_persists"
+)]
+#[test_case(
+    "local function make() local n = 0 return function() n = n + 1 end, function() return n end end \
+             local inc, get = make() inc() inc() return get()" => "2"; "two_closures_share_upvalue"
+)]
+#[test_case(
+    "local fs = {} for i = 1, 3 do fs[i] = function() return i end end \
+             return fs[1]() * 100 + fs[2]() * 10 + fs[3]()" => "123"; "loop_iteration_captures_fresh_variable"
+)]
+#[test_case(
+    "local x = 1 local function outer() local function inner() x = x + 1 return x end return inner end \
+             return outer()()" => "2"; "upvalue_through_two_levels"
+)]
+fn closures_and_upvalues(src: &str) -> String {
+    eval(src)
 }
 
-#[test]
-fn varargs() {
-    assert_eq!(
-        eval("local function f(...) return select('#', ...) end return f(1, nil, 3)"),
-        "3"
-    );
-    assert_eq!(
-        eval("local function f(...) local a, b = ... return a + b end return f(10, 20, 30)"),
-        "30"
-    );
-    assert_eq!(
-        eval("local function f(...) return ... end return (select(2, f(1, 2, 3)))"),
-        "2"
-    );
-    assert_eq!(
-        eval("local function f(a, ...) return a + select('#', ...) end return f(10, 1, 1, 1)"),
-        "13"
-    );
-    assert_eq!(
-        eval("local function f(...) local t = {...} return #t end return f(1, 2, 3)"),
-        "3"
-    );
+#[test_case("local function f(...) return select('#', ...) end return f(1, nil, 3)" => "3"; "select_count")]
+#[test_case("local function f(...) local a, b = ... return a + b end return f(10, 20, 30)" => "30"; "extra_args_ignored")]
+#[test_case("local function f(...) return ... end return (select(2, f(1, 2, 3)))" => "2"; "select_from_second")]
+#[test_case("local function f(a, ...) return a + select('#', ...) end return f(10, 1, 1, 1)" => "13"; "named_param_plus_count")]
+#[test_case("local function f(...) local t = {...} return #t end return f(1, 2, 3)" => "3"; "pack_into_table")]
+fn varargs(src: &str) -> String {
+    eval(src)
 }
 
 // ---- tables ----
@@ -965,19 +879,12 @@ fn mutual_tail_recursion_is_constant_depth() {
     );
 }
 
-#[test]
-fn tail_call_shapes() {
-    // plain call, dot access, method call, and parenthesized callee
-    assert_eq!(eval("local function f() return 1 end return f()"), "1");
-    assert_eq!(
-        eval("local t = {} function t.f() return 2 end return t.f()"),
-        "2"
-    );
-    assert_eq!(
-        eval("local t = {v = 3} function t:m() return self.v end return t:m()"),
-        "3"
-    );
-    assert_eq!(eval("local f = function() return 4 end return (f)()"), "4");
+#[test_case("local function f() return 1 end return f()" => "1"; "plain_call")]
+#[test_case("local t = {} function t.f() return 2 end return t.f()" => "2"; "dot_access")]
+#[test_case("local t = {v = 3} function t:m() return self.v end return t:m()" => "3"; "method_call")]
+#[test_case("local f = function() return 4 end return (f)()" => "4"; "parenthesized_callee")]
+fn tail_call_shapes(src: &str) -> String {
+    eval(src)
 }
 
 #[test]
