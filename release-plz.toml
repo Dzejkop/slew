@@ -1,0 +1,11 @@
+# Single publishable crate. On every push to `main` release-plz opens (or
+# updates) a release PR that bumps the version and writes CHANGELOG.md; once
+# that PR is merged it tags `vX.Y.Z`, publishes to crates.io, and creates the
+# GitHub release. Publishing authenticates via crates.io Trusted Publishing
+# (OIDC), so no registry token is stored.
+[workspace]
+changelog_update = true
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"

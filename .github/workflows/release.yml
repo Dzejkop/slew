@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  # Lets you re-run a failed release without pushing an empty commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Publishes versions already merged via the release PR: pushes the `vX.Y.Z`
+  # tag, publishes to crates.io, and creates the GitHub release.
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    # Additional gate (and the OIDC `environment` claim). Set this to the same
+    # environment name you configure under crates.io -> Trusted Publishing, or
+    # delete the line if you left that field blank.
+    environment: release
+    permissions:
+      # Push tags and create GitHub releases.
+      contents: write
+      # Read the PR associated with the merged release commit.
+      pull-requests: read
+      # OIDC: release-plz exchanges this for a short-lived crates.io token, so
+      # no CARGO_REGISTRY_TOKEN secret is needed. Trusted Publishing must be
+      # configured per crate on crates.io, and a brand-new crate has to be
+      # published manually once before OIDC will work.
+      id-token: write
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history is required to find the commits since the last release.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Opens/updates the standing release PR with version bumps and changelog
+  # entries derived from conventional commits.
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    # Run after the publish job, but even if it failed or was skipped: the PR
+    # job is how a broken release gets fixed.
+    needs: release-plz-release
+    if: ${{ !cancelled() }}
+    permissions:
+      # Push the release branch.
+      contents: write
+      # Open and update the release pull request.
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
