@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Library crate: only refresh the lockfile, never the version requirements
+  # in Cargo.toml, so we opt into MSRV/dependency bumps deliberately.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    versioning-strategy: "lockfile-only"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]

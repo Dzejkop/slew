@@ -11,13 +11,16 @@
 #   scripts/run-lua-tests.sh              # run the corpus
 #   SLEW_BLESS=1 scripts/run-lua-tests.sh # refresh the baseline
 #   SLEW_LUA_TESTS_DIR=/path scripts/...  # use an existing extraction
+#   SLEW_LUA_TESTS_CACHE=/dir scripts/... # where to download/cache the archive
 #   SLEW_LUA_TESTS_TIMEOUT=60 scripts/... # per-file wall-clock budget (s)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="5.4.9"
 sha256="7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca"
-cache_dir="$repo_root/target/lua-tests"
+# Kept separate from `target/` so CI can cache the (pinned, checksum-verified)
+# suite independently of build artifacts.
+cache_dir="${SLEW_LUA_TESTS_CACHE:-$repo_root/target/lua-tests}"
 suite_dir="${SLEW_LUA_TESTS_DIR:-$cache_dir/lua-$version-tests}"
 
 check_sha256() {

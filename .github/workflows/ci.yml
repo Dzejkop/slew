@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Builds the flake package with the toolchain pinned in flake.lock. The
+  # derivation's checkPhase runs the whole `cargo test` suite, so this single
+  # `nix build` covers compile + test and is cached in the Nix store.
+  nix-build:
+    name: nix build
+    runs-on: ubuntu-latest
+    steps:
+      - &checkout
+        uses: actions/checkout@v7
+      - &nix
+        uses: DeterminateSystems/nix-installer-action@v23
+      - &magic-nix-cache
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+      - run: nix build .# --print-build-logs
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *nix
+      - *magic-nix-cache
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-lint-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-lint-
+      - run: nix develop --command cargo fmt --all -- --check
+      # Lint levels live in `[lints]` in Cargo.toml (all + pedantic); the
+      # `-D warnings` turns any regression into a CI failure.
+      - run: nix develop --command cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: nix develop --command cargo clippy --all-targets --no-default-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *nix
+      - *magic-nix-cache
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-test-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-test-
+      - run: nix develop --command cargo test --all-features --locked
+      # The `fs`/`repl` features are default-on; make sure the bare library
+      # (no filesystem adapter, no reedline) still builds.
+      - run: nix develop --command cargo build --no-default-features --locked
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - *checkout
+      - *nix
+      - *magic-nix-cache
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-docs-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-docs-
+      - run: nix develop --command cargo doc --no-deps --all-features --locked

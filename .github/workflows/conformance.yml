@@ -1,0 +1,54 @@
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lua-5-4:
+    name: Lua 5.4.9 conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Cache location understood by scripts/run-lua-tests.sh; kept out of
+      # `target/` so it is independent of the cargo build cache.
+      SLEW_LUA_TESTS_CACHE: ${{ github.workspace }}/.lua-tests
+      # Per-file wall-clock budget; a timeout past the baseline is a regression.
+      SLEW_LUA_TESTS_TIMEOUT: "60"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      # The archive URL is pinned and checksum-verified inside the script, so
+      # the cache key is just the pinned sha256. On a miss the script downloads
+      # and verifies; on a hit the suite is reused verbatim.
+      - name: Cache upstream Lua test suite
+        uses: actions/cache@v6
+        with:
+          path: .lua-tests
+          key: lua-5.4.9-tests-7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-conformance-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-conformance-
+
+      - name: Run conformance suite
+        run: nix develop --command scripts/run-lua-tests.sh

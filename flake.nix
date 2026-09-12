@@ -68,6 +68,10 @@
             clippy
             rustfmt
             pkg-config
+            # Needed by scripts/run-lua-tests.sh to fetch the pinned corpus.
+            curl
+            cacert
+            gnutar
           ];
 
           RUST_BACKTRACE = "1";
