@@ -27,6 +27,7 @@ required-features = ["repl"]
 
 [dev-dependencies]
 ratatui = "0.30.2"
+test-case = "3.3.1"
 
 [lints.rust]
 unsafe_code = "forbid"

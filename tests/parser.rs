@@ -1,5 +1,6 @@
 use slew::ast::*;
 use slew::parser::parse;
+use test_case::test_case;
 
 fn ok(src: &str) -> Block {
     parse(src.as_bytes()).unwrap_or_else(|e| panic!("{e}\nsource: {src}"))
@@ -12,51 +13,51 @@ fn fails(src: &str) {
     );
 }
 
-#[test]
-fn statements() {
-    ok(";;;");
-    ok("local a, b <const>, c <close> = 1, 2");
-    ok("a, b.c, d[1] = f(), 2, 3");
-    ok("do local x = 1 end");
-    ok("while a < 10 do a = a + 1 end");
-    ok("repeat a = a + 1 until a > 10");
-    ok("if a then b() elseif c then d() elseif e then f() else g() end");
-    ok("for i = 1, 10 do end for i = 10, 1, -1 do end");
-    ok("for k, v in pairs(t) do print(k, v) end");
-    ok("function a.b.c:d(x, y, ...) return x end");
-    ok("local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end");
-    ok("goto continue ::continue:: break");
-    ok("return");
-    ok("return 1, 2, f()");
-    ok("return;");
+#[test_case(";;;"; "semicolons_only")]
+#[test_case("local a, b <const>, c <close> = 1, 2"; "attributes_and_locals")]
+#[test_case("a, b.c, d[1] = f(), 2, 3"; "multi_assignment")]
+#[test_case("do local x = 1 end"; "do_block")]
+#[test_case("while a < 10 do a = a + 1 end"; "while_loop")]
+#[test_case("repeat a = a + 1 until a > 10"; "repeat_loop")]
+#[test_case("if a then b() elseif c then d() elseif e then f() else g() end"; "if_elseif_else")]
+#[test_case("for i = 1, 10 do end for i = 10, 1, -1 do end"; "numeric_for")]
+#[test_case("for k, v in pairs(t) do print(k, v) end"; "generic_for")]
+#[test_case("function a.b.c:d(x, y, ...) return x end"; "function_sugar")]
+#[test_case("local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end"; "local_function")]
+#[test_case("goto continue ::continue:: break"; "goto_and_label")]
+#[test_case("return"; "bare_return")]
+#[test_case("return 1, 2, f()"; "return_values")]
+#[test_case("return;"; "return_with_semicolon")]
+fn statements(src: &str) {
+    ok(src);
 }
 
-#[test]
-fn expressions() {
-    ok("x = nil or false or true and 1");
-    ok("x = -2 ^ 2"); // -(2^2)
-    ok("x = a .. b .. c");
-    ok("x = 1 + 2 * 3 - 4 / 5 // 6 % 7");
-    ok("x = a < b or a > c or a <= d or a >= e or a ~= f or a == g");
-    ok("x = a & b | c ~ d << e >> f");
-    ok("x = ~a + -b + not c + #d");
-    ok("x = f()(g())[h()].i:j(k)");
-    ok("x = f 'string arg'");
-    ok("x = f {1, 'two', three = 3}");
-    ok("x = obj:method 'arg'");
-    ok("x = (f())");
-    ok("x = ...");
-    ok("x = function(a, b) return a + b end");
+#[test_case("x = nil or false or true and 1"; "logical_ops")]
+#[test_case("x = -2 ^ 2"; "unary_minus_binds_looser_than_power")]
+#[test_case("x = a .. b .. c"; "concat")]
+#[test_case("x = 1 + 2 * 3 - 4 / 5 // 6 % 7"; "arithmetic")]
+#[test_case("x = a < b or a > c or a <= d or a >= e or a ~= f or a == g"; "comparisons")]
+#[test_case("x = a & b | c ~ d << e >> f"; "bitwise")]
+#[test_case("x = ~a + -b + not c + #d"; "unary_ops")]
+#[test_case("x = f()(g())[h()].i:j(k)"; "call_chain")]
+#[test_case("x = f 'string arg'"; "string_call_arg")]
+#[test_case("x = f {1, 'two', three = 3}"; "table_call_arg")]
+#[test_case("x = obj:method 'arg'"; "method_call_arg")]
+#[test_case("x = (f())"; "paren_expr")]
+#[test_case("x = ..."; "vararg")]
+#[test_case("x = function(a, b) return a + b end"; "anonymous_function")]
+fn expressions(src: &str) {
+    ok(src);
 }
 
-#[test]
-fn table_constructors() {
-    ok("t = {}");
-    ok("t = {1, 2, 3}");
-    ok("t = {1, 2, 3,}");
-    ok("t = {a = 1, b = 2; [k] = v, 10}");
-    ok("t = {f()}");
-    ok("t = {nested = {1, {2, {3}}}}");
+#[test_case("t = {}"; "empty_table")]
+#[test_case("t = {1, 2, 3}"; "array_table")]
+#[test_case("t = {1, 2, 3,}"; "trailing_comma")]
+#[test_case("t = {a = 1, b = 2; [k] = v, 10}"; "mixed_keys")]
+#[test_case("t = {f()}"; "call_in_table")]
+#[test_case("t = {nested = {1, {2, {3}}}}"; "nested_tables")]
+fn table_constructors(src: &str) {
+    ok(src);
 }
 
 #[test]
@@ -116,18 +117,18 @@ fn method_sugar() {
     assert_eq!(&*body.params[1], "x");
 }
 
-#[test]
-fn syntax_errors() {
-    fails("x =");
-    fails("if a then");
-    fails("for i = 1 do end");
-    fails("local 1 = 2");
-    fails("f() = 3");
-    fails("x = y z"); // two expression statements that aren't calls
-    fails("return return");
-    fails("local x <unknown> = 1");
-    fails("a.b"); // not a statement
-    fails("end");
+#[test_case("x ="; "missing_rhs")]
+#[test_case("if a then"; "unterminated_if")]
+#[test_case("for i = 1 do end"; "numeric_for_missing_limit")]
+#[test_case("local 1 = 2"; "bad_local_name")]
+#[test_case("f() = 3"; "assign_to_call")]
+#[test_case("x = y z"; "adjacent_expressions")]
+#[test_case("return return"; "return_return")]
+#[test_case("local x <unknown> = 1"; "unknown_attribute")]
+#[test_case("a.b"; "non_statement_expression")]
+#[test_case("end"; "stray_end")]
+fn syntax_errors(src: &str) {
+    fails(src);
 }
 
 #[test]
