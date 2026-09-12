@@ -1,2 +1,4 @@
 /target
 /result
+/wasm/target
+/wasm/www/pkg
