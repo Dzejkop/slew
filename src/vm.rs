@@ -3036,7 +3036,6 @@ impl<C> Lua<C> {
         Ok(())
     }
 
-    #[expect(clippy::needless_return)]
     fn exec_one(
         &mut self,
         tid: ThreadId,
@@ -3289,25 +3288,60 @@ impl<C> Lua<C> {
             (i, f.base)
         };
         match instr {
-            Instr::LoadK { dst, k } => return self.exec_load_k(th, base, dst, k),
-            Instr::LoadNil { dst, n } => return self.exec_load_nil(th, base, dst, n),
-            Instr::LoadBool { dst, b } => return self.exec_load_bool(th, base, dst, b),
-            Instr::Move { dst, src } => return self.exec_move(th, base, dst, src),
-            Instr::GetUpval { dst, up } => return self.exec_get_upval(th, tid, base, dst, up),
-            Instr::SetUpval { up, src } => return self.exec_set_upval(th, tid, base, up, src),
+            Instr::LoadK { dst, k } => {
+                th.stack[base + dst as usize] = kval(th, k);
+            }
+            Instr::LoadNil { dst, n } => {
+                for i in 0..n as usize {
+                    th.stack[base + dst as usize + i] = Value::Nil;
+                }
+            }
+            Instr::LoadBool { dst, b } => {
+                th.stack[base + dst as usize] = Value::Bool(b);
+            }
+            Instr::Move { dst, src } => {
+                th.stack[base + dst as usize] = th.stack[base + src as usize];
+            }
+            Instr::GetUpval { dst, up } => {
+                let id = self.frame_upval(th, up);
+                th.stack[base + dst as usize] = self.read_upval(tid, th, id);
+            }
+            Instr::SetUpval { up, src } => {
+                let id = self.frame_upval(th, up);
+                let v = th.stack[base + src as usize];
+                self.write_upval(tid, th, id, v);
+            }
             Instr::GetIndex { dst, obj, key } => {
-                return self.exec_get_index(th, fuel, base, dst, obj, key);
+                let o = th.stack[base + obj as usize];
+                let k = th.stack[base + key as usize];
+                if let Some(v) = self.index_chain(th, fuel, o, k, base + dst as usize)? {
+                    th.stack[base + dst as usize] = v;
+                }
             }
             Instr::GetField { dst, obj, k } => {
-                return self.exec_get_field(th, fuel, base, dst, obj, k);
+                let o = th.stack[base + obj as usize];
+                let key = kval(th, k);
+                if let Some(v) = self.index_chain(th, fuel, o, key, base + dst as usize)? {
+                    th.stack[base + dst as usize] = v;
+                }
             }
             Instr::SetIndex { obj, key, src } => {
-                return self.exec_set_index(th, fuel, base, obj, key, src);
+                let o = th.stack[base + obj as usize];
+                let k = th.stack[base + key as usize];
+                let v = th.stack[base + src as usize];
+                self.newindex_chain(th, fuel, o, k, v)?;
             }
             Instr::SetField { obj, k, src } => {
-                return self.exec_set_field(th, fuel, base, obj, k, src);
+                let o = th.stack[base + obj as usize];
+                let key = kval(th, k);
+                let v = th.stack[base + src as usize];
+                self.newindex_chain(th, fuel, o, key, v)?;
             }
-            Instr::NewTable { dst } => return self.exec_new_table(th, fuel, tid, base, dst),
+            Instr::NewTable { dst } => {
+                *fuel -= 2;
+                th.stack[base + dst as usize] = self.new_table();
+                self.maybe_gc(tid, th)?;
+            }
             Instr::SetList {
                 obj,
                 base: b,
@@ -3318,17 +3352,25 @@ impl<C> Lua<C> {
                 return self.exec_arith(th, fuel, base, op, dst, lhs, rhs);
             }
             Instr::Unary { op, dst, src } => {
-                return self.exec_unary(th, fuel, base, op, dst, src);
+                let v = th.stack[base + src as usize];
+                self.unary(th, fuel, op, v, base + dst as usize)?;
             }
             Instr::Cmp { op, dst, lhs, rhs } => {
-                return self.exec_cmp(th, fuel, base, op, dst, lhs, rhs);
+                let a = th.stack[base + lhs as usize];
+                let b = th.stack[base + rhs as usize];
+                self.compare(th, fuel, op, a, b, base + dst as usize)?;
             }
             Instr::Concat { dst, base: b, n } => {
-                return self.exec_concat(th, fuel, tid, dst, b, n);
+                self.concat_run(th, fuel, dst, b, n)?;
+                self.maybe_gc(tid, th)?;
             }
-            Instr::Jump { off } => return self.exec_jump(th, off),
+            Instr::Jump { off } => {
+                jump(th, off);
+            }
             Instr::Test { src, if_true, off } => {
-                return self.exec_test(th, base, src, if_true, off);
+                if th.stack[base + src as usize].truthy() == if_true {
+                    jump(th, off);
+                }
             }
             Instr::Call {
                 base: b,
@@ -3345,168 +3387,24 @@ impl<C> Lua<C> {
             Instr::Closure { dst, p } => {
                 return self.exec_closure(th, fuel, tid, base, dst, p);
             }
-            Instr::Close { from } => return self.exec_close(th, fuel, base, from),
+            Instr::Close { from } => {
+                self.close_upvals(th, base + from as usize);
+                self.run_close_tbc(th, fuel, from, Value::Nil)?;
+            }
             Instr::Tbc { reg, name } => return self.exec_tbc(th, base, reg, name),
-            Instr::ForPrep { base: b, off } => return self.exec_for_prep(th, base, b, off),
+            Instr::ForPrep { base: b, off } => {
+                self.for_prep(th, base + b as usize, off)?;
+            }
             Instr::ForLoop { base: b, off } => return self.exec_for_loop(th, base, b, off),
-            Instr::TForLoop { base: b, off } => return self.exec_t_for_loop(th, base, b, off),
+            Instr::TForLoop { base: b, off } => {
+                let a = base + b as usize;
+                let v = th.stack[a + 4];
+                if v != Value::Nil {
+                    th.stack[a + 2] = v;
+                    jump(th, off);
+                }
+            }
         }
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_load_k(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        dst: u8,
-        k: u16,
-    ) -> Result<Flow, VmError> {
-        th.stack[base + dst as usize] = kval(th, k);
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_load_nil(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        dst: u8,
-        n: u8,
-    ) -> Result<Flow, VmError> {
-        for i in 0..n as usize {
-            th.stack[base + dst as usize + i] = Value::Nil;
-        }
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_load_bool(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        dst: u8,
-        b: bool,
-    ) -> Result<Flow, VmError> {
-        th.stack[base + dst as usize] = Value::Bool(b);
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_move(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        dst: u8,
-        src: u8,
-    ) -> Result<Flow, VmError> {
-        th.stack[base + dst as usize] = th.stack[base + src as usize];
-        Ok(Flow::Continue)
-    }
-
-    fn exec_get_upval(
-        &mut self,
-        th: &mut Thread,
-        tid: ThreadId,
-        base: usize,
-        dst: u8,
-        up: u8,
-    ) -> Result<Flow, VmError> {
-        let id = self.frame_upval(th, up);
-        th.stack[base + dst as usize] = self.read_upval(tid, th, id);
-        Ok(Flow::Continue)
-    }
-
-    fn exec_set_upval(
-        &mut self,
-        th: &mut Thread,
-        tid: ThreadId,
-        base: usize,
-        up: u8,
-        src: u8,
-    ) -> Result<Flow, VmError> {
-        let id = self.frame_upval(th, up);
-        let v = th.stack[base + src as usize];
-        self.write_upval(tid, th, id, v);
-        Ok(Flow::Continue)
-    }
-
-    fn exec_get_index(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        dst: u8,
-        obj: u8,
-        key: u8,
-    ) -> Result<Flow, VmError> {
-        let o = th.stack[base + obj as usize];
-        let k = th.stack[base + key as usize];
-        if let Some(v) = self.index_chain(th, fuel, o, k, base + dst as usize)? {
-            th.stack[base + dst as usize] = v;
-        }
-        Ok(Flow::Continue)
-    }
-
-    fn exec_get_field(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        dst: u8,
-        obj: u8,
-        k: u16,
-    ) -> Result<Flow, VmError> {
-        let o = th.stack[base + obj as usize];
-        let key = kval(th, k);
-        if let Some(v) = self.index_chain(th, fuel, o, key, base + dst as usize)? {
-            th.stack[base + dst as usize] = v;
-        }
-        Ok(Flow::Continue)
-    }
-
-    fn exec_set_index(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        obj: u8,
-        key: u8,
-        src: u8,
-    ) -> Result<Flow, VmError> {
-        let o = th.stack[base + obj as usize];
-        let k = th.stack[base + key as usize];
-        let v = th.stack[base + src as usize];
-        self.newindex_chain(th, fuel, o, k, v)?;
-        Ok(Flow::Continue)
-    }
-
-    fn exec_set_field(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        obj: u8,
-        k: u16,
-        src: u8,
-    ) -> Result<Flow, VmError> {
-        let o = th.stack[base + obj as usize];
-        let key = kval(th, k);
-        let v = th.stack[base + src as usize];
-        self.newindex_chain(th, fuel, o, key, v)?;
-        Ok(Flow::Continue)
-    }
-
-    fn exec_new_table(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        tid: ThreadId,
-        base: usize,
-        dst: u8,
-    ) -> Result<Flow, VmError> {
-        *fuel -= 2;
-        th.stack[base + dst as usize] = self.new_table();
-        self.maybe_gc(tid, th)?;
         Ok(Flow::Continue)
     }
 
@@ -3598,72 +3496,6 @@ impl<C> Lua<C> {
                     fuel,
                 )?;
             }
-        }
-        Ok(Flow::Continue)
-    }
-
-    fn exec_unary(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        op: UnaryOp,
-        dst: u8,
-        src: u8,
-    ) -> Result<Flow, VmError> {
-        let v = th.stack[base + src as usize];
-        self.unary(th, fuel, op, v, base + dst as usize)?;
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    fn exec_cmp(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        op: CmpOp,
-        dst: u8,
-        lhs: u8,
-        rhs: u8,
-    ) -> Result<Flow, VmError> {
-        let a = th.stack[base + lhs as usize];
-        let b = th.stack[base + rhs as usize];
-        self.compare(th, fuel, op, a, b, base + dst as usize)?;
-        Ok(Flow::Continue)
-    }
-
-    fn exec_concat(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        tid: ThreadId,
-        dst: u8,
-        b: u8,
-        n: u8,
-    ) -> Result<Flow, VmError> {
-        self.concat_run(th, fuel, dst, b, n)?;
-        self.maybe_gc(tid, th)?;
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_jump(&mut self, th: &mut Thread, off: i32) -> Result<Flow, VmError> {
-        jump(th, off);
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_test(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        src: u8,
-        if_true: bool,
-        off: i32,
-    ) -> Result<Flow, VmError> {
-        if th.stack[base + src as usize].truthy() == if_true {
-            jump(th, off);
         }
         Ok(Flow::Continue)
     }
@@ -3856,18 +3688,6 @@ impl<C> Lua<C> {
         Ok(Flow::Continue)
     }
 
-    fn exec_close(
-        &mut self,
-        th: &mut Thread,
-        fuel: &mut i64,
-        base: usize,
-        from: u8,
-    ) -> Result<Flow, VmError> {
-        self.close_upvals(th, base + from as usize);
-        self.run_close_tbc(th, fuel, from, Value::Nil)?;
-        Ok(Flow::Continue)
-    }
-
     fn exec_tbc(
         &mut self,
         th: &mut Thread,
@@ -3892,17 +3712,6 @@ impl<C> Lua<C> {
                 ));
             }
         }
-        Ok(Flow::Continue)
-    }
-
-    fn exec_for_prep(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        b: u8,
-        off: i32,
-    ) -> Result<Flow, VmError> {
-        self.for_prep(th, base + b as usize, off)?;
         Ok(Flow::Continue)
     }
 
@@ -3934,23 +3743,6 @@ impl<C> Lua<C> {
                 }
             }
             _ => unreachable!("ForLoop after ForPrep normalization"),
-        }
-        Ok(Flow::Continue)
-    }
-
-    #[expect(clippy::unused_self)]
-    fn exec_t_for_loop(
-        &mut self,
-        th: &mut Thread,
-        base: usize,
-        b: u8,
-        off: i32,
-    ) -> Result<Flow, VmError> {
-        let a = base + b as usize;
-        let v = th.stack[a + 4];
-        if v != Value::Nil {
-            th.stack[a + 2] = v;
-            jump(th, off);
         }
         Ok(Flow::Continue)
     }
@@ -4292,13 +4084,26 @@ impl<C> Lua<C> {
             Intrinsic::Resume => self.intrinsic_resume(th, fuel, call),
             Intrinsic::WrapResume(co) => self.intrinsic_wrap_resume(th, fuel, co, call),
             Intrinsic::Yield => self.intrinsic_yield(th, fuel, call),
-            Intrinsic::EnterNonYieldable => self.intrinsic_enter_non_yieldable(th, call),
-            Intrinsic::LeaveNonYieldable => self.intrinsic_leave_non_yieldable(th, call),
+            Intrinsic::EnterNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_add(1);
+                place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+                Ok(())
+            }
+            Intrinsic::LeaveNonYieldable => {
+                th.non_yieldable = th.non_yieldable.saturating_sub(1);
+                place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+                Ok(())
+            }
             Intrinsic::IsYieldable => self.intrinsic_is_yieldable(th, call),
             Intrinsic::CollectGarbage => self.intrinsic_collect_garbage(th, call),
             Intrinsic::Print => self.intrinsic_print(th, call),
             Intrinsic::CoroutineClose => self.intrinsic_coroutine_close(th, fuel, call),
-            Intrinsic::Running => self.intrinsic_running(th, call),
+            Intrinsic::Running => {
+                let cur = Value::Thread(self.current_thread);
+                let is_main = Value::Bool(th.parent.is_none());
+                place_shaped(th, call.ret_to, call.nres, call.shape, &[cur, is_main]);
+                Ok(())
+            }
             Intrinsic::DebugGetinfo => self.intrinsic_debug_getinfo(th, call),
             Intrinsic::DebugTraceback => self.intrinsic_debug_traceback(th, call),
             Intrinsic::DebugGetupvalue => self.intrinsic_debug_getupvalue(th, call),
@@ -4307,7 +4112,16 @@ impl<C> Lua<C> {
             Intrinsic::DebugUpvaluejoin => self.intrinsic_debug_upvaluejoin(th, call),
             Intrinsic::DebugGetmetatable => self.intrinsic_debug_getmetatable(th, call),
             Intrinsic::DebugSetmetatable => self.intrinsic_debug_setmetatable(th, call),
-            Intrinsic::DebugGetregistry => self.intrinsic_debug_getregistry(th, call),
+            Intrinsic::DebugGetregistry => {
+                place_shaped(
+                    th,
+                    call.ret_to,
+                    call.nres,
+                    call.shape,
+                    &[Value::Table(self.globals)],
+                );
+                Ok(())
+            }
             Intrinsic::DebugGethook => self.intrinsic_debug_gethook(th, call),
             Intrinsic::DebugSethook => self.intrinsic_debug_sethook(th, fuel, call),
         }
@@ -4652,28 +4466,6 @@ impl<C> Lua<C> {
         Ok(())
     }
 
-    #[expect(clippy::unused_self)]
-    fn intrinsic_enter_non_yieldable(
-        &mut self,
-        th: &mut Thread,
-        call: IntrinsicCall,
-    ) -> Result<(), VmError> {
-        th.non_yieldable = th.non_yieldable.saturating_add(1);
-        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
-        Ok(())
-    }
-
-    #[expect(clippy::unused_self)]
-    fn intrinsic_leave_non_yieldable(
-        &mut self,
-        th: &mut Thread,
-        call: IntrinsicCall,
-    ) -> Result<(), VmError> {
-        th.non_yieldable = th.non_yieldable.saturating_sub(1);
-        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
-        Ok(())
-    }
-
     fn intrinsic_is_yieldable(
         &mut self,
         th: &mut Thread,
@@ -4764,13 +4556,6 @@ impl<C> Lua<C> {
             ));
         };
         self.begin_close(th, fuel, co, call.ret_to, call.nres, call.shape)
-    }
-
-    fn intrinsic_running(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
-        let cur = Value::Thread(self.current_thread);
-        let is_main = Value::Bool(th.parent.is_none());
-        place_shaped(th, call.ret_to, call.nres, call.shape, &[cur, is_main]);
-        Ok(())
     }
 
     fn intrinsic_debug_getinfo(
@@ -4978,21 +4763,6 @@ impl<C> Lua<C> {
         };
         self.set_raw_metatable(v, mt);
         place_shaped(th, call.ret_to, call.nres, call.shape, &[v]);
-        Ok(())
-    }
-
-    fn intrinsic_debug_getregistry(
-        &mut self,
-        th: &mut Thread,
-        call: IntrinsicCall,
-    ) -> Result<(), VmError> {
-        place_shaped(
-            th,
-            call.ret_to,
-            call.nres,
-            call.shape,
-            &[Value::Table(self.globals)],
-        );
         Ok(())
     }
 
