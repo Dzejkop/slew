@@ -1,3 +1,54 @@
 [workspace]
 resolver = "3"
 members = ["crates/slew", "crates/robot_fleet"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Dzejkop/slew"
+homepage = "https://github.com/Dzejkop/slew"
+
+[workspace.dependencies]
+# The interpreter. `robot_fleet` builds it without the default `repl`/`fs`
+# features; other embedders can opt back in.
+slew = { path = "crates/slew", default-features = false }
+ratatui = "0.30.2"
+reedline = "0.48.0"
+test-case = "3.3.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Lua numbers are `i64`/`f64` and indices are `usize`; the VM converts between
+# them constantly at well-defined truncating/wrapping boundaries. Rewriting
+# every such site with checked conversions would hurt readability without
+# changing behaviour.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+
+# The bytecode dispatcher and the stdlib entry points are deliberately long
+# `match` tables that mirror the reference interpreter; splitting them up makes
+# the control flow harder to follow.
+too_many_lines = "allow"
+
+# Numeric, pattern-matching and VM code follows PUC-Lua's terse naming
+# conventions (`i`, `n`, `x`, `y`, `s`, `ra`, `rb`, ...).
+many_single_char_names = "allow"
+similar_names = "allow"
+
+# `LuaConfig`-style types carry independent boolean switches, which is exactly
+# what this lint flags but reads better than a bitfield here.
+struct_excessive_bools = "allow"
+
+# Stdlib functions share a uniform `Result`-returning registration signature
+# even when a particular implementation cannot fail.
+unnecessary_wraps = "allow"
