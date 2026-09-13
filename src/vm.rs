@@ -600,7 +600,6 @@ pub enum Step {
 /// lives in the `Lua`, this is a handle plus fuel-debt bookkeeping.
 pub struct Execution<C = ()> {
     /// Root thread of this execution (a GC root while the execution lives).
-    #[allow(dead_code)]
     thread: ThreadId,
     /// Thread to resume on the next step (a coroutine may have been
     /// running when fuel ran out).
@@ -640,13 +639,10 @@ pub(crate) enum Mm {
     Lt,
     Le,
     ToString,
-    #[allow(dead_code)] // looked up by name in setmetatable/getmetatable
-    Metatable,
-    #[allow(dead_code)] // used by to-be-closed variables (M3)
     Close,
 }
 
-const MM_NAMES: [&str; 25] = [
+const MM_NAMES: [&str; 24] = [
     "__index",
     "__newindex",
     "__call",
@@ -670,7 +666,6 @@ const MM_NAMES: [&str; 25] = [
     "__lt",
     "__le",
     "__tostring",
-    "__metatable",
     "__close",
 ];
 
@@ -1722,7 +1717,7 @@ impl<C> Lua<C> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn fill_lua_info(
         &mut self,
         tid: TableId,
@@ -3099,7 +3094,7 @@ impl<C> Lua<C> {
     /// Calls `f` with `args` copied to a scratch window above the current
     /// frame. Results are delivered to `ret_to` (immediately for natives,
     /// after the pushed frame returns for Lua closures).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn call_value(
         &mut self,
         th: &mut Thread,
@@ -3328,7 +3323,7 @@ impl<C> Lua<C> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn call_native(
         &mut self,
         th: &mut Thread,
@@ -3416,7 +3411,7 @@ impl<C> Lua<C> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn call_intrinsic(
         &mut self,
         th: &mut Thread,
@@ -4137,7 +4132,7 @@ impl<C> Lua<C> {
     }
 
     /// Shared by `coroutine.resume` and wrapped coroutines.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn resume_thread(
         &mut self,
         th: &mut Thread,
@@ -4396,7 +4391,7 @@ impl<C> Lua<C> {
     /// Starts `coroutine.close(co)`. Dead-and-clean and to-be-closed-free
     /// coroutines resolve immediately; otherwise a [`CloseJob`] is installed
     /// and driven by [`Pending::CloseStep`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn begin_close(
         &mut self,
         th: &mut Thread,
@@ -4684,7 +4679,7 @@ impl<C> Lua<C> {
     /// Calls the value at `f_abs` under error protection: results arrive as
     /// `true, ...` on success and `false, err` on failure (via the handler
     /// for xpcall).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn protected_call(
         &mut self,
         th: &mut Thread,
@@ -6146,7 +6141,7 @@ impl<C> Execution<C> {
     ///
     /// Returns an error if this execution already finished or a runtime error
     /// escapes the script.
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     pub fn step(&mut self, lua: &mut Lua<C>, fuel: u64) -> Result<Step, Error> {
         if self.finished {
             return Err(Error::Runtime(RuntimeError {
@@ -6206,12 +6201,12 @@ impl<C> Execution<C> {
         self.id
     }
 
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     pub fn context(&self) -> &C {
         self.context.as_ref().expect("execution context missing")
     }
 
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     pub fn context_mut(&mut self) -> &mut C {
         self.context.as_mut().expect("execution context missing")
     }

@@ -148,7 +148,7 @@ fn n_rad<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
 
 // `log2`/`log10` are selected only for the exact bases 2.0 and 10.0; an
 // epsilon comparison would change behavior for other bases.
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 fn n_log<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "log")?;
     Ok(vec![Value::Float(if arg(args, 1) == Value::Nil {

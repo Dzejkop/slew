@@ -602,7 +602,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::approx_constant)]
+    #[expect(clippy::approx_constant)]
     fn float_formatting() {
         assert_eq!(fmt_float(1.0), "1.0");
         assert_eq!(fmt_float(-1.0), "-1.0");

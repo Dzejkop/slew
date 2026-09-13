@@ -234,7 +234,6 @@ fn getdetails(
 }
 
 /// `packint`: write `n` as `size` bytes in the given endianness, sign-extending.
-#[allow(clippy::needless_range_loop)]
 fn packint(out: &mut Vec<u8>, mut n: u64, islittle: bool, size: usize, neg: bool) {
     let start = out.len();
     out.resize(start + size, 0);
@@ -251,7 +250,6 @@ fn packint(out: &mut Vec<u8>, mut n: u64, islittle: bool, size: usize, neg: bool
 }
 
 /// `unpackint`: read `size` bytes, sign-extending/overflow-checking like PUC.
-#[allow(clippy::needless_range_loop)]
 fn unpackint(
     data: &[u8],
     pos: usize,
