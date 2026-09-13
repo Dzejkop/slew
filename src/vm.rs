@@ -879,6 +879,600 @@ impl Lua {
     }
 }
 
+fn n_dead<C>(_: &mut Lua<C>, _: &[Value]) -> Result<Vec<Value>, String> {
+    Err("attempt to call a collected function".into())
+}
+
+struct Marks {
+    strings: Vec<bool>,
+    tables: Vec<bool>,
+    closures: Vec<bool>,
+    natives: Vec<bool>,
+    upvals: Vec<bool>,
+    threads: Vec<bool>,
+    userdata: Vec<bool>,
+}
+
+/// Marks the values reachable only from a frame's staged continuations.
+fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_len: usize) {
+    for p in pending {
+        match *p {
+            Pending::CallClose { v, err } => {
+                work.push(v);
+                work.push(err);
+            }
+            Pending::DeliverError { err, handler, .. } => {
+                work.push(err);
+                if let Some(h) = handler {
+                    work.push(h);
+                }
+            }
+            Pending::CloseTbc { err, .. } | Pending::Reraise { err } => work.push(err),
+            // Return values staged above the register window must survive
+            // while their `__close` handlers run.
+            Pending::FinishReturn { start, count } => {
+                let end = (start + count).min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::TailReturn { start } => {
+                let end = th.top.min(stack_len);
+                if start < end {
+                    work.extend_from_slice(&th.stack[start..end]);
+                }
+            }
+            Pending::Concat { .. }
+            | Pending::DeliverErrErr { .. }
+            | Pending::CloseStep
+            | Pending::PrintStep
+            | Pending::FinishTostring { .. }
+            | Pending::FormatStep
+            | Pending::UnwindAfterHandler { .. }
+            | Pending::PrependShape { .. }
+            | Pending::ReturnHookFire
+            | Pending::YieldStep => {}
+        }
+    }
+}
+
+fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
+    let i = uid.0 as usize;
+    if m.upvals[i] {
+        return;
+    }
+    m.upvals[i] = true;
+    match upvals[i] {
+        Upval::Closed(v) => work.push(v),
+        Upval::Open(t, _) => work.push(Value::Thread(t)),
+    }
+}
+
+struct CallSpec {
+    func_abs: usize,
+    argc: usize,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    protected: bool,
+    handler: Option<Value>,
+    /// True when the call comes from a native (e.g. pcall invoking its
+    /// callee): `error` at level 1 then has no Lua position, like PUC's
+    /// `luaL_where` at a C boundary.
+    native_caller: bool,
+}
+
+enum Flow {
+    Continue,
+    Finished(Vec<Value>),
+}
+
+enum DispatchEnd {
+    Pending,
+    Waiting(NativeWait),
+    Finished(Vec<Value>),
+    Switch(ThreadId),
+}
+
+pub(crate) enum RunOutcome {
+    Done(Vec<Value>),
+    Pending(ThreadId),
+    Waiting(ThreadId, NativeWait),
+}
+
+/// Delivers a coroutine's yield/return values (or failure) into the thread
+/// that resumed it.
+fn deliver_resume(parent: &mut Thread, rr: ResumeRet, ok: bool, vals: &[Value]) {
+    if rr.status_bool {
+        let mut all = Vec::with_capacity(vals.len() + 1);
+        all.push(Value::Bool(ok));
+        all.extend_from_slice(vals);
+        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, &all);
+    } else {
+        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, vals);
+    }
+}
+
+// ---- free helpers ----
+
+/// A resolved `debug.getinfo` level: the running C function (current thread
+/// level 0) or a Lua frame's snapshot.
+enum LevelFrame {
+    Native,
+    Lua {
+        proto: Rc<Proto>,
+        pc: usize,
+        closure: ClosId,
+        tailcall: bool,
+        name: Option<(&'static str, Box<str>)>,
+    },
+}
+
+/// PUC's `luaO_chunkid`-style short source name, used by `debug.getinfo` and
+/// `debug.traceback`. `LUA_IDSIZE` is 60.
+fn short_source(src: &str) -> String {
+    const MAX_ID: usize = 60;
+    if let Some(rest) = src.strip_prefix('=') {
+        rest.chars().take(MAX_ID - 1).collect()
+    } else if let Some(rest) = src.strip_prefix('@') {
+        let n = rest.chars().count();
+        if n < MAX_ID {
+            rest.to_string()
+        } else {
+            let tail: String = rest.chars().skip(n - (MAX_ID - 4)).collect();
+            format!("...{tail}")
+        }
+    } else {
+        let first = src.lines().next().unwrap_or("");
+        let max = MAX_ID.saturating_sub(15);
+        let truncated: String = first.chars().take(max).collect();
+        format!("[string \"{truncated}\"]")
+    }
+}
+
+/// Primary destination register of an instruction, if it writes one. Used by
+/// the best-effort `varinfo` naming for "number has no integer
+/// representation" errors.
+fn instr_dst(i: Instr) -> Option<u8> {
+    match i {
+        Instr::LoadK { dst, .. }
+        | Instr::LoadNil { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::GetUpval { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetField { dst, .. }
+        | Instr::NewTable { dst }
+        | Instr::Arith { dst, .. }
+        | Instr::Unary { dst, .. }
+        | Instr::Cmp { dst, .. }
+        | Instr::Concat { dst, .. }
+        | Instr::Vararg { dst, .. }
+        | Instr::Closure { dst, .. } => Some(dst),
+        Instr::Call { base, .. } | Instr::TailCall { base, .. } => Some(base),
+        Instr::ForLoop { base, .. } => Some(base + 3),
+        Instr::TForLoop { base, .. } => Some(base + 4),
+        _ => None,
+    }
+}
+
+/// Best-effort PUC `varinfo`: name the register `reg` as it was last written
+/// before `before_pc`, returning e.g. `field 'huge'`. Only constant-key
+/// fields, upvalues, and constants are recognized; locals and dynamic keys
+/// yield `None` (in which case callers keep the plain message).
+fn name_for_register(
+    strings: &Strings,
+    proto: &Proto,
+    before_pc: usize,
+    reg: u8,
+) -> Option<String> {
+    let mut pc = before_pc.min(proto.code.len());
+    while pc > 0 {
+        pc -= 1;
+        let instr = proto.code[pc];
+        match instr {
+            Instr::GetField { dst, k, .. } if dst == reg => {
+                return match proto.consts.get(k as usize) {
+                    Some(Value::Str(s)) => Some(format!("field '{}'", strings.get_str_lossy(*s))),
+                    _ => None,
+                };
+            }
+            Instr::GetUpval { dst, up } if dst == reg => {
+                return proto
+                    .upval_names
+                    .get(up as usize)
+                    .map(|n| format!("upvalue '{n}'"));
+            }
+            Instr::LoadK { dst, .. } if dst == reg => return Some("constant".to_string()),
+            _ => {
+                if instr_dst(instr) == Some(reg) {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn kval(th: &Thread, k: u16) -> Value {
+    th.frames.last().unwrap().as_lua().proto.consts[k as usize]
+}
+
+fn jump(th: &mut Thread, off: i32) {
+    let f = th.frames.last_mut().unwrap().as_lua_mut();
+    f.pc = (f.pc as i64 + off as i64) as usize;
+}
+
+fn line_of(th: &Thread) -> u32 {
+    // Boundary frames carry no line info; report the nearest Lua frame's line.
+    th.frames
+        .iter()
+        .rev()
+        .find_map(|f| f.lua())
+        .map_or(0, frame_line)
+}
+
+/// Source line the frame's next instruction belongs to.
+fn frame_line(f: &LuaFrame) -> u32 {
+    f.proto
+        .lines
+        .get(f.pc.wrapping_sub(1))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn ensure_len(stack: &mut Vec<Value>, len: usize) {
+    if stack.len() < len {
+        stack.resize(len, Value::Nil);
+    }
+}
+
+/// Live register extent (relative to `f.base`) of the instruction a frame is
+/// currently executing. `pc` points at the *next* instruction, so the live one
+/// is `pc - 1`. Slots at or above the returned extent are dead temporaries and
+/// must not be treated as roots.
+fn frame_reg_extent(f: &LuaFrame) -> usize {
+    if f.pc == 0 {
+        // Frame pushed but not yet executing (or a chunk that has not run
+        // yet): nothing above the declared window can be live.
+        return f.proto.max_regs as usize;
+    }
+    let idx = f.pc - 1;
+    let recorded = f
+        .proto
+        .reg_extent
+        .get(idx)
+        .copied()
+        .unwrap_or(f.proto.max_regs) as usize;
+    // Belt and braces: never drop a register the instruction itself names,
+    // even if a future emit order were to under-report `free_reg`.
+    let named = f.proto.code.get(idx).map_or(0, |i| i.reg_high()) as usize;
+    recorded.max(named)
+}
+
+/// First stack slot safely above all live data of the current frame.
+/// Bounded by the frame's register window (plus any active multret run),
+/// so repeated metamethod calls reuse the same scratch space instead of
+/// growing the stack.
+fn scratch_base(th: &Thread) -> usize {
+    match th.frames.last().unwrap() {
+        Frame::Lua(f) => (f.base + f.proto.max_regs as usize).max(th.top),
+        // A boundary frame keeps the scratch base recorded at push time.
+        Frame::Boundary(c) => c.base.max(th.top),
+    }
+}
+
+fn is_concatable(v: Value) -> bool {
+    matches!(v, Value::Str(_) | Value::Int(_) | Value::Float(_))
+}
+
+/// Places `results` at `ret_to` per the multret encoding in `nres`.
+fn place_results(th: &mut Thread, ret_to: usize, nres: u8, results: &[Value]) {
+    if nres == 0 {
+        ensure_len(&mut th.stack, ret_to + results.len());
+        th.stack[ret_to..ret_to + results.len()].copy_from_slice(results);
+        th.top = ret_to + results.len();
+    } else {
+        let want = (nres - 1) as usize;
+        ensure_len(&mut th.stack, ret_to + want);
+        for i in 0..want {
+            th.stack[ret_to + i] = results.get(i).copied().unwrap_or(Value::Nil);
+        }
+    }
+}
+
+fn place_shaped(th: &mut Thread, ret_to: usize, nres: u8, shape: RetShape, res: &[Value]) {
+    match shape {
+        RetShape::Normal => place_results(th, ret_to, nres, res),
+        RetShape::ToBool => {
+            let b = res.first().copied().unwrap_or(Value::Nil).truthy();
+            place_results(th, ret_to, nres, &[Value::Bool(b)]);
+        }
+        RetShape::ToNotBool => {
+            let b = res.first().copied().unwrap_or(Value::Nil).truthy();
+            place_results(th, ret_to, nres, &[Value::Bool(!b)]);
+        }
+        RetShape::PrependTrue | RetShape::PrependFalse => {
+            let flag = Value::Bool(shape == RetShape::PrependTrue);
+            let mut all = Vec::with_capacity(res.len() + 1);
+            all.push(flag);
+            all.extend_from_slice(res);
+            place_results(th, ret_to, nres, &all);
+        }
+    }
+}
+
+/// Delivers a returning Lua frame's values (in `stack[start..start+count]`)
+/// to its caller per the frame's shape and expected count.
+fn deliver_return(th: &mut Thread, frame: &LuaFrame, start: usize, count: usize) {
+    let ret_to = frame.ret_to;
+    match frame.shape {
+        RetShape::Normal => {
+            if frame.nres == 0 {
+                ensure_len(&mut th.stack, ret_to + count);
+                th.stack.copy_within(start..start + count, ret_to);
+                th.top = ret_to + count;
+            } else {
+                let want = (frame.nres - 1) as usize;
+                ensure_len(&mut th.stack, ret_to + want);
+                for i in 0..want {
+                    th.stack[ret_to + i] = if i < count {
+                        th.stack[start + i]
+                    } else {
+                        Value::Nil
+                    };
+                }
+            }
+        }
+        RetShape::ToBool | RetShape::ToNotBool => {
+            let v = if count > 0 {
+                th.stack[start]
+            } else {
+                Value::Nil
+            };
+            let b = if frame.shape == RetShape::ToBool {
+                v.truthy()
+            } else {
+                !v.truthy()
+            };
+            place_results(th, ret_to, frame.nres, &[Value::Bool(b)]);
+        }
+        RetShape::PrependTrue | RetShape::PrependFalse => {
+            let flag = Value::Bool(frame.shape == RetShape::PrependTrue);
+            if frame.nres == 0 {
+                ensure_len(&mut th.stack, ret_to + 1 + count);
+                // copy backward-safe: results sit above ret_to
+                th.stack.copy_within(start..start + count, ret_to + 1);
+                th.stack[ret_to] = flag;
+                th.top = ret_to + 1 + count;
+            } else {
+                let want = (frame.nres - 1) as usize;
+                ensure_len(&mut th.stack, ret_to + want);
+                if want > 0 {
+                    let n = count.min(want - 1);
+                    th.stack.copy_within(start..start + n, ret_to + 1);
+                    for i in n..want - 1 {
+                        th.stack[ret_to + 1 + i] = Value::Nil;
+                    }
+                    th.stack[ret_to] = flag;
+                }
+            }
+        }
+    }
+}
+
+/// Lua `==` (without metamethods): raw equality plus cross int/float.
+pub(crate) fn values_equal(a: Value, b: Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
+            float_to_exact_int(y) == Some(x)
+        }
+        _ => a == b,
+    }
+}
+
+/// Converts to an integer for bitwise ops (floats with exact integral value).
+fn to_int(v: Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(i),
+        Value::Float(f) => float_to_exact_int(f),
+        _ => None,
+    }
+}
+
+fn to_float(v: Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(i as f64),
+        Value::Float(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// `i < f` with exact semantics across the full i64/f64 ranges.
+fn int_lt_float(i: i64, f: f64) -> bool {
+    if f.is_nan() {
+        return false;
+    }
+    if f >= 9.223_372_036_854_776e18 {
+        return true; // f >= 2^63 > any i64
+    }
+    if f < -9.223_372_036_854_776e18 {
+        return false;
+    }
+    let ff = f.floor();
+    let fi = ff as i64;
+    i < fi || (i == fi && f > ff)
+}
+
+fn int_le_float(i: i64, f: f64) -> bool {
+    if f.is_nan() {
+        return false;
+    }
+    if f >= 9.223_372_036_854_776e18 {
+        return true;
+    }
+    if f < -9.223_372_036_854_776e18 {
+        return false;
+    }
+    let ff = f.floor();
+    let fi = ff as i64;
+    i < fi || (i == fi && f >= ff)
+}
+
+/// Converts a float limit of an integer `for` loop per Lua 5.4 (floor/ceil
+/// toward the loop interior, clamped). `None` means the loop is empty.
+fn for_int_limit(f: f64, step_positive: bool) -> Option<i64> {
+    if f.is_nan() {
+        return None;
+    }
+    if step_positive {
+        if f < -9.223_372_036_854_776e18 {
+            None
+        } else if f >= 9.223_372_036_854_776e18 {
+            Some(i64::MAX)
+        } else {
+            Some(f.floor() as i64)
+        }
+    } else if f >= 9.223_372_036_854_776e18 {
+        None
+    } else if f < -9.223_372_036_854_776e18 {
+        Some(i64::MIN)
+    } else {
+        Some(f.ceil() as i64)
+    }
+}
+
+/// Numeric coercion for arithmetic operators: numbers pass through and
+/// numeric strings are parsed. Lua 5.4 delegates string coercion to the
+/// string library's arithmetic metamethods; bitwise operators stay strict.
+fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Some(v),
+        Value::Str(id) => crate::stdlib::parse_number(strings.get(id)),
+        _ => None,
+    }
+}
+
+fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
+    use ArithOp::{Add, BAnd, BOr, BXor, Div, IDiv, Mod, Mul, Pow, Shl, Shr, Sub};
+    let num_err = |v: Value| format!("attempt to perform arithmetic on a {} value", v.type_name());
+    let int_err = |v: Value| match v {
+        Value::Float(_) => "number has no integer representation".to_string(),
+        _ => format!(
+            "attempt to perform bitwise operation on a {} value",
+            v.type_name()
+        ),
+    };
+    let na = to_arith_number(strings, a);
+    let nb = to_arith_number(strings, b);
+    let as_float = |n: Option<Value>, v: Value| -> Result<f64, String> {
+        to_float(n.ok_or_else(|| num_err(v))?).ok_or_else(|| num_err(v))
+    };
+    match op {
+        Add | Sub | Mul => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
+                Ok(Value::Int(match op {
+                    Add => x.wrapping_add(y),
+                    Sub => x.wrapping_sub(y),
+                    Mul => x.wrapping_mul(y),
+                    _ => unreachable!(),
+                }))
+            } else {
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
+                Ok(Value::Float(match op {
+                    Add => x + y,
+                    Sub => x - y,
+                    Mul => x * y,
+                    _ => unreachable!(),
+                }))
+            }
+        }
+        Div => {
+            let x = as_float(na, a)?;
+            let y = as_float(nb, b)?;
+            Ok(Value::Float(x / y))
+        }
+        Pow => {
+            let x = as_float(na, a)?;
+            let y = as_float(nb, b)?;
+            Ok(Value::Float(x.powf(y)))
+        }
+        IDiv => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
+                if y == 0 {
+                    return Err("attempt to divide by zero".into());
+                }
+                let q = x.wrapping_div(y);
+                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) {
+                    q - 1
+                } else {
+                    q
+                };
+                Ok(Value::Int(q))
+            } else {
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
+                Ok(Value::Float((x / y).floor()))
+            }
+        }
+        Mod => {
+            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
+                if y == 0 {
+                    return Err("attempt to perform 'n%0'".into());
+                }
+                let r = x.wrapping_rem(y);
+                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) {
+                    r + y
+                } else {
+                    r
+                }))
+            } else {
+                let x = as_float(na, a)?;
+                let y = as_float(nb, b)?;
+                let r = x % y;
+                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) {
+                    r + y
+                } else {
+                    r
+                }))
+            }
+        }
+        BAnd | BOr | BXor => {
+            let x = to_int(a).ok_or_else(|| int_err(a))?;
+            let y = to_int(b).ok_or_else(|| int_err(b))?;
+            Ok(Value::Int(match op {
+                BAnd => x & y,
+                BOr => x | y,
+                BXor => x ^ y,
+                _ => unreachable!(),
+            }))
+        }
+        Shl | Shr => {
+            let x = to_int(a).ok_or_else(|| int_err(a))?;
+            let y = to_int(b).ok_or_else(|| int_err(b))?;
+            // Lua shifts are logical; a negative count shifts the other way,
+            // and counts >= 64 produce zero
+            let n = if op == Shr {
+                y.checked_neg().unwrap_or(i64::MAX)
+            } else {
+                y
+            };
+            Ok(Value::Int(shift_left_logical(x, n)))
+        }
+    }
+}
+
+fn shift_left_logical(x: i64, n: i64) -> i64 {
+    if n <= -64 || n >= 64 {
+        0
+    } else if n >= 0 {
+        ((x as u64) << n) as i64
+    } else {
+        ((x as u64) >> -n) as i64
+    }
+}
+
 impl<C> Lua<C> {
     #[must_use]
     pub fn new() -> Self {
@@ -6404,120 +6998,6 @@ impl<C> Lua<C> {
     }
 }
 
-fn n_dead<C>(_: &mut Lua<C>, _: &[Value]) -> Result<Vec<Value>, String> {
-    Err("attempt to call a collected function".into())
-}
-
-struct Marks {
-    strings: Vec<bool>,
-    tables: Vec<bool>,
-    closures: Vec<bool>,
-    natives: Vec<bool>,
-    upvals: Vec<bool>,
-    threads: Vec<bool>,
-    userdata: Vec<bool>,
-}
-
-/// Marks the values reachable only from a frame's staged continuations.
-fn mark_pending(pending: &[Pending], th: &Thread, work: &mut Vec<Value>, stack_len: usize) {
-    for p in pending {
-        match *p {
-            Pending::CallClose { v, err } => {
-                work.push(v);
-                work.push(err);
-            }
-            Pending::DeliverError { err, handler, .. } => {
-                work.push(err);
-                if let Some(h) = handler {
-                    work.push(h);
-                }
-            }
-            Pending::CloseTbc { err, .. } | Pending::Reraise { err } => work.push(err),
-            // Return values staged above the register window must survive
-            // while their `__close` handlers run.
-            Pending::FinishReturn { start, count } => {
-                let end = (start + count).min(stack_len);
-                if start < end {
-                    work.extend_from_slice(&th.stack[start..end]);
-                }
-            }
-            Pending::TailReturn { start } => {
-                let end = th.top.min(stack_len);
-                if start < end {
-                    work.extend_from_slice(&th.stack[start..end]);
-                }
-            }
-            Pending::Concat { .. }
-            | Pending::DeliverErrErr { .. }
-            | Pending::CloseStep
-            | Pending::PrintStep
-            | Pending::FinishTostring { .. }
-            | Pending::FormatStep
-            | Pending::UnwindAfterHandler { .. }
-            | Pending::PrependShape { .. }
-            | Pending::ReturnHookFire
-            | Pending::YieldStep => {}
-        }
-    }
-}
-
-fn mark_upval(uid: UpvalId, m: &mut Marks, work: &mut Vec<Value>, upvals: &[Upval]) {
-    let i = uid.0 as usize;
-    if m.upvals[i] {
-        return;
-    }
-    m.upvals[i] = true;
-    match upvals[i] {
-        Upval::Closed(v) => work.push(v),
-        Upval::Open(t, _) => work.push(Value::Thread(t)),
-    }
-}
-
-struct CallSpec {
-    func_abs: usize,
-    argc: usize,
-    ret_to: usize,
-    nres: u8,
-    shape: RetShape,
-    protected: bool,
-    handler: Option<Value>,
-    /// True when the call comes from a native (e.g. pcall invoking its
-    /// callee): `error` at level 1 then has no Lua position, like PUC's
-    /// `luaL_where` at a C boundary.
-    native_caller: bool,
-}
-
-enum Flow {
-    Continue,
-    Finished(Vec<Value>),
-}
-
-enum DispatchEnd {
-    Pending,
-    Waiting(NativeWait),
-    Finished(Vec<Value>),
-    Switch(ThreadId),
-}
-
-pub(crate) enum RunOutcome {
-    Done(Vec<Value>),
-    Pending(ThreadId),
-    Waiting(ThreadId, NativeWait),
-}
-
-/// Delivers a coroutine's yield/return values (or failure) into the thread
-/// that resumed it.
-fn deliver_resume(parent: &mut Thread, rr: ResumeRet, ok: bool, vals: &[Value]) {
-    if rr.status_bool {
-        let mut all = Vec::with_capacity(vals.len() + 1);
-        all.push(Value::Bool(ok));
-        all.extend_from_slice(vals);
-        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, &all);
-    } else {
-        place_shaped(parent, rr.ret_to, rr.nres, rr.shape, vals);
-    }
-}
-
 impl<C> Execution<C> {
     /// Runs the script for at most `fuel` units of work (roughly one unit
     /// per VM instruction, with surcharges for calls and allocations).
@@ -6639,485 +7119,5 @@ impl<C> Execution<C> {
         let f = th.frames.iter().rev().find_map(|f| f.lua())?;
         let line = f.proto.lines.get(f.pc).copied().unwrap_or(0);
         Some((f.proto.source.to_string(), line))
-    }
-}
-
-// ---- free helpers ----
-
-/// A resolved `debug.getinfo` level: the running C function (current thread
-/// level 0) or a Lua frame's snapshot.
-enum LevelFrame {
-    Native,
-    Lua {
-        proto: Rc<Proto>,
-        pc: usize,
-        closure: ClosId,
-        tailcall: bool,
-        name: Option<(&'static str, Box<str>)>,
-    },
-}
-
-/// PUC's `luaO_chunkid`-style short source name, used by `debug.getinfo` and
-/// `debug.traceback`. `LUA_IDSIZE` is 60.
-fn short_source(src: &str) -> String {
-    const MAX_ID: usize = 60;
-    if let Some(rest) = src.strip_prefix('=') {
-        rest.chars().take(MAX_ID - 1).collect()
-    } else if let Some(rest) = src.strip_prefix('@') {
-        let n = rest.chars().count();
-        if n < MAX_ID {
-            rest.to_string()
-        } else {
-            let tail: String = rest.chars().skip(n - (MAX_ID - 4)).collect();
-            format!("...{tail}")
-        }
-    } else {
-        let first = src.lines().next().unwrap_or("");
-        let max = MAX_ID.saturating_sub(15);
-        let truncated: String = first.chars().take(max).collect();
-        format!("[string \"{truncated}\"]")
-    }
-}
-
-/// Primary destination register of an instruction, if it writes one. Used by
-/// the best-effort `varinfo` naming for "number has no integer
-/// representation" errors.
-fn instr_dst(i: Instr) -> Option<u8> {
-    match i {
-        Instr::LoadK { dst, .. }
-        | Instr::LoadNil { dst, .. }
-        | Instr::LoadBool { dst, .. }
-        | Instr::Move { dst, .. }
-        | Instr::GetUpval { dst, .. }
-        | Instr::GetIndex { dst, .. }
-        | Instr::GetField { dst, .. }
-        | Instr::NewTable { dst }
-        | Instr::Arith { dst, .. }
-        | Instr::Unary { dst, .. }
-        | Instr::Cmp { dst, .. }
-        | Instr::Concat { dst, .. }
-        | Instr::Vararg { dst, .. }
-        | Instr::Closure { dst, .. } => Some(dst),
-        Instr::Call { base, .. } | Instr::TailCall { base, .. } => Some(base),
-        Instr::ForLoop { base, .. } => Some(base + 3),
-        Instr::TForLoop { base, .. } => Some(base + 4),
-        _ => None,
-    }
-}
-
-/// Best-effort PUC `varinfo`: name the register `reg` as it was last written
-/// before `before_pc`, returning e.g. `field 'huge'`. Only constant-key
-/// fields, upvalues, and constants are recognized; locals and dynamic keys
-/// yield `None` (in which case callers keep the plain message).
-fn name_for_register(
-    strings: &Strings,
-    proto: &Proto,
-    before_pc: usize,
-    reg: u8,
-) -> Option<String> {
-    let mut pc = before_pc.min(proto.code.len());
-    while pc > 0 {
-        pc -= 1;
-        let instr = proto.code[pc];
-        match instr {
-            Instr::GetField { dst, k, .. } if dst == reg => {
-                return match proto.consts.get(k as usize) {
-                    Some(Value::Str(s)) => Some(format!("field '{}'", strings.get_str_lossy(*s))),
-                    _ => None,
-                };
-            }
-            Instr::GetUpval { dst, up } if dst == reg => {
-                return proto
-                    .upval_names
-                    .get(up as usize)
-                    .map(|n| format!("upvalue '{n}'"));
-            }
-            Instr::LoadK { dst, .. } if dst == reg => return Some("constant".to_string()),
-            _ => {
-                if instr_dst(instr) == Some(reg) {
-                    return None;
-                }
-            }
-        }
-    }
-    None
-}
-
-fn kval(th: &Thread, k: u16) -> Value {
-    th.frames.last().unwrap().as_lua().proto.consts[k as usize]
-}
-
-fn jump(th: &mut Thread, off: i32) {
-    let f = th.frames.last_mut().unwrap().as_lua_mut();
-    f.pc = (f.pc as i64 + off as i64) as usize;
-}
-
-fn line_of(th: &Thread) -> u32 {
-    // Boundary frames carry no line info; report the nearest Lua frame's line.
-    th.frames
-        .iter()
-        .rev()
-        .find_map(|f| f.lua())
-        .map_or(0, frame_line)
-}
-
-/// Source line the frame's next instruction belongs to.
-fn frame_line(f: &LuaFrame) -> u32 {
-    f.proto
-        .lines
-        .get(f.pc.wrapping_sub(1))
-        .copied()
-        .unwrap_or(0)
-}
-
-fn ensure_len(stack: &mut Vec<Value>, len: usize) {
-    if stack.len() < len {
-        stack.resize(len, Value::Nil);
-    }
-}
-
-/// Live register extent (relative to `f.base`) of the instruction a frame is
-/// currently executing. `pc` points at the *next* instruction, so the live one
-/// is `pc - 1`. Slots at or above the returned extent are dead temporaries and
-/// must not be treated as roots.
-fn frame_reg_extent(f: &LuaFrame) -> usize {
-    if f.pc == 0 {
-        // Frame pushed but not yet executing (or a chunk that has not run
-        // yet): nothing above the declared window can be live.
-        return f.proto.max_regs as usize;
-    }
-    let idx = f.pc - 1;
-    let recorded = f
-        .proto
-        .reg_extent
-        .get(idx)
-        .copied()
-        .unwrap_or(f.proto.max_regs) as usize;
-    // Belt and braces: never drop a register the instruction itself names,
-    // even if a future emit order were to under-report `free_reg`.
-    let named = f.proto.code.get(idx).map_or(0, |i| i.reg_high()) as usize;
-    recorded.max(named)
-}
-
-/// First stack slot safely above all live data of the current frame.
-/// Bounded by the frame's register window (plus any active multret run),
-/// so repeated metamethod calls reuse the same scratch space instead of
-/// growing the stack.
-fn scratch_base(th: &Thread) -> usize {
-    match th.frames.last().unwrap() {
-        Frame::Lua(f) => (f.base + f.proto.max_regs as usize).max(th.top),
-        // A boundary frame keeps the scratch base recorded at push time.
-        Frame::Boundary(c) => c.base.max(th.top),
-    }
-}
-
-fn is_concatable(v: Value) -> bool {
-    matches!(v, Value::Str(_) | Value::Int(_) | Value::Float(_))
-}
-
-/// Places `results` at `ret_to` per the multret encoding in `nres`.
-fn place_results(th: &mut Thread, ret_to: usize, nres: u8, results: &[Value]) {
-    if nres == 0 {
-        ensure_len(&mut th.stack, ret_to + results.len());
-        th.stack[ret_to..ret_to + results.len()].copy_from_slice(results);
-        th.top = ret_to + results.len();
-    } else {
-        let want = (nres - 1) as usize;
-        ensure_len(&mut th.stack, ret_to + want);
-        for i in 0..want {
-            th.stack[ret_to + i] = results.get(i).copied().unwrap_or(Value::Nil);
-        }
-    }
-}
-
-fn place_shaped(th: &mut Thread, ret_to: usize, nres: u8, shape: RetShape, res: &[Value]) {
-    match shape {
-        RetShape::Normal => place_results(th, ret_to, nres, res),
-        RetShape::ToBool => {
-            let b = res.first().copied().unwrap_or(Value::Nil).truthy();
-            place_results(th, ret_to, nres, &[Value::Bool(b)]);
-        }
-        RetShape::ToNotBool => {
-            let b = res.first().copied().unwrap_or(Value::Nil).truthy();
-            place_results(th, ret_to, nres, &[Value::Bool(!b)]);
-        }
-        RetShape::PrependTrue | RetShape::PrependFalse => {
-            let flag = Value::Bool(shape == RetShape::PrependTrue);
-            let mut all = Vec::with_capacity(res.len() + 1);
-            all.push(flag);
-            all.extend_from_slice(res);
-            place_results(th, ret_to, nres, &all);
-        }
-    }
-}
-
-/// Delivers a returning Lua frame's values (in `stack[start..start+count]`)
-/// to its caller per the frame's shape and expected count.
-fn deliver_return(th: &mut Thread, frame: &LuaFrame, start: usize, count: usize) {
-    let ret_to = frame.ret_to;
-    match frame.shape {
-        RetShape::Normal => {
-            if frame.nres == 0 {
-                ensure_len(&mut th.stack, ret_to + count);
-                th.stack.copy_within(start..start + count, ret_to);
-                th.top = ret_to + count;
-            } else {
-                let want = (frame.nres - 1) as usize;
-                ensure_len(&mut th.stack, ret_to + want);
-                for i in 0..want {
-                    th.stack[ret_to + i] = if i < count {
-                        th.stack[start + i]
-                    } else {
-                        Value::Nil
-                    };
-                }
-            }
-        }
-        RetShape::ToBool | RetShape::ToNotBool => {
-            let v = if count > 0 {
-                th.stack[start]
-            } else {
-                Value::Nil
-            };
-            let b = if frame.shape == RetShape::ToBool {
-                v.truthy()
-            } else {
-                !v.truthy()
-            };
-            place_results(th, ret_to, frame.nres, &[Value::Bool(b)]);
-        }
-        RetShape::PrependTrue | RetShape::PrependFalse => {
-            let flag = Value::Bool(frame.shape == RetShape::PrependTrue);
-            if frame.nres == 0 {
-                ensure_len(&mut th.stack, ret_to + 1 + count);
-                // copy backward-safe: results sit above ret_to
-                th.stack.copy_within(start..start + count, ret_to + 1);
-                th.stack[ret_to] = flag;
-                th.top = ret_to + 1 + count;
-            } else {
-                let want = (frame.nres - 1) as usize;
-                ensure_len(&mut th.stack, ret_to + want);
-                if want > 0 {
-                    let n = count.min(want - 1);
-                    th.stack.copy_within(start..start + n, ret_to + 1);
-                    for i in n..want - 1 {
-                        th.stack[ret_to + 1 + i] = Value::Nil;
-                    }
-                    th.stack[ret_to] = flag;
-                }
-            }
-        }
-    }
-}
-
-/// Lua `==` (without metamethods): raw equality plus cross int/float.
-pub(crate) fn values_equal(a: Value, b: Value) -> bool {
-    match (a, b) {
-        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
-            float_to_exact_int(y) == Some(x)
-        }
-        _ => a == b,
-    }
-}
-
-/// Converts to an integer for bitwise ops (floats with exact integral value).
-fn to_int(v: Value) -> Option<i64> {
-    match v {
-        Value::Int(i) => Some(i),
-        Value::Float(f) => float_to_exact_int(f),
-        _ => None,
-    }
-}
-
-fn to_float(v: Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(i as f64),
-        Value::Float(f) => Some(f),
-        _ => None,
-    }
-}
-
-/// `i < f` with exact semantics across the full i64/f64 ranges.
-fn int_lt_float(i: i64, f: f64) -> bool {
-    if f.is_nan() {
-        return false;
-    }
-    if f >= 9.223_372_036_854_776e18 {
-        return true; // f >= 2^63 > any i64
-    }
-    if f < -9.223_372_036_854_776e18 {
-        return false;
-    }
-    let ff = f.floor();
-    let fi = ff as i64;
-    i < fi || (i == fi && f > ff)
-}
-
-fn int_le_float(i: i64, f: f64) -> bool {
-    if f.is_nan() {
-        return false;
-    }
-    if f >= 9.223_372_036_854_776e18 {
-        return true;
-    }
-    if f < -9.223_372_036_854_776e18 {
-        return false;
-    }
-    let ff = f.floor();
-    let fi = ff as i64;
-    i < fi || (i == fi && f >= ff)
-}
-
-/// Converts a float limit of an integer `for` loop per Lua 5.4 (floor/ceil
-/// toward the loop interior, clamped). `None` means the loop is empty.
-fn for_int_limit(f: f64, step_positive: bool) -> Option<i64> {
-    if f.is_nan() {
-        return None;
-    }
-    if step_positive {
-        if f < -9.223_372_036_854_776e18 {
-            None
-        } else if f >= 9.223_372_036_854_776e18 {
-            Some(i64::MAX)
-        } else {
-            Some(f.floor() as i64)
-        }
-    } else if f >= 9.223_372_036_854_776e18 {
-        None
-    } else if f < -9.223_372_036_854_776e18 {
-        Some(i64::MIN)
-    } else {
-        Some(f.ceil() as i64)
-    }
-}
-
-/// Numeric coercion for arithmetic operators: numbers pass through and
-/// numeric strings are parsed. Lua 5.4 delegates string coercion to the
-/// string library's arithmetic metamethods; bitwise operators stay strict.
-fn to_arith_number(strings: &Strings, v: Value) -> Option<Value> {
-    match v {
-        Value::Int(_) | Value::Float(_) => Some(v),
-        Value::Str(id) => crate::stdlib::parse_number(strings.get(id)),
-        _ => None,
-    }
-}
-
-fn arith(strings: &Strings, op: ArithOp, a: Value, b: Value) -> Result<Value, String> {
-    use ArithOp::{Add, BAnd, BOr, BXor, Div, IDiv, Mod, Mul, Pow, Shl, Shr, Sub};
-    let num_err = |v: Value| format!("attempt to perform arithmetic on a {} value", v.type_name());
-    let int_err = |v: Value| match v {
-        Value::Float(_) => "number has no integer representation".to_string(),
-        _ => format!(
-            "attempt to perform bitwise operation on a {} value",
-            v.type_name()
-        ),
-    };
-    let na = to_arith_number(strings, a);
-    let nb = to_arith_number(strings, b);
-    let as_float = |n: Option<Value>, v: Value| -> Result<f64, String> {
-        to_float(n.ok_or_else(|| num_err(v))?).ok_or_else(|| num_err(v))
-    };
-    match op {
-        Add | Sub | Mul => {
-            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
-                Ok(Value::Int(match op {
-                    Add => x.wrapping_add(y),
-                    Sub => x.wrapping_sub(y),
-                    Mul => x.wrapping_mul(y),
-                    _ => unreachable!(),
-                }))
-            } else {
-                let x = as_float(na, a)?;
-                let y = as_float(nb, b)?;
-                Ok(Value::Float(match op {
-                    Add => x + y,
-                    Sub => x - y,
-                    Mul => x * y,
-                    _ => unreachable!(),
-                }))
-            }
-        }
-        Div => {
-            let x = as_float(na, a)?;
-            let y = as_float(nb, b)?;
-            Ok(Value::Float(x / y))
-        }
-        Pow => {
-            let x = as_float(na, a)?;
-            let y = as_float(nb, b)?;
-            Ok(Value::Float(x.powf(y)))
-        }
-        IDiv => {
-            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
-                if y == 0 {
-                    return Err("attempt to divide by zero".into());
-                }
-                let q = x.wrapping_div(y);
-                let q = if x.wrapping_rem(y) != 0 && (x < 0) != (y < 0) {
-                    q - 1
-                } else {
-                    q
-                };
-                Ok(Value::Int(q))
-            } else {
-                let x = as_float(na, a)?;
-                let y = as_float(nb, b)?;
-                Ok(Value::Float((x / y).floor()))
-            }
-        }
-        Mod => {
-            if let (Some(Value::Int(x)), Some(Value::Int(y))) = (na, nb) {
-                if y == 0 {
-                    return Err("attempt to perform 'n%0'".into());
-                }
-                let r = x.wrapping_rem(y);
-                Ok(Value::Int(if r != 0 && (r < 0) != (y < 0) {
-                    r + y
-                } else {
-                    r
-                }))
-            } else {
-                let x = as_float(na, a)?;
-                let y = as_float(nb, b)?;
-                let r = x % y;
-                Ok(Value::Float(if r != 0.0 && (r < 0.0) != (y < 0.0) {
-                    r + y
-                } else {
-                    r
-                }))
-            }
-        }
-        BAnd | BOr | BXor => {
-            let x = to_int(a).ok_or_else(|| int_err(a))?;
-            let y = to_int(b).ok_or_else(|| int_err(b))?;
-            Ok(Value::Int(match op {
-                BAnd => x & y,
-                BOr => x | y,
-                BXor => x ^ y,
-                _ => unreachable!(),
-            }))
-        }
-        Shl | Shr => {
-            let x = to_int(a).ok_or_else(|| int_err(a))?;
-            let y = to_int(b).ok_or_else(|| int_err(b))?;
-            // Lua shifts are logical; a negative count shifts the other way,
-            // and counts >= 64 produce zero
-            let n = if op == Shr {
-                y.checked_neg().unwrap_or(i64::MAX)
-            } else {
-                y
-            };
-            Ok(Value::Int(shift_left_logical(x, n)))
-        }
-    }
-}
-
-fn shift_left_logical(x: i64, n: i64) -> i64 {
-    if n <= -64 || n >= 64 {
-        0
-    } else if n >= 0 {
-        ((x as u64) << n) as i64
-    } else {
-        ((x as u64) >> -n) as i64
     }
 }
