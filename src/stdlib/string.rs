@@ -10,11 +10,11 @@ use crate::vm::{Intrinsic, Lua, NativeKind};
 use super::string_pack::{n_pack, n_packsize, n_unpack};
 use super::{arg, set_field};
 
-pub fn install(lua: &mut Lua) {
+pub fn install<C>(lua: &mut Lua<C>) {
     let st = lua.new_table();
     lua.set_global("string", st);
     for (name, f) in [
-        ("len", n_len as crate::vm::NativeFn),
+        ("len", n_len as crate::vm::NativeFn<C>),
         ("sub", n_sub),
         ("upper", n_upper),
         ("lower", n_lower),
@@ -47,7 +47,7 @@ pub fn install(lua: &mut Lua) {
 }
 
 /// String argument with Lua's number→string coercion.
-fn arg_str(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
+fn arg_str<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
     match arg(args, i) {
         Value::Str(id) => Ok(lua.strings.get(id).to_vec()),
         v @ (Value::Int(_) | Value::Float(_)) => Ok(fmt_number(v).into_bytes()),
@@ -89,12 +89,12 @@ fn str_index(i: i64, len: usize, default_for_zero: usize) -> usize {
     }
 }
 
-fn n_len(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_len<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "len")?;
     Ok(vec![Value::Int(s.len() as i64)])
 }
 
-fn n_sub(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_sub<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "sub")?;
     let len = s.len();
     let i = arg_int(args, 1, "sub")?.unwrap_or(1);
@@ -110,17 +110,17 @@ fn n_sub(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(out)])
 }
 
-fn n_upper(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_upper<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "upper")?.to_ascii_uppercase();
     Ok(vec![lua.new_string(&s)])
 }
 
-fn n_lower(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_lower<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "lower")?.to_ascii_lowercase();
     Ok(vec![lua.new_string(&s)])
 }
 
-fn n_rep(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rep<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "rep")?;
     let n = arg_int(args, 1, "rep")?.unwrap_or(0);
     let sep = match arg(args, 2) {
@@ -150,13 +150,13 @@ fn n_rep(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(&out)])
 }
 
-fn n_reverse(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_reverse<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut s = arg_str(lua, args, 0, "reverse")?;
     s.reverse();
     Ok(vec![lua.new_string(&s)])
 }
 
-fn n_byte(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_byte<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "byte")?;
     let i = arg_int(args, 1, "byte")?.unwrap_or(1);
     let j = arg_int(args, 2, "byte")?.unwrap_or(i);
@@ -174,7 +174,7 @@ fn n_byte(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
         .collect())
 }
 
-fn n_char(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_char<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(args.len());
     for (i, _) in args.iter().enumerate() {
         let b = arg_int(args, i, "char")?.unwrap_or(-1);
@@ -191,14 +191,14 @@ fn n_char(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 // ---- find / match ----
 
-fn capture_value(lua: &mut Lua, s: &[u8], c: Capture) -> Value {
+fn capture_value<C>(lua: &mut Lua<C>, s: &[u8], c: Capture) -> Value {
     match c {
         Capture::Span(a, b) => lua.new_string(&s[a..b]),
         Capture::Pos(p) => Value::Int(p as i64 + 1),
     }
 }
 
-fn n_find(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_find<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "find")?;
     let pat = arg_str(lua, args, 1, "find")?;
     let init = match arg_int(args, 2, "find")?.unwrap_or(1) {
@@ -237,7 +237,7 @@ fn n_find(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_match(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_match<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = arg_str(lua, args, 0, "match")?;
     let pat = arg_str(lua, args, 1, "match")?;
     let init = match arg_int(args, 2, "match")?.unwrap_or(1) {
@@ -388,8 +388,8 @@ fn skip2digits(form: &[u8], mut i: usize) -> usize {
 /// coercion and `checkformat` validation. `tostr` carries an already-resolved
 /// `%s` value from `luaL_tolstring` (the `__tostring` result, or `None` when
 /// the value has no metamethod).
-pub(crate) fn render_spec(
-    lua: &mut Lua,
+pub(crate) fn render_spec<C>(
+    lua: &mut Lua<C>,
     spec: &FmtSpec,
     v: Value,
     argi: usize,

@@ -12,6 +12,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -41,6 +42,7 @@ fn run_err(src: &str) -> String {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => return e.to_string(),
         }
     }
@@ -560,6 +562,7 @@ fn uncaught_error_value_reaches_host() {
     let err = loop {
         match exec.step(&mut lua, 10_000) {
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Ok(Step::Done(_)) => panic!("expected error"),
             Err(slew::Error::Runtime(e)) => break e,
             Err(e) => panic!("unexpected: {e}"),
@@ -619,7 +622,7 @@ fn goto_basics() {
 #[test_case("local function f() ::inner:: end goto inner", "no visible label"; "label_in_other_function_invisible")]
 #[test_case("::l:: ::l::", "already defined"; "duplicate_label")]
 fn goto_scope_errors(src: &str, needle: &str) {
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     assert!(lua.load(src).unwrap_err().to_string().contains(needle));
 }
 
@@ -666,6 +669,7 @@ fn suspension_through_metamethod_calls() {
                 break;
             }
             Step::Pending => {}
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
 }
@@ -692,6 +696,7 @@ fn suspension_inside_pcall() {
                 break;
             }
             Step::Pending => pendings += 1,
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
     assert!(pendings > 10, "should suspend many times inside pcall");

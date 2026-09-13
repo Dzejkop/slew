@@ -11,6 +11,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -114,7 +115,7 @@ fn unreachable_coroutines_are_collected() {
 
 #[test]
 fn anchors_pin_host_values() {
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     let v = lua.new_string(b"host-held string that nothing in lua references");
     lua.anchor(v);
     lua.gc();
@@ -152,6 +153,7 @@ fn suspended_execution_state_survives_gc() {
                 lua.gc();
                 assert!(steps < 1_000_000);
             }
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
     assert!(steps > 3, "expected multiple suspensions");
@@ -202,6 +204,7 @@ fn memory_limit_enforced() {
     let err = loop {
         match exec.step(&mut lua, 1_000_000) {
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Ok(Step::Done(_)) => panic!("expected memory error"),
             Err(Error::Runtime(e)) => break e,
             Err(e) => panic!("unexpected: {e}"),

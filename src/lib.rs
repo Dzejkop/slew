@@ -18,6 +18,9 @@ pub mod value;
 pub mod vm;
 
 pub use value::Value;
-pub use vm::{Chunk, Error, Execution, Lua, NativeFn, RuntimeError, Step};
+pub use vm::{
+    Chunk, Error, Execution, ExecutionId, Lua, NativeContext, NativeFn, NativeOutcome, NativeWait,
+    RuntimeError, Step, SuspendableNativeFn,
+};
 
 pub use host::{DateParts, Host, HostError, HostObject, SeekWhence, StdHost};

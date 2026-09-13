@@ -12,6 +12,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }

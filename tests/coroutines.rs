@@ -11,6 +11,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -40,6 +41,7 @@ fn run_err(src: &str) -> String {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => return e.to_string(),
         }
     }
@@ -277,6 +279,7 @@ fn coroutine_suspends_on_fuel_and_resumes() {
                 pendings += 1;
                 assert!(pendings < 10_000, "runaway");
             }
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
     // the long loop runs INSIDE the coroutine: most suspensions happen there
@@ -368,7 +371,7 @@ fn close_false_and_nil_allowed() {
     );
     let err = run_err("local x <close> = 42");
     assert!(err.contains("non-closable"), "got: {err}");
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     assert!(
         lua.load("local a <close>, b <close> = nil, nil")
             .unwrap_err()
@@ -465,6 +468,7 @@ fn close_suspends_correctly() {
                 break;
             }
             Step::Pending => {}
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
 }

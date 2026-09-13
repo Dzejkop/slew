@@ -18,11 +18,11 @@ const CHARPATTERN: &[u8] = b"[\x00-\x7F\xC2-\xFD][\x80-\xBF]*";
 /// lone continuation byte), from lutf8lib.c.
 const LIMITS: [u32; 6] = [u32::MAX, 0x80, 0x800, 0x1_0000, 0x20_0000, 0x400_0000];
 
-pub fn install(lua: &mut Lua) {
+pub fn install<C>(lua: &mut Lua<C>) {
     let lib = lua.new_table();
     lua.set_global("utf8", lib);
     for (name, f) in [
-        ("char", n_char as crate::vm::NativeFn),
+        ("char", n_char as crate::vm::NativeFn<C>),
         ("codepoint", n_codepoint),
         ("len", n_len),
         ("offset", n_offset),
@@ -37,7 +37,7 @@ pub fn install(lua: &mut Lua) {
 
 /// `luaL_checkinteger`-ish: integers, floats with an exact integer value, and
 /// numeric strings; everything else is an argument error.
-fn check_integer(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<i64, String> {
+fn check_integer<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<i64, String> {
     let v = arg(args, i);
     if let Some(n) = as_integer(lua, v) {
         return Ok(n);
@@ -61,7 +61,7 @@ fn check_integer(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<i64, 
     }
 }
 
-fn as_integer(lua: &Lua, v: Value) -> Option<i64> {
+fn as_integer<C>(lua: &Lua<C>, v: Value) -> Option<i64> {
     match v {
         Value::Int(n) => Some(n),
         Value::Float(f) => float_to_exact_int(f),
@@ -75,12 +75,12 @@ fn as_integer(lua: &Lua, v: Value) -> Option<i64> {
 }
 
 /// `lua_tointeger`-ish: like `as_integer` but non-numbers silently become 0.
-fn to_integer(lua: &Lua, v: Value) -> i64 {
+fn to_integer<C>(lua: &Lua<C>, v: Value) -> i64 {
     as_integer(lua, v).unwrap_or(0)
 }
 
-fn opt_integer(
-    lua: &Lua,
+fn opt_integer<C>(
+    lua: &Lua<C>,
     args: &[Value],
     i: usize,
     default: i64,
@@ -172,7 +172,7 @@ fn utf8_encode(x: u32, out: &mut Vec<u8>) {
     }
 }
 
-fn n_char(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_char<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(args.len());
     for i in 0..args.len() {
         let code = check_integer(lua, args, i, "char")? as u64;
@@ -187,7 +187,7 @@ fn n_char(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(&out)])
 }
 
-fn n_codepoint(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_codepoint<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = check_bytes(lua, args, 0, "codepoint")?;
     let len = s.len();
     let posi = u_posrelat(opt_integer(lua, args, 1, 1, "codepoint")?, len);
@@ -217,7 +217,7 @@ fn n_codepoint(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-fn n_len(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_len<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = check_bytes(lua, args, 0, "len")?;
     let len = s.len();
     let mut posi = u_posrelat(opt_integer(lua, args, 1, 1, "len")?, len);
@@ -244,7 +244,7 @@ fn n_len(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Int(n)])
 }
 
-fn n_offset(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_offset<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = check_bytes(lua, args, 0, "offset")?;
     let len = s.len();
     let mut n = check_integer(lua, args, 1, "offset")?;
@@ -292,7 +292,7 @@ fn n_offset(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_codes(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_codes<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let s = check_bytes(lua, args, 0, "codes")?;
     let lax = arg(args, 1).truthy();
     if is_cont_at(&s, 0) {
@@ -305,15 +305,15 @@ fn n_codes(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![f, lua.new_string(&s), Value::Int(0)])
 }
 
-fn n_iter_strict(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_iter_strict<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     iter_aux(lua, args, true)
 }
 
-fn n_iter_lax(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_iter_lax<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     iter_aux(lua, args, false)
 }
 
-fn iter_aux(lua: &mut Lua, args: &[Value], strict: bool) -> Result<Vec<Value>, String> {
+fn iter_aux<C>(lua: &mut Lua<C>, args: &[Value], strict: bool) -> Result<Vec<Value>, String> {
     let s = check_bytes(lua, args, 0, "codes")?;
     let len = s.len();
     let control = to_integer(lua, arg(args, 1));

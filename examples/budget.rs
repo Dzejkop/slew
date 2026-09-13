@@ -41,6 +41,7 @@ fn main() {
                 break;
             }
             Step::Pending => println!("sum: not done yet, giving it another 50 fuel"),
+            Step::Waiting(wait) => panic!("unexpected native wait: {wait:?}"),
         }
     }
 }

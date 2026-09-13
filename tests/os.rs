@@ -15,6 +15,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\n{src}"),
         }
     }
@@ -104,6 +105,7 @@ fn exit_is_a_controlled_request() {
         match exec.step(&mut lua, 1_000_000) {
             Ok(Step::Done(_)) => panic!("os.exit should raise"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(_) => break,
         }
     }
@@ -120,6 +122,6 @@ fn os_execute_absent() {
 
 #[test]
 fn os_absent_without_host() {
-    let lua = Lua::new();
+    let lua = Lua::<()>::new();
     assert_eq!(lua.get_global("os"), Value::Nil);
 }

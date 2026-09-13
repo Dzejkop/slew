@@ -13,10 +13,10 @@ use crate::vm::Lua;
 
 use super::{arg, check_bytes, set_field};
 
-pub(super) fn install(lua: &mut Lua) {
+pub(super) fn install<C>(lua: &mut Lua<C>) {
     let os = lua.new_table();
     lua.set_global("os", os);
-    let entries: [(&str, crate::vm::NativeFn); 9] = [
+    let entries: [(&str, crate::vm::NativeFn<C>); 9] = [
         ("clock", n_clock),
         ("time", n_time),
         ("date", n_date),
@@ -35,12 +35,12 @@ pub(super) fn install(lua: &mut Lua) {
     set_field(lua, os, "exit", exit);
 }
 
-fn err_return(lua: &mut Lua, e: &HostError) -> Vec<Value> {
+fn err_return<C>(lua: &mut Lua<C>, e: &HostError) -> Vec<Value> {
     let msg = lua.new_string(e.message.as_bytes());
     vec![Value::Nil, msg, Value::Int(e.errno as i64)]
 }
 
-fn n_clock(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_clock<C>(lua: &mut Lua<C>, _args: &[Value]) -> Result<Vec<Value>, String> {
     let t = match lua.host.as_mut() {
         Some(h) => h.clock(),
         None => 0.0,
@@ -48,14 +48,19 @@ fn n_clock(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Float(t)])
 }
 
-fn table_field(lua: &Lua, t: Value, name: &str) -> Value {
+fn table_field<C>(lua: &Lua<C>, t: Value, name: &str) -> Value {
     let Some(key) = lua.strings.lookup(name.as_bytes()) else {
         return Value::Nil;
     };
     lua.table_get(t, Value::Str(key))
 }
 
-fn want_int_field(lua: &Lua, t: Value, name: &str, default: Option<i64>) -> Result<i64, String> {
+fn want_int_field<C>(
+    lua: &Lua<C>,
+    t: Value,
+    name: &str,
+    default: Option<i64>,
+) -> Result<i64, String> {
     match table_field(lua, t, name) {
         Value::Nil => default.ok_or_else(|| format!("field '{name}' missing in date table")),
         Value::Int(i) => Ok(i),
@@ -68,7 +73,7 @@ fn want_int_field(lua: &Lua, t: Value, name: &str, default: Option<i64>) -> Resu
     }
 }
 
-fn n_time(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_time<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         Value::Nil => {
             let t = match lua.host.as_mut() {
@@ -252,7 +257,7 @@ fn strftime(p: &DateParts, fmt: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
-fn n_date(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_date<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let fmt = match arg(args, 0) {
         Value::Nil => b"%c".to_vec(),
         v => check_bytes(lua, &[v], 0, "date")?,
@@ -311,7 +316,7 @@ fn n_date(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(s.as_bytes())])
 }
 
-fn n_difftime(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_difftime<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let _ = lua;
     let to_num = |v: Value, i: usize| -> Result<f64, String> {
         match v {
@@ -331,7 +336,7 @@ fn n_difftime(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Float(t2 - t1)])
 }
 
-fn n_getenv(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_getenv<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let name = check_bytes(lua, args, 0, "getenv")?;
     let name = String::from_utf8_lossy(&name).into_owned();
     let val = match lua.host.as_mut() {
@@ -344,8 +349,8 @@ fn n_getenv(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn fs_call(
-    lua: &mut Lua,
+fn fs_call<C>(
+    lua: &mut Lua<C>,
     args: &[Value],
     who: &str,
     f: impl FnOnce(&mut dyn crate::host::Host, String, String) -> Result<(), HostError>,
@@ -366,15 +371,15 @@ fn fs_call(
     }
 }
 
-fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_remove<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     fs_call(lua, args, "remove", |h, from, _| h.remove(&from))
 }
 
-fn n_rename(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rename<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     fs_call(lua, args, "rename", |h, from, to| h.rename(&from, &to))
 }
 
-fn n_tmpname(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tmpname<C>(lua: &mut Lua<C>, _args: &[Value]) -> Result<Vec<Value>, String> {
     let name = match lua.host.as_mut() {
         Some(h) => h.tmpname(),
         None => Err(HostError::new("os library has no host")),
@@ -385,7 +390,7 @@ fn n_tmpname(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_setlocale(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_setlocale<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let locale = match arg(args, 0) {
         Value::Nil => None,
         v => Some(String::from_utf8_lossy(&check_bytes(lua, &[v], 0, "setlocale")?).into_owned()),
@@ -412,7 +417,7 @@ fn n_setlocale(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_exit(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_exit<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let code = match arg(args, 0) {
         Value::Nil | Value::Bool(true) => 0,
         Value::Bool(false) => 1,

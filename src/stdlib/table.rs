@@ -10,11 +10,11 @@ use crate::vm::Lua;
 
 use super::{arg, check_table, set_field};
 
-pub fn install(lua: &mut Lua) {
+pub fn install<C>(lua: &mut Lua<C>) {
     let tt = lua.new_table();
     lua.set_global("table", tt);
     for (name, f) in [
-        ("remove", n_remove as crate::vm::NativeFn),
+        ("remove", n_remove as crate::vm::NativeFn<C>),
         ("concat", n_concat),
         ("pack", n_pack),
         ("unpack", n_unpack),
@@ -24,7 +24,7 @@ pub fn install(lua: &mut Lua) {
     }
 }
 
-fn table_id(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<u32, String> {
+fn table_id<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<u32, String> {
     let Value::Table(id) = check_table(lua, args, i, who)? else {
         unreachable!()
     };
@@ -51,7 +51,7 @@ fn opt_int(args: &[Value], i: usize, who: &str) -> Result<Option<i64>, String> {
     }
 }
 
-fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_remove<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_id(lua, args, 0, "remove")? as usize;
     let size = lua.tables[t].length();
     let mut pos = opt_int(args, 1, "remove")?.unwrap_or(size);
@@ -73,7 +73,7 @@ fn n_remove(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![removed])
 }
 
-fn n_concat(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_concat<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_id(lua, args, 0, "concat")? as usize;
     let sep = match arg(args, 1) {
         Value::Nil => Vec::new(),
@@ -107,7 +107,7 @@ fn n_concat(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(&out)])
 }
 
-fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_pack<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = lua.new_table();
     let Value::Table(id) = t else { unreachable!() };
     for (i, v) in args.iter().enumerate() {
@@ -122,7 +122,7 @@ fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![t])
 }
 
-fn n_unpack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_unpack<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = table_id(lua, args, 0, "unpack")? as usize;
     let i = opt_int(args, 1, "unpack")?.unwrap_or(1);
     let j = opt_int(args, 2, "unpack")?.unwrap_or_else(|| lua.tables[t].length());

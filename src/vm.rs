@@ -96,7 +96,66 @@ pub(crate) struct VmError {
     pub source: Option<Rc<str>>,
 }
 
-pub type NativeFn = fn(&mut Lua, &[Value]) -> Result<Vec<Value>, String>;
+pub type NativeFn<C = ()> = fn(&mut Lua<C>, &[Value]) -> Result<Vec<Value>, String>;
+pub type SuspendableNativeFn<C> =
+    fn(&mut NativeContext<'_, C>, &[Value]) -> Result<NativeOutcome, String>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ExecutionId(u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct NativeWait(pub u64);
+
+#[derive(Debug)]
+pub enum NativeOutcome {
+    Return(Vec<Value>),
+    Wait(NativeWait),
+}
+
+pub struct NativeContext<'a, C> {
+    lua: &'a mut Lua<C>,
+    execution: ExecutionId,
+    context: &'a mut C,
+}
+
+impl<C> NativeContext<'_, C> {
+    #[must_use]
+    pub fn execution_id(&self) -> ExecutionId {
+        self.execution
+    }
+
+    #[must_use]
+    pub fn context(&self) -> &C {
+        self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut C {
+        self.context
+    }
+
+    #[must_use]
+    pub fn str_bytes(&self, value: Value) -> Option<&[u8]> {
+        self.lua.str_bytes(value)
+    }
+
+    pub fn new_string(&mut self, value: &[u8]) -> Value {
+        self.lua.new_string(value)
+    }
+
+    pub fn new_table(&mut self) -> Value {
+        self.lua.new_table()
+    }
+
+    #[must_use]
+    pub fn table_get(&self, table: Value, key: Value) -> Value {
+        self.lua.table_get(table, key)
+    }
+
+    #[must_use]
+    pub fn display_value(&self, value: Value) -> String {
+        self.lua.display_value(value)
+    }
+}
 
 /// Host-provided module byte source. `Ok(None)` means "not found"; `Err` is
 /// a hard failure. See [`Lua::set_file_reader`].
@@ -143,14 +202,25 @@ pub(crate) enum Intrinsic {
     DebugSethook,
 }
 
-pub(crate) enum NativeKind {
-    Plain(NativeFn),
+pub(crate) enum NativeKind<C> {
+    Plain(NativeFn<C>),
+    Suspendable(SuspendableNativeFn<C>),
     Intrinsic(Intrinsic),
 }
 
-pub(crate) struct Native {
+// Manual impls: `#[derive(Copy, Clone)]` would wrongly require `C: Copy`/`C: Clone`
+// even though every variant is a plain `Copy` payload (fn pointers and `Intrinsic`).
+impl<C> Copy for NativeKind<C> {}
+
+impl<C> Clone for NativeKind<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub(crate) struct Native<C> {
     pub name: String,
-    pub kind: NativeKind,
+    pub kind: NativeKind<C>,
 }
 
 pub(crate) struct LuaClosure {
@@ -474,6 +544,16 @@ pub(crate) struct Thread {
     /// For a dead coroutine: the error it died with, returned once by
     /// `coroutine.close`. `Some(Nil)` means "died cleanly".
     close_error: Option<Value>,
+    pending_native: Option<PendingNative>,
+}
+
+struct PendingNative {
+    wait: NativeWait,
+    func: Value,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    completion: Option<Result<Vec<Value>, String>>,
 }
 
 /// Hook events to emit before a suspended yield completes. `coroutine.yield`
@@ -512,11 +592,13 @@ pub enum Step {
     Done(Vec<Value>),
     /// Fuel ran out; call `step` again to continue.
     Pending,
+    /// A native call is waiting for the host to complete it.
+    Waiting(NativeWait),
 }
 
 /// A suspendable run of a chunk. Created by [`Lua::execute`]; all VM state
 /// lives in the `Lua`, this is a handle plus fuel-debt bookkeeping.
-pub struct Execution {
+pub struct Execution<C = ()> {
     /// Root thread of this execution (a GC root while the execution lives).
     #[allow(dead_code)]
     thread: ThreadId,
@@ -527,6 +609,8 @@ pub struct Execution {
     /// from the next budget.
     debt: i64,
     finished: bool,
+    id: ExecutionId,
+    context: Option<C>,
 }
 
 /// Metamethod identifiers; indexes into `Lua::mm_names`.
@@ -607,11 +691,11 @@ fn mm_of_arith(op: ArithOp) -> Mm {
     }
 }
 
-pub struct Lua {
+pub struct Lua<C = ()> {
     pub(crate) strings: Strings,
     pub(crate) tables: Vec<Table>,
     pub(crate) closures: Vec<LuaClosure>,
-    pub(crate) natives: Vec<Native>,
+    pub(crate) natives: Vec<Native<C>>,
     pub(crate) upvals: Vec<Upval>,
     pub(crate) threads: Vec<Thread>,
     /// Userdata arena: host objects with optional metatables.
@@ -651,6 +735,10 @@ pub struct Lua {
     anchors: Vec<Value>,
     /// Placeholder proto for swept closure slots.
     empty_proto: Rc<Proto>,
+    next_execution_id: u64,
+    current_execution: Option<ExecutionId>,
+    active_context: Option<C>,
+    suspended_wait: Option<NativeWait>,
     allocs_since_gc: usize,
     str_bytes_at_gc: usize,
     /// Auto-GC after this many allocations (0 disables auto collection).
@@ -771,13 +859,21 @@ enum WeakKind {
     Both,
 }
 
-impl Default for Lua {
+impl<C> Default for Lua<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Lua {
+    /// Instantiates a chunk as a suspended execution. Nothing runs until
+    /// [`Execution::step`] is called.
+    pub fn execute(&mut self, chunk: &Chunk) -> Execution {
+        self.execute_inner(chunk, ())
+    }
+}
+
+impl<C> Lua<C> {
     #[must_use]
     pub fn new() -> Self {
         let mut strings = Strings::default();
@@ -814,6 +910,10 @@ impl Lua {
             natives_free: Vec::new(),
             exec_roots: std::collections::HashMap::new(),
             anchors: Vec::new(),
+            next_execution_id: 0,
+            current_execution: None,
+            active_context: None,
+            suspended_wait: None,
             empty_proto: Rc::new(Proto {
                 code: Vec::new(),
                 source: "<empty>".into(),
@@ -908,9 +1008,15 @@ impl Lua {
         Ok(Chunk { proto })
     }
 
-    /// Instantiates a chunk as a suspended execution. Nothing runs until
+    /// Instantiates a chunk with an execution context. Nothing runs until
     /// [`Execution::step`] is called.
-    pub fn execute(&mut self, chunk: &Chunk) -> Execution {
+    pub fn execute_with_context(&mut self, chunk: &Chunk, context: C) -> Execution<C> {
+        self.execute_inner(chunk, context)
+    }
+
+    /// Instantiates a compiled chunk as a fresh main thread with its frame
+    /// stack built, registering it as a GC root for as long as it is live.
+    fn instantiate_thread(&mut self, chunk: &Chunk) -> ThreadId {
         let env = self.new_upval(Upval::Closed(Value::Table(self.globals)));
         let cid = self.alloc_closure(LuaClosure {
             proto: chunk.proto.clone(),
@@ -943,12 +1049,50 @@ impl Lua {
         let tid = self.alloc_thread(th);
         // GC root for as long as the execution is live
         self.exec_roots.insert(tid.0, tid.0);
+        tid
+    }
+
+    fn execute_inner(&mut self, chunk: &Chunk, context: C) -> Execution<C> {
+        let tid = self.instantiate_thread(chunk);
+        let id = ExecutionId(self.next_execution_id);
+        self.next_execution_id = self.next_execution_id.wrapping_add(1);
         Execution {
             thread: tid,
             current: tid,
             debt: 0,
             finished: false,
+            id,
+            context: Some(context),
         }
+    }
+
+    /// Runs a compiled chunk to completion with no execution context. The
+    /// stdlib preludes use this at installation time: they are plain Lua that
+    /// calls no suspendable natives, so they need no host context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime error if the chunk raises one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk suspends on a native wait (the preludes never do).
+    pub(crate) fn run_chunk(&mut self, chunk: &Chunk) -> Result<(), Error> {
+        let tid = self.instantiate_thread(chunk);
+        let result = loop {
+            let mut fuel = i64::MAX;
+            match self.run(tid, &mut fuel) {
+                Ok(RunOutcome::Done(_)) => break Ok(()),
+                Ok(RunOutcome::Pending(_)) => {}
+                Ok(RunOutcome::Waiting(..)) => {
+                    self.exec_roots.remove(&tid.0);
+                    panic!("prelude cannot wait on the host");
+                }
+                Err(e) => break Err(Error::Runtime(e)),
+            }
+        };
+        self.exec_roots.remove(&tid.0);
+        result
     }
 
     /// Instantiates a compiled chunk as a function value whose `_ENV` is
@@ -1011,7 +1155,7 @@ impl Lua {
     /// # Panics
     ///
     /// Panics if the global table rejects the new entry.
-    pub fn register_native(&mut self, name: &str, f: NativeFn) -> Value {
+    pub fn register_native(&mut self, name: &str, f: NativeFn<C>) -> Value {
         let v = self.add_native(name, f);
         let k = self.new_string(name.as_bytes());
         self.tables[self.globals.0 as usize].set(k, v).unwrap();
@@ -1019,11 +1163,28 @@ impl Lua {
     }
 
     /// Adds a native function without binding it to a global.
-    pub fn add_native(&mut self, name: &str, f: NativeFn) -> Value {
+    pub fn add_native(&mut self, name: &str, f: NativeFn<C>) -> Value {
         self.add_native_kind(name, NativeKind::Plain(f))
     }
 
-    pub(crate) fn add_native_kind(&mut self, name: &str, kind: NativeKind) -> Value {
+    /// Registers a native that may suspend its execution until host completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the global table rejects the new entry.
+    pub fn register_suspendable_native(&mut self, name: &str, f: SuspendableNativeFn<C>) -> Value {
+        let v = self.add_suspendable_native(name, f);
+        let k = self.new_string(name.as_bytes());
+        self.tables[self.globals.0 as usize].set(k, v).unwrap();
+        v
+    }
+
+    /// Adds a suspendable native without binding it to a global.
+    pub fn add_suspendable_native(&mut self, name: &str, f: SuspendableNativeFn<C>) -> Value {
+        self.add_native_kind(name, NativeKind::Suspendable(f))
+    }
+
+    pub(crate) fn add_native_kind(&mut self, name: &str, kind: NativeKind<C>) -> Value {
         self.allocs_since_gc += 1;
         let n = Native {
             name: name.into(),
@@ -1966,6 +2127,10 @@ impl Lua {
                     self.threads[cur.0 as usize] = th;
                     return Ok(RunOutcome::Pending(cur));
                 }
+                Ok(DispatchEnd::Waiting(wait)) => {
+                    self.threads[cur.0 as usize] = th;
+                    return Ok(RunOutcome::Waiting(cur, wait));
+                }
                 Ok(DispatchEnd::Switch(next)) => {
                     self.threads[cur.0 as usize] = th;
                     cur = next;
@@ -2076,6 +2241,30 @@ impl Lua {
         fuel: &mut i64,
     ) -> Result<DispatchEnd, VmError> {
         loop {
+            if let Some(mut pending) = th.pending_native.take() {
+                match pending.completion.take() {
+                    None => {
+                        let wait = pending.wait;
+                        th.pending_native = Some(pending);
+                        return Ok(DispatchEnd::Waiting(wait));
+                    }
+                    Some(Ok(values)) => {
+                        place_shaped(th, pending.ret_to, pending.nres, pending.shape, &values);
+                        if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
+                            self.fire_hook(th, fuel, "return", -1, Some(pending.func))?;
+                        }
+                    }
+                    Some(Err(message)) => {
+                        let e = VmError {
+                            val: ErrVal::Msg(message),
+                            line: line_of(th),
+                            root_line: 0,
+                            source: None,
+                        };
+                        self.recover(th, fuel, e)?;
+                    }
+                }
+            }
             if *fuel <= 0 {
                 return Ok(DispatchEnd::Pending);
             }
@@ -2084,7 +2273,11 @@ impl Lua {
                 return Ok(DispatchEnd::Pending);
             }
             match self.exec_one(tid, th, fuel) {
-                Ok(Flow::Continue) => {}
+                Ok(Flow::Continue) => {
+                    if let Some(wait) = self.suspended_wait.take() {
+                        return Ok(DispatchEnd::Waiting(wait));
+                    }
+                }
                 Ok(Flow::Finished(vals)) => return Ok(DispatchEnd::Finished(vals)),
                 Err(mut e) => {
                     // capture the script's own call site before `recover`
@@ -3164,6 +3357,51 @@ impl Lua {
                 }
                 Ok(())
             }
+            NativeKind::Suspendable(f) => {
+                let fv = th.stack[func_abs];
+                let args = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
+                let execution = self
+                    .current_execution
+                    .expect("native called outside execution");
+                let mut context = self
+                    .active_context
+                    .take()
+                    .expect("execution context missing");
+                let outcome = f(
+                    &mut NativeContext {
+                        lua: self,
+                        execution,
+                        context: &mut context,
+                    },
+                    &args,
+                );
+                self.active_context = Some(context);
+                match outcome.map_err(|message| VmError {
+                    val: ErrVal::Msg(message),
+                    line: line_of(th),
+                    root_line: 0,
+                    source: None,
+                })? {
+                    NativeOutcome::Return(res) => {
+                        place_shaped(th, ret_to, nres, shape, &res);
+                        if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
+                            self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                        }
+                    }
+                    NativeOutcome::Wait(wait) => {
+                        th.pending_native = Some(PendingNative {
+                            wait,
+                            func: fv,
+                            ret_to,
+                            nres,
+                            shape,
+                            completion: None,
+                        });
+                        self.suspended_wait = Some(wait);
+                    }
+                }
+                Ok(())
+            }
             NativeKind::Intrinsic(i) => self.call_intrinsic(
                 th,
                 fuel,
@@ -4110,6 +4348,10 @@ impl Lua {
                                 } else {
                                     match &self.natives[nid.0 as usize].kind {
                                         NativeKind::Plain(f) => f(self, args),
+                                        NativeKind::Suspendable(_) => Err(
+                                            "cannot use a suspendable native as a coroutine body"
+                                                .into(),
+                                        ),
                                         NativeKind::Intrinsic(_) => {
                                             Err("cannot use this builtin as a coroutine body"
                                                 .into())
@@ -5692,6 +5934,12 @@ impl Lua {
                 work.push(v);
             }
         }
+        if let Some(pending) = &th.pending_native {
+            work.push(pending.func);
+            if let Some(Ok(values)) = &pending.completion {
+                work.extend_from_slice(values);
+            }
+        }
         if let Some(p) = th.parent {
             work.push(Value::Thread(p));
         }
@@ -5775,7 +6023,7 @@ impl Lua {
     }
 }
 
-fn n_dead(_: &mut Lua, _: &[Value]) -> Result<Vec<Value>, String> {
+fn n_dead<C>(_: &mut Lua<C>, _: &[Value]) -> Result<Vec<Value>, String> {
     Err("attempt to call a collected function".into())
 }
 
@@ -5865,6 +6113,7 @@ enum Flow {
 
 enum DispatchEnd {
     Pending,
+    Waiting(NativeWait),
     Finished(Vec<Value>),
     Switch(ThreadId),
 }
@@ -5872,6 +6121,7 @@ enum DispatchEnd {
 pub(crate) enum RunOutcome {
     Done(Vec<Value>),
     Pending(ThreadId),
+    Waiting(ThreadId, NativeWait),
 }
 
 /// Delivers a coroutine's yield/return values (or failure) into the thread
@@ -5887,7 +6137,7 @@ fn deliver_resume(parent: &mut Thread, rr: ResumeRet, ok: bool, vals: &[Value]) 
     }
 }
 
-impl Execution {
+impl<C> Execution<C> {
     /// Runs the script for at most `fuel` units of work (roughly one unit
     /// per VM instruction, with surcharges for calls and allocations).
     /// Returns `Step::Pending` if the budget ran out — call again to resume.
@@ -5896,7 +6146,8 @@ impl Execution {
     ///
     /// Returns an error if this execution already finished or a runtime error
     /// escapes the script.
-    pub fn step(&mut self, lua: &mut Lua, fuel: u64) -> Result<Step, Error> {
+    #[allow(clippy::missing_panics_doc)]
+    pub fn step(&mut self, lua: &mut Lua<C>, fuel: u64) -> Result<Step, Error> {
         if self.finished {
             return Err(Error::Runtime(RuntimeError {
                 message: "execution already finished".into(),
@@ -5911,7 +6162,12 @@ impl Execution {
             self.debt -= budget;
             return Ok(Step::Pending);
         }
-        match lua.run(self.current, &mut remaining) {
+        lua.current_execution = Some(self.id);
+        lua.active_context = Some(self.context.take().expect("execution context missing"));
+        let outcome = lua.run(self.current, &mut remaining);
+        lua.current_execution = None;
+        self.context = lua.active_context.take();
+        match outcome {
             Ok(RunOutcome::Done(vals)) => {
                 self.finished = true;
                 lua.exec_roots.remove(&self.thread.0);
@@ -5922,6 +6178,12 @@ impl Execution {
                 lua.exec_roots.insert(self.thread.0, current.0);
                 self.debt = (-remaining).max(0);
                 Ok(Step::Pending)
+            }
+            Ok(RunOutcome::Waiting(current, wait)) => {
+                self.current = current;
+                lua.exec_roots.insert(self.thread.0, current.0);
+                self.debt = (-remaining).max(0);
+                Ok(Step::Waiting(wait))
             }
             Err(e) => {
                 self.finished = true;
@@ -5934,9 +6196,53 @@ impl Execution {
     /// Abandons a suspended execution, releasing its GC roots. Without
     /// this (or running to completion), the execution's threads stay
     /// rooted for the lifetime of the `Lua`.
-    pub fn abort(mut self, lua: &mut Lua) {
+    pub fn abort(mut self, lua: &mut Lua<C>) {
         self.finished = true;
         lua.exec_roots.remove(&self.thread.0);
+    }
+
+    #[must_use]
+    pub fn id(&self) -> ExecutionId {
+        self.id
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn context(&self) -> &C {
+        self.context.as_ref().expect("execution context missing")
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn context_mut(&mut self) -> &mut C {
+        self.context.as_mut().expect("execution context missing")
+    }
+
+    /// Supplies the result of the native call currently awaiting `wait`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a finished execution, a stale or mismatched token,
+    /// or a call that has already been completed.
+    pub fn complete_native(
+        &mut self,
+        lua: &mut Lua<C>,
+        wait: NativeWait,
+        result: Result<Vec<Value>, String>,
+    ) -> Result<(), String> {
+        if self.finished {
+            return Err("execution already finished".into());
+        }
+        let pending = lua.threads[self.current.0 as usize]
+            .pending_native
+            .as_mut()
+            .ok_or_else(|| "execution is not waiting for a native call".to_string())?;
+        if pending.wait != wait {
+            return Err("native wait token does not match this execution".into());
+        }
+        if pending.completion.is_some() {
+            return Err("native call was already completed".into());
+        }
+        pending.completion = Some(result);
+        Ok(())
     }
 
     #[must_use]
@@ -5947,7 +6253,7 @@ impl Execution {
     /// `(chunk name, source line)` of the instruction the execution would
     /// run next, for debuggers and tracers. `None` once it has finished.
     #[must_use]
-    pub fn current_location(&self, lua: &Lua) -> Option<(String, u32)> {
+    pub fn current_location(&self, lua: &Lua<C>) -> Option<(String, u32)> {
         let th = lua.threads.get(self.current.0 as usize)?;
         let f = th.frames.iter().rev().find_map(|f| f.lua())?;
         let line = f.proto.lines.get(f.pc).copied().unwrap_or(0);

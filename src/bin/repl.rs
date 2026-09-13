@@ -50,6 +50,10 @@ fn run_script(name: &str, src: &[u8]) {
         match exec.step(&mut lua, 10_000_000) {
             Ok(Step::Done(_)) => return,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(wait)) => {
+                eprintln!("slew: waiting for native operation {wait:?}");
+                std::process::exit(1);
+            }
             Err(e) => {
                 eprintln!("slew: {e}");
                 std::process::exit(1);
@@ -125,6 +129,10 @@ fn drive(lua: &mut Lua, mut exec: Execution, fuel: u64) -> Option<Execution> {
         }
         Ok(Step::Pending) => {
             println!("~ suspended after {fuel} fuel (:more to continue, new input to abandon)");
+            Some(exec)
+        }
+        Ok(Step::Waiting(wait)) => {
+            println!("~ waiting for native operation {wait:?}");
             Some(exec)
         }
         Err(e) => {

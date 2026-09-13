@@ -18,9 +18,9 @@ mod table;
 mod utf8;
 
 use crate::value::{Value, fmt_number, to_key};
-use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind, Step};
+use crate::vm::{CoStatus, Error, Intrinsic, Lua, NativeKind};
 
-pub fn install(lua: &mut Lua) {
+pub fn install<C>(lua: &mut Lua<C>) {
     lua.register_intrinsic("print", Intrinsic::Print);
     lua.register_native("type", n_type);
     lua.register_native("tonumber", n_tonumber);
@@ -71,7 +71,7 @@ pub fn install(lua: &mut Lua) {
 /// Building the file metatable first lets userdata reference it; the small Lua
 /// prelude then adds the `lines` iterators. This is never called without a
 /// host, so `io`/`os` are simply absent and the core keeps no authority.
-pub(crate) fn install_host_libs(lua: &mut Lua) {
+pub(crate) fn install_host_libs<C>(lua: &mut Lua<C>) {
     let file_meta = io::build_file_metatable(lua);
     lua.file_meta = Some(file_meta);
     io::install(lua);
@@ -93,7 +93,7 @@ pub(crate) fn install_host_libs(lua: &mut Lua) {
 /// natives) because they inspect call frames, and the running thread is
 /// `mem::take`n out of the arena during dispatch: only intrinsics receive
 /// the live `&mut Thread`.
-fn install_debug(lua: &mut Lua) {
+fn install_debug<C>(lua: &mut Lua<C>) {
     let debug = lua.new_table();
     lua.set_global("debug", debug);
     let entries: [(&str, Intrinsic); 11] = [
@@ -115,27 +115,22 @@ fn install_debug(lua: &mut Lua) {
     }
 }
 
-fn run_prelude(lua: &mut Lua) {
+fn run_prelude<C>(lua: &mut Lua<C>) {
     let chunk = lua
         .load_named("prelude", include_str!("prelude.lua"))
         .expect("prelude must compile");
-    let mut exec = lua.execute(&chunk);
-    loop {
-        match exec.step(lua, 1_000_000) {
-            Ok(Step::Done(_)) => break,
-            Ok(Step::Pending) => {}
-            Err(e) => panic!("prelude failed: {e}"),
-        }
+    if let Err(e) = lua.run_chunk(&chunk) {
+        panic!("prelude failed: {e}");
     }
 }
 
-pub(super) fn set_field(lua: &mut Lua, t: Value, name: &str, v: Value) {
+pub(super) fn set_field<C>(lua: &mut Lua<C>, t: Value, name: &str, v: Value) {
     let Value::Table(id) = t else { unreachable!() };
     let k = lua.new_string(name.as_bytes());
     lua.tables[id.0 as usize].set(k, v).unwrap();
 }
 
-fn install_coroutine(lua: &mut Lua) {
+fn install_coroutine<C>(lua: &mut Lua<C>) {
     let ct = lua.new_table();
     lua.set_global("coroutine", ct);
     let create = lua.add_native("create", n_co_create);
@@ -160,7 +155,7 @@ fn install_coroutine(lua: &mut Lua) {
 /// Creates the `package` table: `loaded`/`preload`/paths plus the
 /// `searchpath` probe. `require` and the searchers live in the prelude so
 /// they can call back into Lua loaders through the regular VM machinery.
-fn install_package(lua: &mut Lua) {
+fn install_package<C>(lua: &mut Lua<C>) {
     let pkg = lua.new_table();
     lua.set_global("package", pkg);
     let loaded = lua.new_table();
@@ -196,8 +191,8 @@ fn install_package(lua: &mut Lua) {
 /// Compiles `src` the way `load`/`loadfile` do: the function on success,
 /// `nil, message` on any failure. Text/binary `mode` is enforced, and binary
 /// chunks are decoded by [`dump::undump`].
-fn load_source(
-    lua: &mut Lua,
+fn load_source<C>(
+    lua: &mut Lua<C>,
     src: &[u8],
     chunkname: &str,
     mode: &[u8],
@@ -236,15 +231,15 @@ fn load_source(
 
 /// `nil, "chunkname:line: message"`, the shape `load`/`loadfile` use for
 /// compile failures.
-fn text_error(lua: &mut Lua, chunkname: &str, line: u32, message: &str) -> Vec<Value> {
+fn text_error<C>(lua: &mut Lua<C>, chunkname: &str, line: u32, message: &str) -> Vec<Value> {
     let msg = format!("{chunkname}:{line}: {message}");
     vec![Value::Nil, lua.new_string(msg.as_bytes())]
 }
 
 /// `luaL_checkstring`-ish: strings pass, numbers are rendered, anything
 /// else (including nil) is an error.
-pub(super) fn check_bytes(
-    lua: &Lua,
+pub(super) fn check_bytes<C>(
+    lua: &Lua<C>,
     args: &[Value],
     i: usize,
     who: &str,
@@ -260,7 +255,12 @@ pub(super) fn check_bytes(
     }
 }
 
-fn opt_bytes(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Option<Vec<u8>>, String> {
+fn opt_bytes<C>(
+    lua: &Lua<C>,
+    args: &[Value],
+    i: usize,
+    who: &str,
+) -> Result<Option<Vec<u8>>, String> {
     if arg(args, i) == Value::Nil {
         Ok(None)
     } else {
@@ -286,7 +286,7 @@ fn replace_all(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     out
 }
 
-fn n_load(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_load<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let src = check_bytes(lua, args, 0, "load")?;
     // PUC defaults the chunk name of a string chunk to the source itself
     let chunkname = match opt_bytes(lua, args, 1, "load")? {
@@ -300,7 +300,7 @@ fn n_load(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(load_source(lua, &src, &chunkname, &mode, env))
 }
 
-fn n_loadfile(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_loadfile<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let Some(filename) = opt_bytes(lua, args, 0, "loadfile")? else {
         return Ok(vec![
             Value::Nil,
@@ -329,7 +329,7 @@ fn n_loadfile(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 /// `nil, "no file '...'\n\tno file '...'"` like PUC (built from the whole
 /// expanded path, so empty templates still produce their line). A hard
 /// reader error counts as "not readable", matching PUC's `fopen` probe.
-fn n_searchpath(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_searchpath<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let name = check_bytes(lua, args, 0, "searchpath")?;
     let path = check_bytes(lua, args, 1, "searchpath")?;
     let sep = opt_bytes(lua, args, 2, "searchpath")?.unwrap_or_else(|| b".".to_vec());
@@ -355,7 +355,7 @@ fn n_searchpath(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Nil, lua.new_string(&msg)])
 }
 
-fn n_co_create(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_co_create<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         f @ (Value::Closure(_) | Value::Native(_)) => Ok(vec![lua.create_coroutine(f)]),
         v => Err(format!(
@@ -365,7 +365,7 @@ fn n_co_create(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_co_status(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_co_status<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let Value::Thread(co) = arg(args, 0) else {
         return Err("bad argument #1 to 'status' (coroutine expected)".into());
     };
@@ -382,7 +382,7 @@ fn n_co_status(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(s.as_bytes())])
 }
 
-fn n_co_wrap(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_co_wrap<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         f @ (Value::Closure(_) | Value::Native(_)) => {
             let Value::Thread(tid) = lua.create_coroutine(f) else {
@@ -401,7 +401,7 @@ fn n_co_wrap(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_setmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_setmetatable<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = check_table(lua, args, 0, "setmetatable")?;
     let Value::Table(id) = t else { unreachable!() };
     let mt = match arg(args, 1) {
@@ -416,7 +416,7 @@ fn n_setmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![t])
 }
 
-fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_getmetatable<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let v = arg(args, 0);
     match lua.get_metatable(v) {
         None => Ok(vec![Value::Nil]),
@@ -433,7 +433,7 @@ fn n_getmetatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// The raw metatable (ignoring a `__metatable` guard), for the prelude's
 /// metamethod lookups.
-fn n_raw_metatable(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_raw_metatable<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match lua.get_metatable(arg(args, 0)) {
         Some(mt) => Ok(vec![Value::Table(mt)]),
         None => Ok(vec![Value::Nil]),
@@ -444,8 +444,8 @@ pub(super) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::Nil)
 }
 
-pub(super) fn check_table(
-    _lua: &Lua,
+pub(super) fn check_table<C>(
+    _lua: &Lua<C>,
     args: &[Value],
     i: usize,
     who: &str,
@@ -460,14 +460,14 @@ pub(super) fn check_table(
     }
 }
 
-fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_type<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     if args.is_empty() {
         return Err("bad argument #1 to 'type' (value expected)".into());
     }
     Ok(vec![lua.new_string(args[0].type_name().as_bytes())])
 }
 
-fn n_tonumber(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tonumber<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 1) {
         Value::Nil => Ok(vec![match arg(args, 0) {
             v @ (Value::Int(_) | Value::Float(_)) => v,
@@ -570,7 +570,7 @@ fn parse_int_base(s: &str, base: i64) -> Option<i64> {
     Some(if negate { v.wrapping_neg() } else { v })
 }
 
-fn n_select(_lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_select<C>(_lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let rest = args.get(1..).unwrap_or(&[]);
     match arg(args, 0) {
         Value::Str(_) => Ok(vec![Value::Int(rest.len() as i64)]), // select('#', ...)
@@ -586,12 +586,12 @@ fn n_select(_lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_rawget(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rawget<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = check_table(lua, args, 0, "rawget")?;
     Ok(vec![lua.table_get(t, arg(args, 1))])
 }
 
-fn n_rawset(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rawset<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let t = check_table(lua, args, 0, "rawset")?;
     let Value::Table(id) = t else { unreachable!() };
     lua.tables[id.0 as usize]
@@ -600,14 +600,14 @@ fn n_rawset(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![t])
 }
 
-fn n_rawequal(_lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rawequal<C>(_lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Bool(crate::vm::values_equal(
         arg(args, 0),
         arg(args, 1),
     ))])
 }
 
-fn n_rawlen(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rawlen<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         Value::Table(t) => Ok(vec![Value::Int(lua.tables[t.0 as usize].length())]),
         Value::Str(s) => Ok(vec![Value::Int(lua.strings.get(s).len() as i64)]),
@@ -620,7 +620,7 @@ fn n_rawlen(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_next(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_next<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let Value::Table(id) = check_table(lua, args, 0, "next")? else {
         unreachable!()
     };

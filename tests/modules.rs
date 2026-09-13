@@ -15,6 +15,7 @@ fn eval(lua: &mut Lua, src: &str) -> String {
                 return lua.display_value(vals[0]);
             }
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -31,6 +32,7 @@ fn run_ok(lua: &mut Lua, src: &str) {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => return,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }

@@ -7,7 +7,7 @@ use test_case::test_case;
 
 /// Compiles `src`, expecting a compile/parse failure, and returns its message.
 fn load_err(src: &str) -> String {
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     lua.load(src)
         .err()
         .unwrap_or_else(|| panic!("expected a load error for:\n{src}"))
@@ -27,6 +27,7 @@ fn eval_multi(src: &str) -> Vec<String> {
                 return vals.iter().map(|v| lua.display_value(*v)).collect();
             }
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }

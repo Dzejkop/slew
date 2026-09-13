@@ -14,9 +14,9 @@ use super::{arg, check_bytes, set_field};
 
 /// Builds the shared file userdata metatable and its method table. `lines` is
 /// added later by the Lua prelude (it needs to close over the format list).
-pub(super) fn build_file_metatable(lua: &mut Lua) -> crate::value::TableId {
+pub(super) fn build_file_metatable<C>(lua: &mut Lua<C>) -> crate::value::TableId {
     let methods = lua.new_table();
-    let natives: [(&str, crate::vm::NativeFn); 7] = [
+    let natives: [(&str, crate::vm::NativeFn<C>); 7] = [
         ("read", n_read),
         ("write", n_write),
         ("seek", n_seek),
@@ -48,7 +48,7 @@ pub(super) fn build_file_metatable(lua: &mut Lua) -> crate::value::TableId {
     meta_id
 }
 
-pub(super) fn install(lua: &mut Lua) {
+pub(super) fn install<C>(lua: &mut Lua<C>) {
     let file_meta = lua.file_meta.expect("file metatable installed first");
     let io = lua.new_table();
     lua.set_global("io", io);
@@ -68,7 +68,7 @@ pub(super) fn install(lua: &mut Lua) {
     lua.io_input = Some(stdin_id);
     lua.io_output = Some(stdout_id);
 
-    let entries: [(&str, crate::vm::NativeFn); 8] = [
+    let entries: [(&str, crate::vm::NativeFn<C>); 8] = [
         ("open", n_open),
         ("close", n_io_close),
         ("read", n_io_read),
@@ -87,22 +87,21 @@ pub(super) fn install(lua: &mut Lua) {
 /// Runs the small Lua prelude that defines `io.lines` and `file:lines` in
 /// terms of the native `read` (so their iterator closures are real Lua
 /// functions, suspendable like everything else).
-pub(super) fn run_prelude(lua: &mut Lua) {
+pub(super) fn run_prelude<C>(lua: &mut Lua<C>) {
     let chunk = match lua.load_named("=io", include_str!("io_prelude.lua")) {
         Ok(c) => c,
         Err(e) => panic!("io prelude must compile: {e}"),
     };
-    let mut exec = lua.execute(&chunk);
-    loop {
-        match exec.step(lua, 10_000_000) {
-            Ok(crate::vm::Step::Done(_)) => break,
-            Ok(crate::vm::Step::Pending) => {}
-            Err(e) => panic!("io prelude failed: {e}"),
-        }
+    if let Err(e) = lua.run_chunk(&chunk) {
+        panic!("io prelude failed: {e}");
     }
 }
 
-pub(super) fn new_file(lua: &mut Lua, object: HostObject, meta: crate::value::TableId) -> Value {
+pub(super) fn new_file<C>(
+    lua: &mut Lua<C>,
+    object: HostObject,
+    meta: crate::value::TableId,
+) -> Value {
     let ud = Userdata {
         metatable: Some(meta),
         object,
@@ -115,12 +114,12 @@ pub(super) fn new_file(lua: &mut Lua, object: HostObject, meta: crate::value::Ta
 }
 
 /// `nil, "message", errno` return shape used by `io.open` etc.
-fn open_failure(lua: &mut Lua, e: &HostError) -> Vec<Value> {
+fn open_failure<C>(lua: &mut Lua<C>, e: &HostError) -> Vec<Value> {
     let msg = lua.new_string(e.message.as_bytes());
     vec![Value::Nil, msg, Value::Int(e.errno as i64)]
 }
 
-fn want_file(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<UserdataId, String> {
+fn want_file<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<UserdataId, String> {
     match arg(args, i) {
         Value::Userdata(u) => {
             if lua.userdata[u.0 as usize].closed {
@@ -141,7 +140,7 @@ fn want_file(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<UserdataI
 
 /// Reads more bytes from the host, compacting any consumed prefix first.
 /// Returns the number of new bytes (0 at end of file).
-fn fill_more(lua: &mut Lua, uid: UserdataId) -> Result<usize, String> {
+fn fill_more<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<usize, String> {
     let obj = {
         let ud = &mut lua.userdata[uid.0 as usize];
         if ud.read_pos > 0 {
@@ -170,7 +169,7 @@ fn fill_more(lua: &mut Lua, uid: UserdataId) -> Result<usize, String> {
 
 /// Ensures at least one buffered byte is available. Returns `true` when bytes
 /// are available, `false` at end of file.
-fn refill(lua: &mut Lua, uid: UserdataId) -> Result<bool, String> {
+fn refill<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<bool, String> {
     {
         let ud = &lua.userdata[uid.0 as usize];
         if ud.read_pos < ud.read_buf.len() {
@@ -180,7 +179,7 @@ fn refill(lua: &mut Lua, uid: UserdataId) -> Result<bool, String> {
     fill_more(lua, uid).map(|n| n > 0)
 }
 
-fn peek(lua: &mut Lua, uid: UserdataId) -> Result<Option<u8>, String> {
+fn peek<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<Option<u8>, String> {
     if !refill(lua, uid)? {
         return Ok(None);
     }
@@ -188,12 +187,12 @@ fn peek(lua: &mut Lua, uid: UserdataId) -> Result<Option<u8>, String> {
     Ok(Some(ud.read_buf[ud.read_pos]))
 }
 
-fn advance(lua: &mut Lua, uid: UserdataId) {
+fn advance<C>(lua: &mut Lua<C>, uid: UserdataId) {
     lua.userdata[uid.0 as usize].read_pos += 1;
 }
 
-fn read_line(
-    lua: &mut Lua,
+fn read_line<C>(
+    lua: &mut Lua<C>,
     uid: UserdataId,
     keep_newline: bool,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -226,7 +225,7 @@ fn read_line(
     }
 }
 
-fn read_count(lua: &mut Lua, uid: UserdataId, n: usize) -> Result<Option<Vec<u8>>, String> {
+fn read_count<C>(lua: &mut Lua<C>, uid: UserdataId, n: usize) -> Result<Option<Vec<u8>>, String> {
     if n == 0 {
         return Ok(peek(lua, uid)?.map(|_| Vec::new()));
     }
@@ -267,7 +266,7 @@ fn read_count(lua: &mut Lua, uid: UserdataId, n: usize) -> Result<Option<Vec<u8>
     }
 }
 
-fn read_all(lua: &mut Lua, uid: UserdataId) -> Result<Vec<u8>, String> {
+fn read_all<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     loop {
         {
@@ -290,8 +289,8 @@ const MAX_NUMERAL_LEN: usize = 200;
 /// Consumes the current byte into `token` when `pred` accepts it, mirroring
 /// PUC's `nextc`: once the buffer is full the byte is left unread and `overflow`
 /// is set, so an over-long numeral fails instead of growing without bound.
-fn accept_byte(
-    lua: &mut Lua,
+fn accept_byte<C>(
+    lua: &mut Lua<C>,
     uid: UserdataId,
     token: &mut Vec<u8>,
     overflow: &mut bool,
@@ -313,8 +312,8 @@ fn accept_byte(
 }
 
 /// Consumes a run of (hex)digits, returning how many were accepted.
-fn accept_digits(
-    lua: &mut Lua,
+fn accept_digits<C>(
+    lua: &mut Lua<C>,
     uid: UserdataId,
     token: &mut Vec<u8>,
     overflow: &mut bool,
@@ -341,7 +340,7 @@ fn accept_digits(
 /// leaving every other byte — including a long non-numeric run — unread, then
 /// let [`super::parse_number`] validate the scanned prefix. This never rewinds
 /// `read_pos`, so a token spanning the read buffer cannot underflow.
-fn read_number(lua: &mut Lua, uid: UserdataId) -> Result<Option<Value>, String> {
+fn read_number<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<Option<Value>, String> {
     // skip leading whitespace
     while let Some(b) = peek(lua, uid)? {
         if b.is_ascii_whitespace() {
@@ -392,7 +391,7 @@ fn read_number(lua: &mut Lua, uid: UserdataId) -> Result<Option<Value>, String> 
 }
 
 /// One `read` format: `Value` result or `None` on failure (EOF).
-fn read_one(lua: &mut Lua, uid: UserdataId, fmt: Value) -> Result<Option<Value>, String> {
+fn read_one<C>(lua: &mut Lua<C>, uid: UserdataId, fmt: Value) -> Result<Option<Value>, String> {
     match fmt {
         Value::Int(n) => {
             if n < 0 {
@@ -433,7 +432,7 @@ fn read_one(lua: &mut Lua, uid: UserdataId, fmt: Value) -> Result<Option<Value>,
     }
 }
 
-fn do_read(lua: &mut Lua, uid: UserdataId, fmts: &[Value]) -> Result<Vec<Value>, String> {
+fn do_read<C>(lua: &mut Lua<C>, uid: UserdataId, fmts: &[Value]) -> Result<Vec<Value>, String> {
     let mut results = Vec::new();
     if fmts.is_empty() {
         let lfmt = lua.new_string(b"l");
@@ -456,13 +455,13 @@ fn do_read(lua: &mut Lua, uid: UserdataId, fmts: &[Value]) -> Result<Vec<Value>,
 
 // ---- natives -----------------------------------------------------------
 
-fn n_read(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_read<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "read")?;
     let fmts = args.get(1..).unwrap_or(&[]).to_vec();
     do_read(lua, uid, &fmts)
 }
 
-fn n_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_write<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "write")?;
     let mut bytes = Vec::new();
     for (i, &v) in args.iter().enumerate().skip(1) {
@@ -486,7 +485,7 @@ fn n_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![args[0]])
 }
 
-fn write_handle(lua: &mut Lua, uid: UserdataId, bytes: &[u8]) -> Result<(), HostError> {
+fn write_handle<C>(lua: &mut Lua<C>, uid: UserdataId, bytes: &[u8]) -> Result<(), HostError> {
     let obj = lua.userdata[uid.0 as usize].object;
     let Some(h) = lua.host.as_mut() else {
         return Err(HostError::new("io library has no host"));
@@ -508,7 +507,7 @@ fn seek_whence(bytes: &[u8]) -> Option<SeekWhence> {
     }
 }
 
-fn n_seek(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_seek<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "seek")?;
     let whence_bytes = match arg(args, 1) {
         Value::Nil => None,
@@ -564,13 +563,13 @@ fn n_seek(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_close(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_close<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "close")?;
     close_handle(lua, uid)?;
     Ok(vec![Value::Bool(true)])
 }
 
-fn close_handle(lua: &mut Lua, uid: UserdataId) -> Result<(), String> {
+fn close_handle<C>(lua: &mut Lua<C>, uid: UserdataId) -> Result<(), String> {
     if lua.userdata[uid.0 as usize].closed {
         return Err("attempt to use a closed file".into());
     }
@@ -586,7 +585,7 @@ fn close_handle(lua: &mut Lua, uid: UserdataId) -> Result<(), String> {
     Ok(())
 }
 
-fn n_flush(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_flush<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "flush")?;
     let obj = lua.userdata[uid.0 as usize].object;
     if let HostObject::File(handle) = obj
@@ -598,7 +597,7 @@ fn n_flush(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![args[0]])
 }
 
-fn n_setvbuf(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_setvbuf<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "setvbuf")?;
     let mode = check_bytes(lua, args, 1, "setvbuf")?;
     if !matches!(&mode[..], b"no" | b"full" | b"line") {
@@ -619,12 +618,12 @@ fn n_setvbuf(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![args[0]])
 }
 
-fn n_lines_stub(_lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_lines_stub<C>(_lua: &mut Lua<C>, _args: &[Value]) -> Result<Vec<Value>, String> {
     // Replaced by the Lua prelude's `methods:lines`.
     Err("bad argument #1 to 'lines' (FILE* expected)".into())
 }
 
-fn n_tostring(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tostring<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = want_file(lua, args, 0, "tostring")?;
     let s = if lua.userdata[uid.0 as usize].closed {
         "file (closed)".to_string()
@@ -634,7 +633,7 @@ fn n_tostring(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![lua.new_string(s.as_bytes())])
 }
 
-fn n_gc(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_gc<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     if let Value::Userdata(u) = arg(args, 0)
         && !lua.userdata[u.0 as usize].closed
     {
@@ -660,7 +659,7 @@ fn valid_mode(mode: &[u8]) -> bool {
     true
 }
 
-fn n_open(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_open<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let path = check_bytes(lua, args, 0, "open")?;
     let mode = match arg(args, 1) {
         Value::Nil => b"r".to_vec(),
@@ -684,23 +683,23 @@ fn n_open(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn default_input(lua: &mut Lua, who: &str) -> Result<UserdataId, String> {
+fn default_input<C>(lua: &mut Lua<C>, who: &str) -> Result<UserdataId, String> {
     lua.io_input
         .ok_or_else(|| format!("bad argument #1 to '{who}' (no default input)"))
 }
 
-fn default_output(lua: &mut Lua, who: &str) -> Result<UserdataId, String> {
+fn default_output<C>(lua: &mut Lua<C>, who: &str) -> Result<UserdataId, String> {
     lua.io_output
         .ok_or_else(|| format!("bad argument #1 to '{who}' (no default output)"))
 }
 
-fn n_io_read(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_io_read<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = default_input(lua, "read")?;
     let fmts = args.to_vec();
     do_read(lua, uid, &fmts)
 }
 
-fn n_io_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_io_write<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = default_output(lua, "write")?;
     let mut bytes = Vec::new();
     for (i, &v) in args.iter().enumerate() {
@@ -724,7 +723,7 @@ fn n_io_write(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![Value::Userdata(uid)])
 }
 
-fn n_io_close(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_io_close<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let uid = match arg(args, 0) {
         Value::Nil => default_output(lua, "close")?,
         v => match v {
@@ -746,7 +745,7 @@ fn n_io_close(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 /// Opens a named file for `io.input`/`io.output`: `Ok(file)` or `Err(message)`
 /// so the wrapper can raise with a PUC-shaped message.
-fn open_named(lua: &mut Lua, name: &[u8], mode: &[u8]) -> Result<Value, String> {
+fn open_named<C>(lua: &mut Lua<C>, name: &[u8], mode: &[u8]) -> Result<Value, String> {
     let file_meta = lua.file_meta.expect("file metatable");
     let path = String::from_utf8_lossy(name).into_owned();
     let mode_str = String::from_utf8_lossy(mode).into_owned();
@@ -762,15 +761,19 @@ fn open_named(lua: &mut Lua, name: &[u8], mode: &[u8]) -> Result<Value, String> 
     }
 }
 
-fn n_io_input(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_io_input<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     set_default_stream(lua, args, true)
 }
 
-fn n_io_output(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_io_output<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     set_default_stream(lua, args, false)
 }
 
-fn set_default_stream(lua: &mut Lua, args: &[Value], input: bool) -> Result<Vec<Value>, String> {
+fn set_default_stream<C>(
+    lua: &mut Lua<C>,
+    args: &[Value],
+    input: bool,
+) -> Result<Vec<Value>, String> {
     match arg(args, 0) {
         Value::Nil => {
             let uid = if input {
@@ -810,7 +813,7 @@ fn set_default_stream(lua: &mut Lua, args: &[Value], input: bool) -> Result<Vec<
     }
 }
 
-fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_type<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let file_meta = lua.file_meta;
     match arg(args, 0) {
         Value::Userdata(u) if lua.userdata[u.0 as usize].metatable == file_meta => {
@@ -825,7 +828,7 @@ fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_tmpfile(lua: &mut Lua, _args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tmpfile<C>(lua: &mut Lua<C>, _args: &[Value]) -> Result<Vec<Value>, String> {
     let file_meta = lua.file_meta.expect("file metatable");
     let name = {
         let Some(h) = lua.host.as_mut() else {

@@ -66,7 +66,7 @@ fn argerr(n: usize, who: &str, msg: &str) -> String {
 }
 
 /// `luaL_checkinteger`: accepts integers, integral floats, and numeric strings.
-fn check_integer(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<i64, String> {
+fn check_integer<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<i64, String> {
     let v = arg(args, i);
     let coerced = match v {
         Value::Str(id) => parse_number(lua.strings.get(id)),
@@ -88,7 +88,7 @@ fn check_integer(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<i64, 
     }
 }
 
-fn check_number(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<f64, String> {
+fn check_number<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<f64, String> {
     match arg(args, i) {
         Value::Int(n) => Ok(n as f64),
         Value::Float(f) => Ok(f),
@@ -108,7 +108,7 @@ fn check_number(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<f64, S
     }
 }
 
-fn check_string(lua: &Lua, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
+fn check_string<C>(lua: &Lua<C>, args: &[Value], i: usize, who: &str) -> Result<Vec<u8>, String> {
     match arg(args, i) {
         Value::Str(id) => Ok(lua.strings.get(id).to_vec()),
         v @ (Value::Int(_) | Value::Float(_)) => Ok(crate::value::fmt_number(v).into_bytes()),
@@ -285,7 +285,7 @@ fn unpackint(
     Ok(res as i64)
 }
 
-pub(crate) fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(crate) fn n_pack<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let fmt = check_string(lua, args, 0, "pack")?;
     let mut h = Header::new("pack");
     let mut out: Vec<u8> = Vec::new();
@@ -369,7 +369,7 @@ pub(crate) fn n_pack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String
     Ok(vec![lua.new_string(&out)])
 }
 
-pub(crate) fn n_packsize(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(crate) fn n_packsize<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let fmt = check_string(lua, args, 0, "packsize")?;
     let mut h = Header::new("packsize");
     let mut total = 0usize;
@@ -388,7 +388,7 @@ pub(crate) fn n_packsize(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, St
     Ok(vec![Value::Int(total as i64)])
 }
 
-pub(crate) fn n_unpack(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(crate) fn n_unpack<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let fmt = check_string(lua, args, 0, "unpack")?;
     let data = check_string(lua, args, 1, "unpack")?;
     let ld = data.len();

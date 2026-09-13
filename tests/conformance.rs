@@ -328,6 +328,7 @@ fn run_source(dir: &Path, path: &Path, src: &[u8], shims: &str) -> Status {
                     return Status::Timeout;
                 }
             }
+            Ok(Step::Waiting(_)) => return Status::Line(0),
             Err(e) => {
                 if std::env::var_os("SLEW_LUA_TESTS_VERBOSE").is_some() {
                     eprintln!("    {e}");
@@ -345,6 +346,7 @@ fn drive(lua: &mut Lua, name: &str, src: &[u8]) -> Result<(), Error> {
         match exec.step(lua, STEP_FUEL)? {
             Step::Done(_) => return Ok(()),
             Step::Pending => {}
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
 }

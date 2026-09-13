@@ -1,4 +1,4 @@
-use slew::{Lua, Step, Value};
+use slew::{Lua, NativeContext, NativeOutcome, NativeWait, Step, Value};
 use test_case::test_case;
 
 /// Runs a script to completion with a generous fuel budget; panics if it
@@ -12,6 +12,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 100_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -42,6 +43,7 @@ fn run_err(src: &str) -> String {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => return e.to_string(),
         }
     }
@@ -147,7 +149,7 @@ fn local_env_declaration() {
 #[test]
 fn labels_are_invisible_to_enclosing_blocks() {
     // Out-of-block labels must be compile errors, never host panics.
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     for src in [
         "do goto l end do ::l:: end",
         "if true then goto l else ::l:: end",
@@ -660,7 +662,7 @@ fn globals() {
 
 #[test]
 fn const_attrib_enforced() {
-    let mut lua = Lua::new();
+    let mut lua = Lua::<()>::new();
     let err = lua.load("local x <const> = 1 x = 2").unwrap_err();
     assert!(err.to_string().contains("const"));
 }
@@ -755,6 +757,7 @@ fn suspension_mid_call_resumes_correctly() {
                 steps += 1;
                 assert!(steps < 1_000_000, "runaway");
             }
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
     assert!(
@@ -820,6 +823,151 @@ fn two_executions_share_globals_but_not_control() {
     assert_eq!(w.step(&mut lua, 1_000).unwrap(), Step::Pending);
 }
 
+#[derive(Debug, PartialEq)]
+struct RobotContext {
+    robot: u32,
+    moves: Vec<(u32, String)>,
+}
+
+fn move_robot(
+    ctx: &mut NativeContext<'_, RobotContext>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    let robot = ctx.context().robot;
+    let direction = ctx
+        .str_bytes(args.first().copied().unwrap_or(Value::Nil))
+        .ok_or("direction must be a string")?;
+    let direction = String::from_utf8(direction.to_vec()).unwrap();
+    ctx.context_mut().moves.push((robot, direction));
+    Ok(NativeOutcome::Wait(NativeWait(robot as u64)))
+}
+
+#[test]
+fn suspendable_native_waits_for_host_completion() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua
+        .load("local arrived = move('east'); return arrived, 'continued'")
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        exec.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(7))
+    );
+    assert_eq!(exec.context().moves, vec![(7, "east".into())]);
+    assert_eq!(
+        exec.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(7))
+    );
+
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("execution should complete")
+    };
+    assert_eq!(values[0], Value::Bool(true));
+    assert_eq!(lua.display_value(values[1]), "continued");
+}
+
+#[test]
+fn suspendable_native_resumes_inside_coroutine() {
+    let mut runtime = slew::Lua::<RobotContext>::new();
+    runtime.register_suspendable_native("move", move_robot);
+    let chunk = runtime
+        .load(
+            "local co = coroutine.create(function() return move('south') end)\n\
+             local ok, moved = coroutine.resume(co)\n\
+             return ok, moved, coroutine.status(co)",
+        )
+        .unwrap();
+    let mut exec = runtime.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 11,
+            moves: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        exec.step(&mut runtime, 100_000).unwrap(),
+        Step::Waiting(NativeWait(11))
+    );
+    exec.complete_native(&mut runtime, NativeWait(11), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut runtime, 100_000).unwrap() else {
+        panic!("execution should complete")
+    };
+    assert_eq!(values[0], Value::Bool(true));
+    assert_eq!(values[1], Value::Bool(true));
+    assert_eq!(runtime.display_value(values[2]), "dead");
+}
+
+#[test]
+fn native_completion_error_is_caught_by_pcall() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua.load("return pcall(move, 'north')").unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 9,
+            moves: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        exec.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(9))
+    );
+    exec.complete_native(&mut lua, NativeWait(9), Err("blocked".into()))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("pcall should catch completion error")
+    };
+    assert_eq!(values[0], Value::Bool(false));
+    assert_eq!(lua.display_value(values[1]), "blocked");
+}
+
+#[test]
+fn execution_context_identifies_each_robot() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua.load("return move('west')").unwrap();
+    let mut first = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 1,
+            moves: Vec::new(),
+        },
+    );
+    let mut second = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 2,
+            moves: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        first.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(1))
+    );
+    assert_eq!(
+        second.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(2))
+    );
+    assert_ne!(first.id(), second.id());
+    assert_eq!(first.context().moves[0].0, 1);
+    assert_eq!(second.context().moves[0].0, 2);
+}
+
 #[test]
 fn runtime_error_reports_line() {
     let err = run_err("local x = 1\nlocal y = 2\nreturn x + {}");
@@ -837,6 +985,7 @@ fn runtime_error_reports_root_line() {
         match exec.step(&mut lua, 100_000) {
             Ok(Step::Done(_)) => panic!("expected error"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => break e,
         }
     };

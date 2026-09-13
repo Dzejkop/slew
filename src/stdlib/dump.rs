@@ -131,7 +131,7 @@ pub(super) fn is_binary(bytes: &[u8]) -> bool {
 /// `string.dump(f[, strip])`. `strip` is accepted but ignored: slew does not
 /// store optional debug info that could be dropped without breaking
 /// `debug.getinfo`/`getupvalue` round-trips.
-pub(super) fn n_dump(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+pub(super) fn n_dump<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let Value::Closure(cid) = arg(args, 0) else {
         let got = arg(args, 0).type_name();
         if got == "function" {
@@ -153,7 +153,7 @@ pub(super) fn n_dump(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String
     Ok(vec![lua.new_string(&w.buf)])
 }
 
-fn write_proto(w: &mut Writer, lua: &Lua, p: &Proto) {
+fn write_proto<C>(w: &mut Writer, lua: &Lua<C>, p: &Proto) {
     w.bytes(p.source.as_bytes());
     w.bytes(p.name.as_bytes());
     w.u8(p.nparams);
@@ -219,7 +219,7 @@ fn write_proto(w: &mut Writer, lua: &Lua, p: &Proto) {
     }
 }
 
-fn write_const(w: &mut Writer, lua: &Lua, v: Value) {
+fn write_const<C>(w: &mut Writer, lua: &Lua<C>, v: Value) {
     match v {
         Value::Nil => w.u8(0),
         Value::Bool(false) => w.u8(1),
@@ -463,7 +463,11 @@ fn namewhat_from_index(i: u8) -> &'static str {
 /// Decodes a slew binary chunk and builds its closure. Errors are the
 /// `nil, message` text `load` reports (PUC-style: truncation, bad header,
 /// unknown opcode).
-pub(super) fn undump(lua: &mut Lua, bytes: &[u8], env: Option<Value>) -> Result<Value, String> {
+pub(super) fn undump<C>(
+    lua: &mut Lua<C>,
+    bytes: &[u8],
+    env: Option<Value>,
+) -> Result<Value, String> {
     let mut r = Reader::new(bytes);
     let header = r.take(HEADER.len())?;
     if header != HEADER {
@@ -485,7 +489,7 @@ pub(super) fn undump(lua: &mut Lua, bytes: &[u8], env: Option<Value>) -> Result<
     Ok(lua.make_function_from_proto(Rc::new(proto), env))
 }
 
-fn read_proto(r: &mut Reader, lua: &mut Lua) -> Result<Proto, String> {
+fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
     let source = String::from_utf8_lossy(r.bytes()?).into_owned();
     let name = String::from_utf8_lossy(r.bytes()?).into_owned();
     let nparams = r.u8()?;
@@ -579,7 +583,7 @@ fn read_proto(r: &mut Reader, lua: &mut Lua) -> Result<Proto, String> {
     })
 }
 
-fn read_const(r: &mut Reader, lua: &mut Lua) -> Result<Value, String> {
+fn read_const<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Value, String> {
     Ok(match r.u8()? {
         0 => Value::Nil,
         1 => Value::Bool(false),

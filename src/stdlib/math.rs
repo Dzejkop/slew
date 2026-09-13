@@ -10,11 +10,11 @@ use crate::vm::Lua;
 
 use super::{arg, set_field};
 
-pub fn install(lua: &mut Lua) {
+pub fn install<C>(lua: &mut Lua<C>) {
     let mt = lua.new_table();
     lua.set_global("math", mt);
     for (name, f) in [
-        ("floor", n_floor as crate::vm::NativeFn),
+        ("floor", n_floor as crate::vm::NativeFn<C>),
         ("ceil", n_ceil),
         ("abs", n_abs),
         ("sqrt", n_sqrt),
@@ -84,21 +84,21 @@ fn to_int_result(f: f64) -> Value {
     }
 }
 
-fn n_floor(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_floor<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         v @ Value::Int(_) => v,
         _ => to_int_result(num(args, 0, "floor")?.floor()),
     }])
 }
 
-fn n_ceil(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_ceil<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         v @ Value::Int(_) => v,
         _ => to_int_result(num(args, 0, "ceil")?.ceil()),
     }])
 }
 
-fn n_abs(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_abs<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         Value::Int(i) => Value::Int(i.wrapping_abs()),
         _ => Value::Float(num(args, 0, "abs")?.abs()),
@@ -107,7 +107,7 @@ fn n_abs(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 
 macro_rules! float_fn {
     ($name:ident, $who:literal, $method:ident) => {
-        fn $name(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+        fn $name<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(vec![Value::Float(num(args, 0, $who)?.$method())])
         }
     };
@@ -121,7 +121,7 @@ float_fn!(n_asin, "asin", asin);
 float_fn!(n_acos, "acos", acos);
 float_fn!(n_exp, "exp", exp);
 
-fn n_atan(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_atan<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let y = num(args, 0, "atan")?;
     let x = match arg(args, 1) {
         Value::Nil => 1.0,
@@ -131,7 +131,7 @@ fn n_atan(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// `math.deg`: radians → degrees (`x / (pi/180)`).
-fn n_deg(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_deg<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
     Ok(vec![Value::Float(
         num(args, 0, "deg")? / RADIANS_PER_DEGREE,
@@ -139,7 +139,7 @@ fn n_deg(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// `math.rad`: degrees → radians (`x * (pi/180)`).
-fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_rad<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
     Ok(vec![Value::Float(
         num(args, 0, "rad")? * RADIANS_PER_DEGREE,
@@ -149,7 +149,7 @@ fn n_rad(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
 // `log2`/`log10` are selected only for the exact bases 2.0 and 10.0; an
 // epsilon comparison would change behavior for other bases.
 #[allow(clippy::float_cmp)]
-fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_log<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "log")?;
     Ok(vec![Value::Float(if arg(args, 1) == Value::Nil {
         x.ln()
@@ -165,7 +165,7 @@ fn n_log(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     })])
 }
 
-fn n_fmod(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_fmod<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     if let (Value::Int(a), Value::Int(b)) = (arg(args, 0), arg(args, 1)) {
         if b == 0 {
             return Err("bad argument #2 to 'fmod' (zero)".into());
@@ -178,7 +178,7 @@ fn n_fmod(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_modf(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_modf<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let x = num(args, 0, "modf")?;
     let ip = x.trunc();
     Ok(vec![
@@ -187,7 +187,7 @@ fn n_modf(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     ])
 }
 
-fn n_tointeger(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_tointeger<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         v @ Value::Int(_) => v,
         Value::Float(f) => float_to_exact_int(f).map_or(Value::Nil, Value::Int),
@@ -202,7 +202,7 @@ fn n_tointeger(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }])
 }
 
-fn n_type(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_type<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     Ok(vec![match arg(args, 0) {
         Value::Int(_) => lua.new_string(b"integer"),
         Value::Float(_) => lua.new_string(b"float"),
@@ -236,15 +236,15 @@ fn to_f(v: Value) -> f64 {
     }
 }
 
-fn n_max(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_max<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     minmax(args, "math.max", true)
 }
 
-fn n_min(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_min<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     minmax(args, "math.min", false)
 }
 
-fn n_ult(_: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_ult<C>(_: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let a = int(args, 0, "ult")? as u64;
     let b = int(args, 1, "ult")? as u64;
     Ok(vec![Value::Bool(a < b)])
@@ -259,7 +259,7 @@ fn i2d(x: u64) -> f64 {
 
 /// PUC's `project`: uniform projection of `ran` into `[0, n]`, drawing more
 /// values from `lua` when the first lands outside.
-fn project(lua: &mut Lua, mut ran: u64, n: u64) -> u64 {
+fn project<C>(lua: &mut Lua<C>, mut ran: u64, n: u64) -> u64 {
     if n & n.wrapping_add(1) == 0 {
         return ran & n; // n + 1 is a power of two
     }
@@ -279,7 +279,7 @@ fn project(lua: &mut Lua, mut ran: u64, n: u64) -> u64 {
     }
 }
 
-fn n_random(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_random<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     // PUC draws the value before validating arguments, so failed calls still
     // advance the generator.
     let rv = lua.next_random();
@@ -313,7 +313,7 @@ fn n_random(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
     }
 }
 
-fn n_randomseed(lua: &mut Lua, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_randomseed<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     // `math.randomseed()` with no argument uses a time/address-derived seed in
     // PUC. slew has no ambient time authority, so it reuses its fixed default;
     // either way the returned pair fully reproduces the state.

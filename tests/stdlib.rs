@@ -13,6 +13,7 @@ fn run(lua: &mut Lua, src: &str) -> Vec<Value> {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(vals)) => return vals,
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => panic!("{e}\nsource:\n{src}"),
         }
     }
@@ -42,6 +43,7 @@ fn run_err(src: &str) -> String {
         match exec.step(&mut lua, 1_000_000) {
             Ok(Step::Done(_)) => panic!("expected error: {src}"),
             Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("unexpected native wait"),
             Err(e) => return e.to_string(),
         }
     }
@@ -788,6 +790,7 @@ fn gsub_with_function_suspends() {
                 pendings += 1;
                 assert!(pendings < 100_000, "runaway");
             }
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
     assert!(pendings > 5, "expected several suspensions, got {pendings}");
@@ -812,6 +815,7 @@ fn sort_comparator_suspends() {
                 break;
             }
             Step::Pending => {}
+            Step::Waiting(_) => panic!("unexpected native wait"),
         }
     }
 }
