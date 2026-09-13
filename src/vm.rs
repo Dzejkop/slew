@@ -2436,6 +2436,7 @@ impl<C> Lua<C> {
         Ok(())
     }
 
+    #[expect(clippy::needless_return)]
     fn exec_one(
         &mut self,
         tid: ThreadId,
@@ -2688,366 +2689,668 @@ impl<C> Lua<C> {
             (i, f.base)
         };
         match instr {
-            Instr::LoadK { dst, k } => {
-                th.stack[base + dst as usize] = kval(th, k);
-            }
-            Instr::LoadNil { dst, n } => {
-                for i in 0..n as usize {
-                    th.stack[base + dst as usize + i] = Value::Nil;
-                }
-            }
-            Instr::LoadBool { dst, b } => {
-                th.stack[base + dst as usize] = Value::Bool(b);
-            }
-            Instr::Move { dst, src } => {
-                th.stack[base + dst as usize] = th.stack[base + src as usize];
-            }
-            Instr::GetUpval { dst, up } => {
-                let id = self.frame_upval(th, up);
-                th.stack[base + dst as usize] = self.read_upval(tid, th, id);
-            }
-            Instr::SetUpval { up, src } => {
-                let id = self.frame_upval(th, up);
-                let v = th.stack[base + src as usize];
-                self.write_upval(tid, th, id, v);
-            }
+            Instr::LoadK { dst, k } => return self.exec_load_k(th, base, dst, k),
+            Instr::LoadNil { dst, n } => return self.exec_load_nil(th, base, dst, n),
+            Instr::LoadBool { dst, b } => return self.exec_load_bool(th, base, dst, b),
+            Instr::Move { dst, src } => return self.exec_move(th, base, dst, src),
+            Instr::GetUpval { dst, up } => return self.exec_get_upval(th, tid, base, dst, up),
+            Instr::SetUpval { up, src } => return self.exec_set_upval(th, tid, base, up, src),
             Instr::GetIndex { dst, obj, key } => {
-                let o = th.stack[base + obj as usize];
-                let k = th.stack[base + key as usize];
-                if let Some(v) = self.index_chain(th, fuel, o, k, base + dst as usize)? {
-                    th.stack[base + dst as usize] = v;
-                }
+                return self.exec_get_index(th, fuel, base, dst, obj, key);
             }
             Instr::GetField { dst, obj, k } => {
-                let o = th.stack[base + obj as usize];
-                let key = kval(th, k);
-                if let Some(v) = self.index_chain(th, fuel, o, key, base + dst as usize)? {
-                    th.stack[base + dst as usize] = v;
-                }
+                return self.exec_get_field(th, fuel, base, dst, obj, k);
             }
             Instr::SetIndex { obj, key, src } => {
-                let o = th.stack[base + obj as usize];
-                let k = th.stack[base + key as usize];
-                let v = th.stack[base + src as usize];
-                self.newindex_chain(th, fuel, o, k, v)?;
+                return self.exec_set_index(th, fuel, base, obj, key, src);
             }
             Instr::SetField { obj, k, src } => {
-                let o = th.stack[base + obj as usize];
-                let key = kval(th, k);
-                let v = th.stack[base + src as usize];
-                self.newindex_chain(th, fuel, o, key, v)?;
+                return self.exec_set_field(th, fuel, base, obj, k, src);
             }
-            Instr::NewTable { dst } => {
-                *fuel -= 2;
-                th.stack[base + dst as usize] = self.new_table();
-                self.maybe_gc(tid, th)?;
-            }
+            Instr::NewTable { dst } => return self.exec_new_table(th, fuel, tid, base, dst),
             Instr::SetList {
                 obj,
                 base: b,
                 n,
                 start,
-            } => {
-                let Value::Table(t) = th.stack[base + obj as usize] else {
-                    unreachable!("SetList on non-table")
-                };
-                let first = base + b as usize;
-                let count = if n == 0 {
-                    th.top.saturating_sub(first)
-                } else {
-                    n as usize
-                };
-                *fuel -= count as i64;
-                for i in 0..count {
-                    let v = th.stack[first + i];
-                    self.tables[t.0 as usize]
-                        .set(Value::Int(start as i64 + i as i64), v)
-                        .map_err(|m| Self::rt_err(th, m.to_string()))?;
-                }
-            }
+            } => return self.exec_set_list(th, fuel, base, obj, b, n, start),
             Instr::Arith { op, dst, lhs, rhs } => {
-                let a = th.stack[base + lhs as usize];
-                let b = th.stack[base + rhs as usize];
-                match arith(&self.strings, op, a, b) {
-                    Ok(v) => th.stack[base + dst as usize] = v,
-                    Err(msg) => {
-                        let mm = self.binary_mm(a, b, mm_of_arith(op));
-                        if mm == Value::Nil {
-                            let msg = if msg == "number has no integer representation"
-                                && matches!(
-                                    op,
-                                    ArithOp::BAnd
-                                        | ArithOp::BOr
-                                        | ArithOp::BXor
-                                        | ArithOp::Shl
-                                        | ArithOp::Shr
-                                ) {
-                                // PUC-style varinfo: name the offending operand
-                                // when it was loaded from a constant field.
-                                let reg = if matches!(a, Value::Float(_)) {
-                                    Some(lhs)
-                                } else if matches!(b, Value::Float(_)) {
-                                    Some(rhs)
-                                } else {
-                                    None
-                                };
-                                let f = th.frames.last().unwrap().as_lua();
-                                match reg.and_then(|r| {
-                                    name_for_register(
-                                        &self.strings,
-                                        &f.proto,
-                                        f.pc.wrapping_sub(1),
-                                        r,
-                                    )
-                                }) {
-                                    Some(v) => {
-                                        format!("number ({v}) has no integer representation")
-                                    }
-                                    None => msg,
-                                }
-                            } else {
-                                msg
-                            };
-                            return Err(Self::rt_err(th, msg));
-                        }
-                        self.call_value(
-                            th,
-                            mm,
-                            &[a, b],
-                            base + dst as usize,
-                            2,
-                            RetShape::Normal,
-                            fuel,
-                        )?;
-                    }
-                }
+                return self.exec_arith(th, fuel, base, op, dst, lhs, rhs);
             }
             Instr::Unary { op, dst, src } => {
-                let v = th.stack[base + src as usize];
-                self.unary(th, fuel, op, v, base + dst as usize)?;
+                return self.exec_unary(th, fuel, base, op, dst, src);
             }
             Instr::Cmp { op, dst, lhs, rhs } => {
-                let a = th.stack[base + lhs as usize];
-                let b = th.stack[base + rhs as usize];
-                self.compare(th, fuel, op, a, b, base + dst as usize)?;
+                return self.exec_cmp(th, fuel, base, op, dst, lhs, rhs);
             }
             Instr::Concat { dst, base: b, n } => {
-                self.concat_run(th, fuel, dst, b, n)?;
-                self.maybe_gc(tid, th)?;
+                return self.exec_concat(th, fuel, tid, dst, b, n);
             }
-            Instr::Jump { off } => {
-                jump(th, off);
-            }
+            Instr::Jump { off } => return self.exec_jump(th, off),
             Instr::Test { src, if_true, off } => {
-                if th.stack[base + src as usize].truthy() == if_true {
-                    jump(th, off);
-                }
+                return self.exec_test(th, base, src, if_true, off);
             }
             Instr::Call {
                 base: b,
                 nargs,
                 nres,
             } => {
-                let func_abs = base + b as usize;
-                let argc = if nargs == 0 {
-                    th.top.saturating_sub(func_abs + 1)
-                } else {
-                    (nargs - 1) as usize
-                };
-                self.do_call(
-                    th,
-                    fuel,
-                    &CallSpec {
-                        func_abs,
-                        argc,
-                        ret_to: func_abs,
-                        nres,
-                        shape: RetShape::Normal,
-                        protected: false,
-                        handler: None,
-                        native_caller: false,
-                    },
-                )?;
+                return self.exec_call(th, fuel, base, b, nargs, nres);
             }
             Instr::TailCall { base: b, nargs } => {
-                let fb = th.frames.last().unwrap().as_lua().base;
-                let func_abs = fb + b as usize;
-                let argc = if nargs == 0 {
-                    th.top.saturating_sub(func_abs + 1)
-                } else {
-                    (nargs - 1) as usize
-                };
-                let (callee, func_abs, argc) = self.resolve_callable(th, func_abs, argc)?;
-                match callee {
-                    Value::Closure(cid) => {
-                        self.tail_replace_frame(th, cid, func_abs, argc)?;
-                    }
-                    Value::Native(nid) => {
-                        // Natives do not own a Lua frame, so there is nothing
-                        // to reuse: run the call with an open result window,
-                        // then finish the frame's return via a continuation
-                        // (the callee may itself push frames, e.g. pcall).
-                        let ret_slot = fb + b as usize;
-                        th.frames
-                            .last_mut()
-                            .unwrap()
-                            .pending_mut()
-                            .push(Pending::TailReturn { start: ret_slot });
-                        self.call_native(
-                            th,
-                            fuel,
-                            nid,
-                            func_abs,
-                            argc,
-                            ret_slot,
-                            0,
-                            RetShape::Normal,
-                            false,
-                        )?;
-                    }
-                    _ => unreachable!("resolve_callable returns a callable"),
-                }
+                return self.exec_tail_call(th, fuel, b, nargs);
             }
-            Instr::Return { base: b, n } => {
-                if !th.frames.last().unwrap().as_lua().tbc.is_empty() {
-                    // run __close handlers before completing the return;
-                    // snapshot the value window now (closes may clobber top)
-                    let fb = th.frames.last().unwrap().as_lua().base;
-                    let start = fb + b as usize;
-                    let count = if n == 0 {
-                        th.top.saturating_sub(start)
-                    } else {
-                        (n - 1) as usize
-                    };
-                    let f = th.frames.last_mut().unwrap().as_lua_mut();
-                    f.pending.push(Pending::FinishReturn { start, count });
-                    // Fire the return hook after every __close handler has run
-                    // (PUC's order): the hook may even be *set* by one of them.
-                    f.pending.push(Pending::ReturnHookFire);
-                    f.pending.push(Pending::CloseTbc {
-                        from: 0,
-                        err: Value::Nil,
-                    });
-                    return Ok(Flow::Continue);
-                }
-                let frame_base = th.frames.last().unwrap().as_lua().base;
-                let start = frame_base + b as usize;
-                let count = if n == 0 {
-                    th.top.saturating_sub(start)
-                } else {
-                    (n - 1) as usize
-                };
-                if Self::hook_on(th, HOOK_RETURN) {
-                    let f = th.frames.last_mut().unwrap().as_lua_mut();
-                    f.pending.push(Pending::FinishReturn { start, count });
-                    self.fire_hook(th, fuel, "return", -1)?;
-                    return Ok(Flow::Continue);
-                }
-                let frame = th.frames.pop().unwrap();
-                let frame = frame.as_lua();
-                self.close_upvals(th, frame.base);
-                if th.frames.is_empty() {
-                    let vals = th.stack[start..start + count].to_vec();
-                    th.stack.clear();
-                    th.top = 0;
-                    return Ok(Flow::Finished(vals));
-                }
-                deliver_return(th, frame, start, count);
-            }
-            Instr::Vararg { dst, n } => {
-                let varargs =
-                    std::mem::take(&mut th.frames.last_mut().unwrap().as_lua_mut().varargs);
-                let first = base + dst as usize;
-                if n == 0 {
-                    ensure_len(&mut th.stack, first + varargs.len());
-                    th.stack[first..first + varargs.len()].copy_from_slice(&varargs);
-                    th.top = first + varargs.len();
-                } else {
-                    let want = (n - 1) as usize;
-                    ensure_len(&mut th.stack, first + want);
-                    for i in 0..want {
-                        th.stack[first + i] = varargs.get(i).copied().unwrap_or(Value::Nil);
-                    }
-                }
-                th.frames.last_mut().unwrap().as_lua_mut().varargs = varargs;
-            }
+            Instr::Return { base: b, n } => return self.exec_return(th, fuel, b, n),
+            Instr::Vararg { dst, n } => return self.exec_vararg(th, base, dst, n),
             Instr::Closure { dst, p } => {
-                *fuel -= 2;
-                let proto = th.frames.last().unwrap().as_lua().proto.protos[p as usize].clone();
-                let mut ups = Vec::with_capacity(proto.upvals.len());
-                for d in &proto.upvals {
-                    match *d {
-                        UpvalDesc::Local(r) => {
-                            let abs = base + r as usize;
-                            ups.push(self.find_or_create_open(tid, th, abs));
-                        }
-                        UpvalDesc::Upval(i) => {
-                            let cur = th.frames.last().unwrap().as_lua().closure;
-                            ups.push(self.closures[cur.0 as usize].upvals[i as usize]);
-                        }
-                    }
-                }
-                let cid = self.alloc_closure(LuaClosure { proto, upvals: ups });
-                th.stack[base + dst as usize] = Value::Closure(cid);
-                self.maybe_gc(tid, th)?;
+                return self.exec_closure(th, fuel, tid, base, dst, p);
             }
-            Instr::Close { from } => {
-                self.close_upvals(th, base + from as usize);
-                self.run_close_tbc(th, fuel, from, Value::Nil)?;
-            }
-            Instr::Tbc { reg, name } => {
-                let v = th.stack[base + reg as usize];
-                match v {
-                    Value::Nil | Value::Bool(false) => {}
-                    _ if self.metamethod(v, Mm::Close) != Value::Nil => {
-                        th.frames.last_mut().unwrap().as_lua_mut().tbc.push(reg);
-                    }
-                    _ => {
-                        let vname = match kval(th, name) {
-                            Value::Str(id) => self.strings.get_str_lossy(id).into_owned(),
-                            _ => "?".to_string(),
+            Instr::Close { from } => return self.exec_close(th, fuel, base, from),
+            Instr::Tbc { reg, name } => return self.exec_tbc(th, base, reg, name),
+            Instr::ForPrep { base: b, off } => return self.exec_for_prep(th, base, b, off),
+            Instr::ForLoop { base: b, off } => return self.exec_for_loop(th, base, b, off),
+            Instr::TForLoop { base: b, off } => return self.exec_t_for_loop(th, base, b, off),
+        }
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_load_k(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        dst: u8,
+        k: u16,
+    ) -> Result<Flow, VmError> {
+        th.stack[base + dst as usize] = kval(th, k);
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_load_nil(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        dst: u8,
+        n: u8,
+    ) -> Result<Flow, VmError> {
+        for i in 0..n as usize {
+            th.stack[base + dst as usize + i] = Value::Nil;
+        }
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_load_bool(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        dst: u8,
+        b: bool,
+    ) -> Result<Flow, VmError> {
+        th.stack[base + dst as usize] = Value::Bool(b);
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_move(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        dst: u8,
+        src: u8,
+    ) -> Result<Flow, VmError> {
+        th.stack[base + dst as usize] = th.stack[base + src as usize];
+        Ok(Flow::Continue)
+    }
+
+    fn exec_get_upval(
+        &mut self,
+        th: &mut Thread,
+        tid: ThreadId,
+        base: usize,
+        dst: u8,
+        up: u8,
+    ) -> Result<Flow, VmError> {
+        let id = self.frame_upval(th, up);
+        th.stack[base + dst as usize] = self.read_upval(tid, th, id);
+        Ok(Flow::Continue)
+    }
+
+    fn exec_set_upval(
+        &mut self,
+        th: &mut Thread,
+        tid: ThreadId,
+        base: usize,
+        up: u8,
+        src: u8,
+    ) -> Result<Flow, VmError> {
+        let id = self.frame_upval(th, up);
+        let v = th.stack[base + src as usize];
+        self.write_upval(tid, th, id, v);
+        Ok(Flow::Continue)
+    }
+
+    fn exec_get_index(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        dst: u8,
+        obj: u8,
+        key: u8,
+    ) -> Result<Flow, VmError> {
+        let o = th.stack[base + obj as usize];
+        let k = th.stack[base + key as usize];
+        if let Some(v) = self.index_chain(th, fuel, o, k, base + dst as usize)? {
+            th.stack[base + dst as usize] = v;
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_get_field(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        dst: u8,
+        obj: u8,
+        k: u16,
+    ) -> Result<Flow, VmError> {
+        let o = th.stack[base + obj as usize];
+        let key = kval(th, k);
+        if let Some(v) = self.index_chain(th, fuel, o, key, base + dst as usize)? {
+            th.stack[base + dst as usize] = v;
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_set_index(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        obj: u8,
+        key: u8,
+        src: u8,
+    ) -> Result<Flow, VmError> {
+        let o = th.stack[base + obj as usize];
+        let k = th.stack[base + key as usize];
+        let v = th.stack[base + src as usize];
+        self.newindex_chain(th, fuel, o, k, v)?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_set_field(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        obj: u8,
+        k: u16,
+        src: u8,
+    ) -> Result<Flow, VmError> {
+        let o = th.stack[base + obj as usize];
+        let key = kval(th, k);
+        let v = th.stack[base + src as usize];
+        self.newindex_chain(th, fuel, o, key, v)?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_new_table(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        tid: ThreadId,
+        base: usize,
+        dst: u8,
+    ) -> Result<Flow, VmError> {
+        *fuel -= 2;
+        th.stack[base + dst as usize] = self.new_table();
+        self.maybe_gc(tid, th)?;
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn exec_set_list(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        obj: u8,
+        b: u8,
+        n: u8,
+        start: u32,
+    ) -> Result<Flow, VmError> {
+        let Value::Table(t) = th.stack[base + obj as usize] else {
+            unreachable!("SetList on non-table")
+        };
+        let first = base + b as usize;
+        let count = if n == 0 {
+            th.top.saturating_sub(first)
+        } else {
+            n as usize
+        };
+        *fuel -= count as i64;
+        for i in 0..count {
+            let v = th.stack[first + i];
+            self.tables[t.0 as usize]
+                .set(Value::Int(start as i64 + i as i64), v)
+                .map_err(|m| Self::rt_err(th, m.to_string()))?;
+        }
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn exec_arith(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        op: ArithOp,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    ) -> Result<Flow, VmError> {
+        let a = th.stack[base + lhs as usize];
+        let b = th.stack[base + rhs as usize];
+        match arith(&self.strings, op, a, b) {
+            Ok(v) => th.stack[base + dst as usize] = v,
+            Err(msg) => {
+                let mm = self.binary_mm(a, b, mm_of_arith(op));
+                if mm == Value::Nil {
+                    let msg = if msg == "number has no integer representation"
+                        && matches!(
+                            op,
+                            ArithOp::BAnd
+                                | ArithOp::BOr
+                                | ArithOp::BXor
+                                | ArithOp::Shl
+                                | ArithOp::Shr
+                        ) {
+                        // PUC-style varinfo: name the offending operand
+                        // when it was loaded from a constant field.
+                        let reg = if matches!(a, Value::Float(_)) {
+                            Some(lhs)
+                        } else if matches!(b, Value::Float(_)) {
+                            Some(rhs)
+                        } else {
+                            None
                         };
-                        return Err(Self::rt_err(
-                            th,
-                            format!("variable '{vname}' got a non-closable value"),
-                        ));
-                    }
+                        let f = th.frames.last().unwrap().as_lua();
+                        match reg.and_then(|r| {
+                            name_for_register(&self.strings, &f.proto, f.pc.wrapping_sub(1), r)
+                        }) {
+                            Some(v) => format!("number ({v}) has no integer representation"),
+                            None => msg,
+                        }
+                    } else {
+                        msg
+                    };
+                    return Err(Self::rt_err(th, msg));
+                }
+                self.call_value(
+                    th,
+                    mm,
+                    &[a, b],
+                    base + dst as usize,
+                    2,
+                    RetShape::Normal,
+                    fuel,
+                )?;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_unary(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        op: UnaryOp,
+        dst: u8,
+        src: u8,
+    ) -> Result<Flow, VmError> {
+        let v = th.stack[base + src as usize];
+        self.unary(th, fuel, op, v, base + dst as usize)?;
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn exec_cmp(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        op: CmpOp,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    ) -> Result<Flow, VmError> {
+        let a = th.stack[base + lhs as usize];
+        let b = th.stack[base + rhs as usize];
+        self.compare(th, fuel, op, a, b, base + dst as usize)?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_concat(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        tid: ThreadId,
+        dst: u8,
+        b: u8,
+        n: u8,
+    ) -> Result<Flow, VmError> {
+        self.concat_run(th, fuel, dst, b, n)?;
+        self.maybe_gc(tid, th)?;
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_jump(&mut self, th: &mut Thread, off: i32) -> Result<Flow, VmError> {
+        jump(th, off);
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_test(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        src: u8,
+        if_true: bool,
+        off: i32,
+    ) -> Result<Flow, VmError> {
+        if th.stack[base + src as usize].truthy() == if_true {
+            jump(th, off);
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_call(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        b: u8,
+        nargs: u8,
+        nres: u8,
+    ) -> Result<Flow, VmError> {
+        let func_abs = base + b as usize;
+        let argc = if nargs == 0 {
+            th.top.saturating_sub(func_abs + 1)
+        } else {
+            (nargs - 1) as usize
+        };
+        self.do_call(
+            th,
+            fuel,
+            &CallSpec {
+                func_abs,
+                argc,
+                ret_to: func_abs,
+                nres,
+                shape: RetShape::Normal,
+                protected: false,
+                handler: None,
+                native_caller: false,
+            },
+        )?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_tail_call(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        b: u8,
+        nargs: u8,
+    ) -> Result<Flow, VmError> {
+        let fb = th.frames.last().unwrap().as_lua().base;
+        let func_abs = fb + b as usize;
+        let argc = if nargs == 0 {
+            th.top.saturating_sub(func_abs + 1)
+        } else {
+            (nargs - 1) as usize
+        };
+        let (callee, func_abs, argc) = self.resolve_callable(th, func_abs, argc)?;
+        match callee {
+            Value::Closure(cid) => {
+                self.tail_replace_frame(th, cid, func_abs, argc)?;
+            }
+            Value::Native(nid) => {
+                // Natives do not own a Lua frame, so there is nothing
+                // to reuse: run the call with an open result window,
+                // then finish the frame's return via a continuation
+                // (the callee may itself push frames, e.g. pcall).
+                let ret_slot = fb + b as usize;
+                th.frames
+                    .last_mut()
+                    .unwrap()
+                    .pending_mut()
+                    .push(Pending::TailReturn { start: ret_slot });
+                self.call_native(
+                    th,
+                    fuel,
+                    nid,
+                    func_abs,
+                    argc,
+                    ret_slot,
+                    0,
+                    RetShape::Normal,
+                    false,
+                )?;
+            }
+            _ => unreachable!("resolve_callable returns a callable"),
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_return(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        b: u8,
+        n: u8,
+    ) -> Result<Flow, VmError> {
+        if !th.frames.last().unwrap().as_lua().tbc.is_empty() {
+            // run __close handlers before completing the return;
+            // snapshot the value window now (closes may clobber top)
+            let fb = th.frames.last().unwrap().as_lua().base;
+            let start = fb + b as usize;
+            let count = if n == 0 {
+                th.top.saturating_sub(start)
+            } else {
+                (n - 1) as usize
+            };
+            let f = th.frames.last_mut().unwrap().as_lua_mut();
+            f.pending.push(Pending::FinishReturn { start, count });
+            // Fire the return hook after every __close handler has run
+            // (PUC's order): the hook may even be *set* by one of them.
+            f.pending.push(Pending::ReturnHookFire);
+            f.pending.push(Pending::CloseTbc {
+                from: 0,
+                err: Value::Nil,
+            });
+            return Ok(Flow::Continue);
+        }
+        let frame_base = th.frames.last().unwrap().as_lua().base;
+        let start = frame_base + b as usize;
+        let count = if n == 0 {
+            th.top.saturating_sub(start)
+        } else {
+            (n - 1) as usize
+        };
+        if Self::hook_on(th, HOOK_RETURN) {
+            let f = th.frames.last_mut().unwrap().as_lua_mut();
+            f.pending.push(Pending::FinishReturn { start, count });
+            self.fire_hook(th, fuel, "return", -1)?;
+            return Ok(Flow::Continue);
+        }
+        let frame = th.frames.pop().unwrap();
+        let frame = frame.as_lua();
+        self.close_upvals(th, frame.base);
+        if th.frames.is_empty() {
+            let vals = th.stack[start..start + count].to_vec();
+            th.stack.clear();
+            th.top = 0;
+            return Ok(Flow::Finished(vals));
+        }
+        deliver_return(th, frame, start, count);
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_vararg(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        dst: u8,
+        n: u8,
+    ) -> Result<Flow, VmError> {
+        let varargs = std::mem::take(&mut th.frames.last_mut().unwrap().as_lua_mut().varargs);
+        let first = base + dst as usize;
+        if n == 0 {
+            ensure_len(&mut th.stack, first + varargs.len());
+            th.stack[first..first + varargs.len()].copy_from_slice(&varargs);
+            th.top = first + varargs.len();
+        } else {
+            let want = (n - 1) as usize;
+            ensure_len(&mut th.stack, first + want);
+            for i in 0..want {
+                th.stack[first + i] = varargs.get(i).copied().unwrap_or(Value::Nil);
+            }
+        }
+        th.frames.last_mut().unwrap().as_lua_mut().varargs = varargs;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_closure(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        tid: ThreadId,
+        base: usize,
+        dst: u8,
+        p: u16,
+    ) -> Result<Flow, VmError> {
+        *fuel -= 2;
+        let proto = th.frames.last().unwrap().as_lua().proto.protos[p as usize].clone();
+        let mut ups = Vec::with_capacity(proto.upvals.len());
+        for d in &proto.upvals {
+            match *d {
+                UpvalDesc::Local(r) => {
+                    let abs = base + r as usize;
+                    ups.push(self.find_or_create_open(tid, th, abs));
+                }
+                UpvalDesc::Upval(i) => {
+                    let cur = th.frames.last().unwrap().as_lua().closure;
+                    ups.push(self.closures[cur.0 as usize].upvals[i as usize]);
                 }
             }
-            Instr::ForPrep { base: b, off } => {
-                self.for_prep(th, base + b as usize, off)?;
+        }
+        let cid = self.alloc_closure(LuaClosure { proto, upvals: ups });
+        th.stack[base + dst as usize] = Value::Closure(cid);
+        self.maybe_gc(tid, th)?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_close(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        base: usize,
+        from: u8,
+    ) -> Result<Flow, VmError> {
+        self.close_upvals(th, base + from as usize);
+        self.run_close_tbc(th, fuel, from, Value::Nil)?;
+        Ok(Flow::Continue)
+    }
+
+    fn exec_tbc(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        reg: u8,
+        name: u16,
+    ) -> Result<Flow, VmError> {
+        let v = th.stack[base + reg as usize];
+        match v {
+            Value::Nil | Value::Bool(false) => {}
+            _ if self.metamethod(v, Mm::Close) != Value::Nil => {
+                th.frames.last_mut().unwrap().as_lua_mut().tbc.push(reg);
             }
-            Instr::ForLoop { base: b, off } => {
-                let a = base + b as usize;
-                match (th.stack[a], th.stack[a + 1], th.stack[a + 2]) {
-                    (Value::Int(i), Value::Int(l), Value::Int(s)) => {
-                        if let Some(ni) = i.checked_add(s)
-                            && ((s > 0 && ni <= l) || (s < 0 && ni >= l))
-                        {
-                            th.stack[a] = Value::Int(ni);
-                            th.stack[a + 3] = Value::Int(ni);
-                            jump(th, off);
-                        }
-                    }
-                    (Value::Float(i), Value::Float(l), Value::Float(s)) => {
-                        let ni = i + s;
-                        if (s > 0.0 && ni <= l) || (s < 0.0 && ni >= l) {
-                            th.stack[a] = Value::Float(ni);
-                            th.stack[a + 3] = Value::Float(ni);
-                            jump(th, off);
-                        }
-                    }
-                    _ => unreachable!("ForLoop after ForPrep normalization"),
-                }
+            _ => {
+                let vname = match kval(th, name) {
+                    Value::Str(id) => self.strings.get_str_lossy(id).into_owned(),
+                    _ => "?".to_string(),
+                };
+                return Err(Self::rt_err(
+                    th,
+                    format!("variable '{vname}' got a non-closable value"),
+                ));
             }
-            Instr::TForLoop { base: b, off } => {
-                let a = base + b as usize;
-                let v = th.stack[a + 4];
-                if v != Value::Nil {
-                    th.stack[a + 2] = v;
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn exec_for_prep(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        b: u8,
+        off: i32,
+    ) -> Result<Flow, VmError> {
+        self.for_prep(th, base + b as usize, off)?;
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_for_loop(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        b: u8,
+        off: i32,
+    ) -> Result<Flow, VmError> {
+        let a = base + b as usize;
+        match (th.stack[a], th.stack[a + 1], th.stack[a + 2]) {
+            (Value::Int(i), Value::Int(l), Value::Int(s)) => {
+                if let Some(ni) = i.checked_add(s)
+                    && ((s > 0 && ni <= l) || (s < 0 && ni >= l))
+                {
+                    th.stack[a] = Value::Int(ni);
+                    th.stack[a + 3] = Value::Int(ni);
                     jump(th, off);
                 }
             }
+            (Value::Float(i), Value::Float(l), Value::Float(s)) => {
+                let ni = i + s;
+                if (s > 0.0 && ni <= l) || (s < 0.0 && ni >= l) {
+                    th.stack[a] = Value::Float(ni);
+                    th.stack[a + 3] = Value::Float(ni);
+                    jump(th, off);
+                }
+            }
+            _ => unreachable!("ForLoop after ForPrep normalization"),
+        }
+        Ok(Flow::Continue)
+    }
+
+    #[expect(clippy::unused_self)]
+    fn exec_t_for_loop(
+        &mut self,
+        th: &mut Thread,
+        base: usize,
+        b: u8,
+        off: i32,
+    ) -> Result<Flow, VmError> {
+        let a = base + b as usize;
+        let v = th.stack[a + 4];
+        if v != Value::Nil {
+            th.stack[a + 2] = v;
+            jump(th, off);
         }
         Ok(Flow::Continue)
     }
