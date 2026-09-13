@@ -247,6 +247,31 @@ enum RetShape {
     PrependFalse,
 }
 
+/// Immutable call shape shared by the intrinsic dispatch arms. Reading
+/// arguments through it keeps the dispatcher itself a flat jump table.
+#[derive(Clone, Copy)]
+struct IntrinsicCall {
+    func_abs: usize,
+    argc: usize,
+    ret_to: usize,
+    nres: u8,
+    shape: RetShape,
+    native_caller: bool,
+}
+
+impl IntrinsicCall {
+    /// The `i`-th argument, or `None` when absent (PUC distinguishes an
+    /// absent argument from an explicit `nil`).
+    fn arg_opt(self, th: &Thread, i: usize) -> Option<Value> {
+        (i < self.argc).then(|| th.stack[self.func_abs + 1 + i])
+    }
+
+    /// The `i`-th argument, or `nil` when absent.
+    fn arg(self, th: &Thread, i: usize) -> Value {
+        self.arg_opt(th, i).unwrap_or(Value::Nil)
+    }
+}
+
 /// A continuation the frame must run when it becomes the top of the stack
 /// again (after a metamethod call it triggered returns). Processed LIFO,
 /// one per dispatch step, before the next instruction fetch.
@@ -3335,708 +3360,876 @@ impl<C> Lua<C> {
                 th,
                 fuel,
                 i,
-                func_abs,
-                argc,
-                ret_to,
-                nres,
-                shape,
-                native_caller,
+                IntrinsicCall {
+                    func_abs,
+                    argc,
+                    ret_to,
+                    nres,
+                    shape,
+                    native_caller,
+                },
             ),
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn call_intrinsic(
         &mut self,
         th: &mut Thread,
         fuel: &mut i64,
         i: Intrinsic,
-        func_abs: usize,
-        argc: usize,
-        ret_to: usize,
-        nres: u8,
-        shape: RetShape,
-        native_caller: bool,
+        call: IntrinsicCall,
     ) -> Result<(), VmError> {
-        let arg_opt = |th: &Thread, i: usize| -> Option<Value> {
-            if i < argc {
-                Some(th.stack[func_abs + 1 + i])
-            } else {
-                None
-            }
-        };
-        let arg = |th: &Thread, i: usize| -> Value { arg_opt(th, i).unwrap_or(Value::Nil) };
         match i {
-            Intrinsic::Error => {
-                let v = arg(th, 0);
-                let level = match arg(th, 1) {
-                    Value::Int(l) => l,
-                    Value::Float(f) => f as i64,
-                    _ => 1,
+            Intrinsic::Error => self.intrinsic_error(th, call),
+            Intrinsic::Assert => self.intrinsic_assert(th, call),
+            Intrinsic::ToString => self.intrinsic_to_string(th, fuel, call),
+            Intrinsic::Format => self.intrinsic_format(th, call),
+            Intrinsic::Pcall => self.intrinsic_pcall(th, fuel, call),
+            Intrinsic::Xpcall => self.intrinsic_xpcall(th, fuel, call),
+            Intrinsic::Resume => self.intrinsic_resume(th, fuel, call),
+            Intrinsic::WrapResume(co) => self.intrinsic_wrap_resume(th, fuel, co, call),
+            Intrinsic::Yield => self.intrinsic_yield(th, fuel, call),
+            Intrinsic::EnterNonYieldable => self.intrinsic_enter_non_yieldable(th, call),
+            Intrinsic::LeaveNonYieldable => self.intrinsic_leave_non_yieldable(th, call),
+            Intrinsic::IsYieldable => self.intrinsic_is_yieldable(th, call),
+            Intrinsic::CollectGarbage => self.intrinsic_collect_garbage(th, call),
+            Intrinsic::Print => self.intrinsic_print(th, call),
+            Intrinsic::CoroutineClose => self.intrinsic_coroutine_close(th, fuel, call),
+            Intrinsic::Running => self.intrinsic_running(th, call),
+            Intrinsic::DebugGetinfo => self.intrinsic_debug_getinfo(th, call),
+            Intrinsic::DebugTraceback => self.intrinsic_debug_traceback(th, call),
+            Intrinsic::DebugGetupvalue => self.intrinsic_debug_getupvalue(th, call),
+            Intrinsic::DebugSetupvalue => self.intrinsic_debug_setupvalue(th, call),
+            Intrinsic::DebugUpvalueid => self.intrinsic_debug_upvalueid(th, call),
+            Intrinsic::DebugUpvaluejoin => self.intrinsic_debug_upvaluejoin(th, call),
+            Intrinsic::DebugGetmetatable => self.intrinsic_debug_getmetatable(th, call),
+            Intrinsic::DebugSetmetatable => self.intrinsic_debug_setmetatable(th, call),
+            Intrinsic::DebugGetregistry => self.intrinsic_debug_getregistry(th, call),
+            Intrinsic::DebugGethook => self.intrinsic_debug_gethook(th, call),
+            Intrinsic::DebugSethook => self.intrinsic_debug_sethook(th, fuel, call),
+        }
+    }
+
+    fn intrinsic_error(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
+        let v = call.arg(th, 0);
+        let level = match call.arg(th, 1) {
+            Value::Int(l) => l,
+            Value::Float(f) => f as i64,
+            _ => 1,
+        };
+        // level 1 names the caller of error(); when that caller is a
+        // native (pcall(error, ...)), there is no Lua position
+        let val = match v {
+            Value::Str(s) if level > 0 && !call.native_caller => {
+                let fidx = th.frames.len().saturating_sub(level as usize);
+                let (line, src) = match th.frames.get(fidx).and_then(|f| f.lua()) {
+                    Some(f) => (
+                        f.proto
+                            .lines
+                            .get(f.pc.wrapping_sub(1))
+                            .copied()
+                            .unwrap_or(0),
+                        f.proto.source.clone(),
+                    ),
+                    None => (
+                        line_of(th),
+                        th.frames
+                            .last()
+                            .and_then(|f| f.lua())
+                            .map(|f| f.proto.source.clone())
+                            .unwrap_or_default(),
+                    ),
                 };
-                // level 1 names the caller of error(); when that caller is a
-                // native (pcall(error, ...)), there is no Lua position
-                let val = match v {
-                    Value::Str(s) if level > 0 && !native_caller => {
-                        let fidx = th.frames.len().saturating_sub(level as usize);
-                        let (line, src) = match th.frames.get(fidx).and_then(|f| f.lua()) {
-                            Some(f) => (
-                                f.proto
-                                    .lines
-                                    .get(f.pc.wrapping_sub(1))
-                                    .copied()
-                                    .unwrap_or(0),
-                                f.proto.source.clone(),
-                            ),
-                            None => (
-                                line_of(th),
-                                th.frames
-                                    .last()
-                                    .and_then(|f| f.lua())
-                                    .map(|f| f.proto.source.clone())
-                                    .unwrap_or_default(),
-                            ),
-                        };
-                        let msg = format!("{src}:{line}: {}", self.strings.get_str_lossy(s));
-                        self.new_string(msg.as_bytes())
-                    }
-                    _ => v,
-                };
-                Err(VmError {
-                    val: ErrVal::Val(val),
+                let msg = format!("{src}:{line}: {}", self.strings.get_str_lossy(s));
+                self.new_string(msg.as_bytes())
+            }
+            _ => v,
+        };
+        Err(VmError {
+            val: ErrVal::Val(val),
+            line: line_of(th),
+            root_line: 0,
+            source: None,
+        })
+    }
+
+    #[expect(clippy::unused_self)]
+    fn intrinsic_assert(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
+        if call.argc == 0 {
+            return Err(Self::rt_err(
+                th,
+                "bad argument #1 to 'assert' (value expected)".into(),
+            ));
+        }
+        if call.arg(th, 0).truthy() {
+            let res = th.stack[call.func_abs + 1..call.func_abs + 1 + call.argc].to_vec();
+            place_shaped(th, call.ret_to, call.nres, call.shape, &res);
+            Ok(())
+        } else {
+            match call.arg(th, 1) {
+                Value::Nil => {
+                    let source = if call.native_caller {
+                        None
+                    } else {
+                        th.frames
+                            .last()
+                            .and_then(|f| f.lua())
+                            .map(|f| f.proto.source.clone())
+                    };
+                    Err(VmError {
+                        val: ErrVal::Msg("assertion failed!".into()),
+                        line: line_of(th),
+                        root_line: 0,
+                        source,
+                    })
+                }
+                v => Err(VmError {
+                    val: ErrVal::Val(v),
                     line: line_of(th),
                     root_line: 0,
                     source: None,
-                })
-            }
-            Intrinsic::Assert => {
-                if argc == 0 {
-                    return Err(Self::rt_err(
-                        th,
-                        "bad argument #1 to 'assert' (value expected)".into(),
-                    ));
-                }
-                if arg(th, 0).truthy() {
-                    let res = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
-                    place_shaped(th, ret_to, nres, shape, &res);
-                    Ok(())
-                } else {
-                    match arg(th, 1) {
-                        Value::Nil => {
-                            let source = if native_caller {
-                                None
-                            } else {
-                                th.frames
-                                    .last()
-                                    .and_then(|f| f.lua())
-                                    .map(|f| f.proto.source.clone())
-                            };
-                            Err(VmError {
-                                val: ErrVal::Msg("assertion failed!".into()),
-                                line: line_of(th),
-                                root_line: 0,
-                                source,
-                            })
-                        }
-                        v => Err(VmError {
-                            val: ErrVal::Val(v),
-                            line: line_of(th),
-                            root_line: 0,
-                            source: None,
-                        }),
-                    }
-                }
-            }
-            Intrinsic::ToString => {
-                let v = arg(th, 0);
-                let mm = self.metamethod(v, Mm::ToString);
-                if mm == Value::Nil {
-                    let s = self.tostring_default(v);
-                    let sv = self.new_string(s.as_bytes());
-                    place_shaped(th, ret_to, nres, shape, &[sv]);
-                    Ok(())
-                } else {
-                    // PUC's `luaL_tolstring` requires the metamethod result to
-                    // be a string (numbers are accepted by `lua_isstring` and
-                    // converted). Validate after it returns.
-                    let result_slot = scratch_base(th);
-                    ensure_len(&mut th.stack, result_slot + 1);
-                    th.frames
-                        .last_mut()
-                        .unwrap()
-                        .pending_mut()
-                        .push(Pending::FinishTostring {
-                            ret_to,
-                            nres,
-                            shape,
-                            result_slot,
-                        });
-                    self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel)
-                }
-            }
-            Intrinsic::Format => {
-                let nargs = argc;
-                let fmt = if nargs == 0 {
-                    return Err(Self::rt_err(
-                        th,
-                        "bad argument #1 to 'format' (string expected, got no value)".into(),
-                    ));
-                } else {
-                    match arg(th, 0) {
-                        Value::Str(id) => self.strings.get(id).to_vec(),
-                        v @ (Value::Int(_) | Value::Float(_)) => {
-                            crate::value::fmt_number(v).into_bytes()
-                        }
-                        other => {
-                            return Err(Self::rt_err(
-                                th,
-                                format!(
-                                    "bad argument #1 to 'format' (string expected, got {})",
-                                    other.type_name()
-                                ),
-                            ));
-                        }
-                    }
-                };
-                let args: Vec<Value> = (0..nargs).map(|i| arg(th, i)).collect();
-                self.format_job = Some(FormatJob {
-                    fmt,
-                    pos: 0,
-                    arg: 1,
-                    args,
-                    out: Vec::new(),
-                    ret_to,
-                    nres,
-                    shape,
-                    result_slot: 0,
-                    awaiting: false,
-                    saved: None,
-                });
-                th.frames
-                    .last_mut()
-                    .unwrap()
-                    .pending_mut()
-                    .push(Pending::FormatStep);
-                Ok(())
-            }
-            Intrinsic::Pcall => {
-                if argc == 0 {
-                    return Err(Self::rt_err(
-                        th,
-                        "bad argument #1 to 'pcall' (value expected)".into(),
-                    ));
-                }
-                if shape == RetShape::PrependTrue
-                    && let Some(f @ Frame::Boundary(_)) = th.frames.last_mut()
-                {
-                    f.pending_mut().push(Pending::PrependShape {
-                        ret_to,
-                        nres,
-                        shape,
-                    });
-                }
-                self.protected_call(
-                    th,
-                    fuel,
-                    func_abs + 1,
-                    argc - 1,
-                    ret_to,
-                    nres,
-                    None,
-                    true,
-                )
-            }
-            Intrinsic::Xpcall => {
-                if argc < 2 {
-                    return Err(Self::rt_err(
-                        th,
-                        "bad argument #2 to 'xpcall' (value expected)".into(),
-                    ));
-                }
-                let handler = arg(th, 1);
-                // rebuild a contiguous window: [f, args...] (handler sits
-                // between f and the args in the original window)
-                let f = arg(th, 0);
-                let wb = scratch_base(th).max(func_abs + 1 + argc);
-                let n_args = argc - 2;
-                ensure_len(&mut th.stack, wb + 1 + n_args);
-                th.stack[wb] = f;
-                th.stack
-                    .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
-                if shape == RetShape::PrependTrue
-                    && let Some(cf @ Frame::Boundary(_)) = th.frames.last_mut()
-                {
-                    cf.pending_mut().push(Pending::PrependShape {
-                        ret_to,
-                        nres,
-                        shape,
-                    });
-                }
-                self.protected_call(
-                    th,
-                    fuel,
-                    wb,
-                    n_args,
-                    ret_to,
-                    nres,
-                    Some(handler),
-                    true,
-                )
-            }
-            Intrinsic::Resume => {
-                let co = arg(th, 0);
-                let Value::Thread(co) = co else {
-                    return Err(Self::rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'resume' (coroutine expected, got {})",
-                            co.type_name()
-                        ),
-                    ));
-                };
-                let args: Vec<Value> = th.stack[func_abs + 2..func_abs + 1 + argc].to_vec();
-                self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, false)
-            }
-            Intrinsic::WrapResume(co) => {
-                let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
-                self.resume_thread(th, fuel, co, &args, ret_to, nres, shape, true)
-            }
-            Intrinsic::Yield => {
-                // Non-yieldable C boundary (e.g. inside a `table.sort`
-                // comparator or `string.gsub` replacement): PUC reports a
-                // cross-boundary yield, unless we are on the main thread, which
-                // reports "outside a coroutine" instead.
-                if th.non_yieldable > 0 && !th.is_main {
-                    return Err(Self::rt_err(
-                        th,
-                        "attempt to yield across a C-call boundary".into(),
-                    ));
-                }
-                let Some(parent) = th.parent else {
-                    return Err(Self::rt_err(
-                        th,
-                        "attempt to yield from outside a coroutine".into(),
-                    ));
-                };
-                *fuel -= 3;
-                let args: Vec<Value> = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
-                let rr = th.resume_ret.expect("resumed thread has resume_ret");
-                let yield_fn = th.stack[func_abs];
-                let want_call = self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL);
-                let want_ret = self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN);
-                let job = YieldJob {
-                    parent,
-                    rr,
-                    ret_to,
-                    nres,
-                    shape,
-                    args,
-                    func: yield_fn,
-                    stage: 0,
-                };
-                if want_call || want_ret {
-                    // `yield` is a C function: emit its call/return hook events
-                    // before the thread actually suspends. Each hook runs as a
-                    // frame, so the suspension is deferred through `YieldStep`.
-                    th.yield_job = Some(job);
-                    th.frames
-                        .last_mut()
-                        .unwrap()
-                        .pending_mut()
-                        .push(Pending::YieldStep);
-                    return Ok(());
-                }
-                self.perform_yield(th, &job);
-                Ok(())
-            }
-            Intrinsic::EnterNonYieldable => {
-                th.non_yieldable = th.non_yieldable.saturating_add(1);
-                place_shaped(th, ret_to, nres, shape, &[]);
-                Ok(())
-            }
-            Intrinsic::LeaveNonYieldable => {
-                th.non_yieldable = th.non_yieldable.saturating_sub(1);
-                place_shaped(th, ret_to, nres, shape, &[]);
-                Ok(())
-            }
-            Intrinsic::IsYieldable => {
-                // Optional `co` argument: true for any coroutine (even a dead
-                // or never-started one), false for the main thread or a thread
-                // currently inside a non-yieldable C boundary.
-                let r = match arg_opt(th, 0) {
-                    None => !th.is_main && th.non_yieldable == 0,
-                    // the running thread is taken out of the arena, so read
-                    // its flag from the live `th`, not the placeholder
-                    Some(Value::Thread(t)) if t == self.current_thread => {
-                        !th.is_main && th.non_yieldable == 0
-                    }
-                    Some(Value::Thread(t)) => {
-                        let other = &self.threads[t.0 as usize];
-                        !other.is_main && other.non_yieldable == 0
-                    }
-                    Some(v) => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #1 to 'isyieldable' (thread expected, got {})",
-                                v.type_name()
-                            ),
-                        ));
-                    }
-                };
-                place_shaped(th, ret_to, nres, shape, &[Value::Bool(r)]);
-                Ok(())
-            }
-            Intrinsic::CollectGarbage => {
-                // An intrinsic so the running thread (taken out of the arena
-                // during dispatch) can be passed as a GC root.
-                let r = self
-                    .gc_command(
-                        th,
-                        arg(th, 0),
-                        (argc > 1).then(|| arg(th, 1)),
-                        func_abs + 1 + argc,
-                    )
-                    .map_err(|m| Self::rt_err(th, m))?;
-                place_shaped(th, ret_to, nres, shape, &r);
-                Ok(())
-            }
-            Intrinsic::Print => {
-                let items: Vec<Value> = (0..argc).map(|i| arg(th, i)).collect();
-                self.print_job = Some(PrintJob {
-                    items,
-                    idx: 0,
-                    out: Vec::new(),
-                    ret_to,
-                    nres,
-                    shape,
-                    result_slot: 0,
-                    awaiting: false,
-                });
-                th.frames
-                    .last_mut()
-                    .unwrap()
-                    .pending_mut()
-                    .push(Pending::PrintStep);
-                Ok(())
-            }
-            Intrinsic::CoroutineClose => {
-                let co = arg_opt(th, 0);
-                let Value::Thread(co) = co.unwrap_or(Value::Nil) else {
-                    let got = match co {
-                        Some(v) => v.type_name().to_string(),
-                        None => "no value".to_string(),
-                    };
-                    return Err(Self::rt_err(
-                        th,
-                        format!(
-                            "bad argument #1 to 'coroutine.close' (thread expected, got {got})"
-                        ),
-                    ));
-                };
-                self.begin_close(th, fuel, co, ret_to, nres, shape)
-            }
-            Intrinsic::Running => {
-                let cur = Value::Thread(self.current_thread);
-                let is_main = Value::Bool(th.parent.is_none());
-                place_shaped(th, ret_to, nres, shape, &[cur, is_main]);
-                Ok(())
-            }
-            Intrinsic::DebugGetinfo => {
-                let a0 = arg_opt(th, 0);
-                let (target, base) = match a0 {
-                    Some(Value::Thread(t)) => (Some(t), 1usize),
-                    _ => (None, 0usize),
-                };
-                let f = arg_opt(th, base);
-                let what = arg(th, base + 1);
-                let r = self
-                    .debug_getinfo(th, target, f, what, base + 1)
-                    .map_err(|m| Self::rt_err(th, m))?;
-                place_shaped(th, ret_to, nres, shape, &[r]);
-                Ok(())
-            }
-            Intrinsic::DebugTraceback => {
-                let a0 = arg_opt(th, 0);
-                let (target, base) = match a0 {
-                    Some(Value::Thread(t)) => (Some(t), 1usize),
-                    _ => (None, 0usize),
-                };
-                let message = arg(th, base);
-                let level = arg_opt(th, base + 1);
-                let r = self
-                    .debug_traceback(th, target, message, level, base + 2)
-                    .map_err(|m| Self::rt_err(th, m))?;
-                place_shaped(th, ret_to, nres, shape, &[r]);
-                Ok(())
-            }
-            Intrinsic::DebugGetupvalue => {
-                // PUC checks the index (arg #2) before the function (arg #1).
-                let n = self
-                    .debug_check_int(arg_opt(th, 1), 2, "debug.getupvalue")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let f = arg(th, 0);
-                match f {
-                    Value::Closure(cid) => match self.debug_getupvalue(th, cid, n) {
-                        Some((name, val)) => {
-                            let nv = self.new_string(name.as_bytes());
-                            place_shaped(th, ret_to, nres, shape, &[nv, val]);
-                        }
-                        // Out of range: PUC returns no values.
-                        None => place_shaped(th, ret_to, nres, shape, &[]),
-                    },
-                    // A native is a C function: it is a valid function with no
-                    // upvalues, so `lua_getupvalue` returns NULL -> zero values.
-                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
-                    other => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
-                                other.type_name()
-                            ),
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            Intrinsic::DebugSetupvalue => {
-                // PUC checks the value (arg #3), then index (#2), then
-                // function (#1).
-                if arg_opt(th, 2).is_none() {
-                    return Err(Self::rt_err(
-                        th,
-                        "bad argument #3 to 'debug.setupvalue' (value expected)".into(),
-                    ));
-                }
-                let n = self
-                    .debug_check_int(arg_opt(th, 1), 2, "debug.setupvalue")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let v = arg(th, 2);
-                let f = arg(th, 0);
-                match f {
-                    Value::Closure(cid) => match self.debug_setupvalue(th, cid, n, v) {
-                        Some(name) => {
-                            let nv = self.new_string(name.as_bytes());
-                            place_shaped(th, ret_to, nres, shape, &[nv]);
-                        }
-                        None => place_shaped(th, ret_to, nres, shape, &[]),
-                    },
-                    // Native (C) functions have no upvalues: `lua_setupvalue`
-                    // returns NULL, and the API reports zero values.
-                    Value::Native(_) => place_shaped(th, ret_to, nres, shape, &[]),
-                    other => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
-                                other.type_name()
-                            ),
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            Intrinsic::DebugUpvalueid => {
-                let n = self
-                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvalueid")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let f = arg(th, 0);
-                let r = match f {
-                    Value::Closure(cid) => self.debug_upvalueid(cid, n),
-                    // `lua_upvalueid` returns NULL for a C function (no
-                    // upvalues); PUC pushes fail (nil) as a single value.
-                    Value::Native(_) => Value::Nil,
-                    other => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
-                                other.type_name()
-                            ),
-                        ));
-                    }
-                };
-                place_shaped(th, ret_to, nres, shape, &[r]);
-                Ok(())
-            }
-            Intrinsic::DebugUpvaluejoin => {
-                // PUC's `checkupval` validates each (function, index) pair in
-                // order: index (#2/#4) then function (#1/#3) then upvalue
-                // existence. A native has no upvalues, so it fails the index
-                // check; a non-function fails the type check.
-                let n1 = self
-                    .debug_check_int(arg_opt(th, 1), 2, "debug.upvaluejoin")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let c1 = self
-                    .debug_check_upval(arg(th, 0), n1, 1, 2, "debug.upvaluejoin")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let n2 = self
-                    .debug_check_int(arg_opt(th, 3), 4, "debug.upvaluejoin")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                let c2 = self
-                    .debug_check_upval(arg(th, 2), n2, 3, 4, "debug.upvaluejoin")
-                    .map_err(|m| Self::rt_err(th, m))?;
-                self.debug_upvaluejoin(c1, n1, c2, n2)
-                    .map_err(|m| Self::rt_err(th, m))?;
-                place_shaped(th, ret_to, nres, shape, &[]);
-                Ok(())
-            }
-            Intrinsic::DebugGetmetatable => {
-                let v = arg(th, 0);
-                let r = match self.get_metatable(v) {
-                    Some(mt) => Value::Table(mt),
-                    None => Value::Nil,
-                };
-                place_shaped(th, ret_to, nres, shape, &[r]);
-                Ok(())
-            }
-            Intrinsic::DebugSetmetatable => {
-                let v = arg(th, 0);
-                let mt = match arg(th, 1) {
-                    Value::Nil => None,
-                    Value::Table(t) => Some(t),
-                    other => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
-                                other.type_name()
-                            ),
-                        ));
-                    }
-                };
-                self.set_raw_metatable(v, mt);
-                place_shaped(th, ret_to, nres, shape, &[v]);
-                Ok(())
-            }
-            Intrinsic::DebugGetregistry => {
-                place_shaped(th, ret_to, nres, shape, &[Value::Table(self.globals)]);
-                Ok(())
-            }
-            Intrinsic::DebugGethook => {
-                let target = match arg_opt(th, 0) {
-                    None | Some(Value::Nil) => None,
-                    Some(Value::Thread(t)) => Some(t),
-                    Some(v) => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #1 to 'gethook' (thread expected, got {})",
-                                v.type_name()
-                            ),
-                        ));
-                    }
-                };
-                let (hook, mask, count) = match target {
-                    Some(t) if t != self.current_thread => {
-                        let o = &self.threads[t.0 as usize];
-                        (o.hook.unwrap_or(Value::Nil), o.hook_mask, o.hook_count)
-                    }
-                    _ => (th.hook.unwrap_or(Value::Nil), th.hook_mask, th.hook_count),
-                };
-                // PUC returns a single `nil` (fail) when no hook is set,
-                // otherwise the hook, its mask string, and the count.
-                if hook == Value::Nil {
-                    place_shaped(th, ret_to, nres, shape, &[Value::Nil]);
-                    return Ok(());
-                }
-                let mut s = String::new();
-                if mask & HOOK_CALL != 0 {
-                    s.push('c');
-                }
-                if mask & HOOK_RETURN != 0 {
-                    s.push('r');
-                }
-                if mask & HOOK_LINE != 0 {
-                    s.push('l');
-                }
-                let sv = self.new_string(s.as_bytes());
-                place_shaped(th, ret_to, nres, shape, &[hook, sv, Value::Int(count)]);
-                Ok(())
-            }
-            Intrinsic::DebugSethook => {
-                // `debug.sethook([thread,] hook, mask [, count])`
-                let (target, base_index) = match arg_opt(th, 0) {
-                    Some(Value::Thread(t)) => (Some(t), 1usize),
-                    _ => (None, 0usize),
-                };
-                let hook_opt = match arg(th, base_index) {
-                    Value::Nil => None,
-                    v @ (Value::Closure(_) | Value::Native(_)) => Some(v),
-                    other => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #{} to 'sethook' (function expected, got {})",
-                                base_index + 1,
-                                other.type_name()
-                            ),
-                        ));
-                    }
-                };
-                let mut bits = 0u8;
-                match arg_opt(th, base_index + 1) {
-                    None | Some(Value::Nil) => {}
-                    Some(Value::Str(sid)) => {
-                        for &c in self.strings.get(sid) {
-                            match c {
-                                b'c' => bits |= HOOK_CALL,
-                                b'r' => bits |= HOOK_RETURN,
-                                b'l' => bits |= HOOK_LINE,
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some(v) => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #{} to 'sethook' (string expected, got {})",
-                                base_index + 2,
-                                v.type_name()
-                            ),
-                        ));
-                    }
-                }
-                let count = match arg_opt(th, base_index + 2) {
-                    None | Some(Value::Nil) => 0,
-                    Some(Value::Int(n)) => n,
-                    Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
-                    Some(v) => {
-                        return Err(Self::rt_err(
-                            th,
-                            format!(
-                                "bad argument #{} to 'sethook' (number expected, got {})",
-                                base_index + 3,
-                                v.type_name()
-                            ),
-                        ));
-                    }
-                };
-                let apply = |t: &mut Thread| {
-                    t.hook = hook_opt;
-                    t.hook_mask = bits;
-                    t.hook_count = count.max(0);
-                    t.hook_counter = count.max(0);
-                };
-                match target {
-                    Some(t) if t != self.current_thread => {
-                        apply(&mut self.threads[t.0 as usize]);
-                    }
-                    _ => apply(th),
-                }
-                // `debug.sethook` is itself a C function: if a return hook is
-                // now active on this thread, its return fires the hook (and the
-                // hook it just set observes it). A clearing call has already
-                // removed the hook, so nothing fires.
-                place_shaped(th, ret_to, nres, shape, &[]);
-                if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                    self.fire_hook(th, fuel, "return", -1)?;
-                }
-                Ok(())
+                }),
             }
         }
+    }
+
+    fn intrinsic_to_string(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let v = call.arg(th, 0);
+        let mm = self.metamethod(v, Mm::ToString);
+        if mm == Value::Nil {
+            let s = self.tostring_default(v);
+            let sv = self.new_string(s.as_bytes());
+            place_shaped(th, call.ret_to, call.nres, call.shape, &[sv]);
+            Ok(())
+        } else {
+            // PUC's `luaL_tolstring` requires the metamethod result to
+            // be a string (numbers are accepted by `lua_isstring` and
+            // converted). Validate after it returns.
+            let result_slot = scratch_base(th);
+            ensure_len(&mut th.stack, result_slot + 1);
+            th.frames
+                .last_mut()
+                .unwrap()
+                .pending_mut()
+                .push(Pending::FinishTostring {
+                    ret_to: call.ret_to,
+                    nres: call.nres,
+                    shape: call.shape,
+                    result_slot,
+                });
+            self.call_value(th, mm, &[v], result_slot, 2, RetShape::Normal, fuel)
+        }
+    }
+
+    fn intrinsic_format(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
+        let nargs = call.argc;
+        let fmt = if nargs == 0 {
+            return Err(Self::rt_err(
+                th,
+                "bad argument #1 to 'format' (string expected, got no value)".into(),
+            ));
+        } else {
+            match call.arg(th, 0) {
+                Value::Str(id) => self.strings.get(id).to_vec(),
+                v @ (Value::Int(_) | Value::Float(_)) => crate::value::fmt_number(v).into_bytes(),
+                other => {
+                    return Err(Self::rt_err(
+                        th,
+                        format!(
+                            "bad argument #1 to 'format' (string expected, got {})",
+                            other.type_name()
+                        ),
+                    ));
+                }
+            }
+        };
+        let args: Vec<Value> = (0..nargs).map(|i| call.arg(th, i)).collect();
+        self.format_job = Some(FormatJob {
+            fmt,
+            pos: 0,
+            arg: 1,
+            args,
+            out: Vec::new(),
+            ret_to: call.ret_to,
+            nres: call.nres,
+            shape: call.shape,
+            result_slot: 0,
+            awaiting: false,
+            saved: None,
+        });
+        th.frames
+            .last_mut()
+            .unwrap()
+            .pending_mut()
+            .push(Pending::FormatStep);
+        Ok(())
+    }
+
+    fn intrinsic_pcall(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        if call.argc == 0 {
+            return Err(Self::rt_err(
+                th,
+                "bad argument #1 to 'pcall' (value expected)".into(),
+            ));
+        }
+        if call.shape == RetShape::PrependTrue
+            && let Some(f @ Frame::Boundary(_)) = th.frames.last_mut()
+        {
+            f.pending_mut().push(Pending::PrependShape {
+                ret_to: call.ret_to,
+                nres: call.nres,
+                shape: call.shape,
+            });
+        }
+        self.protected_call(
+            th,
+            fuel,
+            call.func_abs + 1,
+            call.argc - 1,
+            call.ret_to,
+            call.nres,
+            None,
+            true,
+        )
+    }
+
+    fn intrinsic_xpcall(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        if call.argc < 2 {
+            return Err(Self::rt_err(
+                th,
+                "bad argument #2 to 'xpcall' (value expected)".into(),
+            ));
+        }
+        let handler = call.arg(th, 1);
+        // rebuild a contiguous window: [f, args...] (handler sits
+        // between f and the args in the original window)
+        let f = call.arg(th, 0);
+        let wb = scratch_base(th).max(call.func_abs + 1 + call.argc);
+        let n_args = call.argc - 2;
+        ensure_len(&mut th.stack, wb + 1 + n_args);
+        th.stack[wb] = f;
+        th.stack
+            .copy_within(call.func_abs + 3..call.func_abs + 1 + call.argc, wb + 1);
+        if call.shape == RetShape::PrependTrue
+            && let Some(cf @ Frame::Boundary(_)) = th.frames.last_mut()
+        {
+            cf.pending_mut().push(Pending::PrependShape {
+                ret_to: call.ret_to,
+                nres: call.nres,
+                shape: call.shape,
+            });
+        }
+        self.protected_call(
+            th,
+            fuel,
+            wb,
+            n_args,
+            call.ret_to,
+            call.nres,
+            Some(handler),
+            true,
+        )
+    }
+
+    fn intrinsic_resume(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let co = call.arg(th, 0);
+        let Value::Thread(co) = co else {
+            return Err(Self::rt_err(
+                th,
+                format!(
+                    "bad argument #1 to 'resume' (coroutine expected, got {})",
+                    co.type_name()
+                ),
+            ));
+        };
+        let args: Vec<Value> = th.stack[call.func_abs + 2..call.func_abs + 1 + call.argc].to_vec();
+        self.resume_thread(
+            th,
+            fuel,
+            co,
+            &args,
+            call.ret_to,
+            call.nres,
+            call.shape,
+            false,
+        )
+    }
+
+    fn intrinsic_wrap_resume(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        co: ThreadId,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let args: Vec<Value> = th.stack[call.func_abs + 1..call.func_abs + 1 + call.argc].to_vec();
+        self.resume_thread(
+            th,
+            fuel,
+            co,
+            &args,
+            call.ret_to,
+            call.nres,
+            call.shape,
+            true,
+        )
+    }
+
+    fn intrinsic_yield(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // Non-yieldable C boundary (e.g. inside a `table.sort`
+        // comparator or `string.gsub` replacement): PUC reports a
+        // cross-boundary yield, unless we are on the main thread, which
+        // reports "outside a coroutine" instead.
+        if th.non_yieldable > 0 && !th.is_main {
+            return Err(Self::rt_err(
+                th,
+                "attempt to yield across a C-call boundary".into(),
+            ));
+        }
+        let Some(parent) = th.parent else {
+            return Err(Self::rt_err(
+                th,
+                "attempt to yield from outside a coroutine".into(),
+            ));
+        };
+        *fuel -= 3;
+        let args: Vec<Value> = th.stack[call.func_abs + 1..call.func_abs + 1 + call.argc].to_vec();
+        let rr = th.resume_ret.expect("resumed thread has resume_ret");
+        let yield_fn = th.stack[call.func_abs];
+        let want_call = self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL);
+        let want_ret = self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN);
+        let job = YieldJob {
+            parent,
+            rr,
+            ret_to: call.ret_to,
+            nres: call.nres,
+            shape: call.shape,
+            args,
+            func: yield_fn,
+            stage: 0,
+        };
+        if want_call || want_ret {
+            // `yield` is a C function: emit its call/return hook events
+            // before the thread actually suspends. Each hook runs as a
+            // frame, so the suspension is deferred through `YieldStep`.
+            th.yield_job = Some(job);
+            th.frames
+                .last_mut()
+                .unwrap()
+                .pending_mut()
+                .push(Pending::YieldStep);
+            return Ok(());
+        }
+        self.perform_yield(th, &job);
+        Ok(())
+    }
+
+    #[expect(clippy::unused_self)]
+    fn intrinsic_enter_non_yieldable(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        th.non_yieldable = th.non_yieldable.saturating_add(1);
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+        Ok(())
+    }
+
+    #[expect(clippy::unused_self)]
+    fn intrinsic_leave_non_yieldable(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        th.non_yieldable = th.non_yieldable.saturating_sub(1);
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+        Ok(())
+    }
+
+    fn intrinsic_is_yieldable(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // Optional `co` argument: true for any coroutine (even a dead
+        // or never-started one), false for the main thread or a thread
+        // currently inside a non-yieldable C boundary.
+        let r = match call.arg_opt(th, 0) {
+            None => !th.is_main && th.non_yieldable == 0,
+            // the running thread is taken out of the arena, so read
+            // its flag from the live `th`, not the placeholder
+            Some(Value::Thread(t)) if t == self.current_thread => {
+                !th.is_main && th.non_yieldable == 0
+            }
+            Some(Value::Thread(t)) => {
+                let other = &self.threads[t.0 as usize];
+                !other.is_main && other.non_yieldable == 0
+            }
+            Some(v) => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #1 to 'isyieldable' (thread expected, got {})",
+                        v.type_name()
+                    ),
+                ));
+            }
+        };
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[Value::Bool(r)]);
+        Ok(())
+    }
+
+    fn intrinsic_collect_garbage(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // An intrinsic so the running thread (taken out of the arena
+        // during dispatch) can be passed as a GC root.
+        let r = self
+            .gc_command(
+                th,
+                call.arg(th, 0),
+                (call.argc > 1).then(|| call.arg(th, 1)),
+                call.func_abs + 1 + call.argc,
+            )
+            .map_err(|m| Self::rt_err(th, m))?;
+        place_shaped(th, call.ret_to, call.nres, call.shape, &r);
+        Ok(())
+    }
+
+    fn intrinsic_print(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
+        let items: Vec<Value> = (0..call.argc).map(|i| call.arg(th, i)).collect();
+        self.print_job = Some(PrintJob {
+            items,
+            idx: 0,
+            out: Vec::new(),
+            ret_to: call.ret_to,
+            nres: call.nres,
+            shape: call.shape,
+            result_slot: 0,
+            awaiting: false,
+        });
+        th.frames
+            .last_mut()
+            .unwrap()
+            .pending_mut()
+            .push(Pending::PrintStep);
+        Ok(())
+    }
+
+    fn intrinsic_coroutine_close(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let co = call.arg_opt(th, 0);
+        let Value::Thread(co) = co.unwrap_or(Value::Nil) else {
+            let got = match co {
+                Some(v) => v.type_name().to_string(),
+                None => "no value".to_string(),
+            };
+            return Err(Self::rt_err(
+                th,
+                format!("bad argument #1 to 'coroutine.close' (thread expected, got {got})"),
+            ));
+        };
+        self.begin_close(th, fuel, co, call.ret_to, call.nres, call.shape)
+    }
+
+    fn intrinsic_running(&mut self, th: &mut Thread, call: IntrinsicCall) -> Result<(), VmError> {
+        let cur = Value::Thread(self.current_thread);
+        let is_main = Value::Bool(th.parent.is_none());
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[cur, is_main]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_getinfo(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let a0 = call.arg_opt(th, 0);
+        let (target, base) = match a0 {
+            Some(Value::Thread(t)) => (Some(t), 1usize),
+            _ => (None, 0usize),
+        };
+        let f = call.arg_opt(th, base);
+        let what = call.arg(th, base + 1);
+        let r = self
+            .debug_getinfo(th, target, f, what, base + 1)
+            .map_err(|m| Self::rt_err(th, m))?;
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[r]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_traceback(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let a0 = call.arg_opt(th, 0);
+        let (target, base) = match a0 {
+            Some(Value::Thread(t)) => (Some(t), 1usize),
+            _ => (None, 0usize),
+        };
+        let message = call.arg(th, base);
+        let level = call.arg_opt(th, base + 1);
+        let r = self
+            .debug_traceback(th, target, message, level, base + 2)
+            .map_err(|m| Self::rt_err(th, m))?;
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[r]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_getupvalue(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // PUC checks the index (arg #2) before the function (arg #1).
+        let n = self
+            .debug_check_int(call.arg_opt(th, 1), 2, "debug.getupvalue")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let f = call.arg(th, 0);
+        match f {
+            Value::Closure(cid) => match self.debug_getupvalue(th, cid, n) {
+                Some((name, val)) => {
+                    let nv = self.new_string(name.as_bytes());
+                    place_shaped(th, call.ret_to, call.nres, call.shape, &[nv, val]);
+                }
+                // Out of range: PUC returns no values.
+                None => place_shaped(th, call.ret_to, call.nres, call.shape, &[]),
+            },
+            // A native is a C function: it is a valid function with no
+            // upvalues, so `lua_getupvalue` returns NULL -> zero values.
+            Value::Native(_) => place_shaped(th, call.ret_to, call.nres, call.shape, &[]),
+            other => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #1 to 'debug.getupvalue' (function expected, got {})",
+                        other.type_name()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn intrinsic_debug_setupvalue(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // PUC checks the value (arg #3), then index (#2), then
+        // function (#1).
+        if call.arg_opt(th, 2).is_none() {
+            return Err(Self::rt_err(
+                th,
+                "bad argument #3 to 'debug.setupvalue' (value expected)".into(),
+            ));
+        }
+        let n = self
+            .debug_check_int(call.arg_opt(th, 1), 2, "debug.setupvalue")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let v = call.arg(th, 2);
+        let f = call.arg(th, 0);
+        match f {
+            Value::Closure(cid) => match self.debug_setupvalue(th, cid, n, v) {
+                Some(name) => {
+                    let nv = self.new_string(name.as_bytes());
+                    place_shaped(th, call.ret_to, call.nres, call.shape, &[nv]);
+                }
+                None => place_shaped(th, call.ret_to, call.nres, call.shape, &[]),
+            },
+            // Native (C) functions have no upvalues: `lua_setupvalue`
+            // returns NULL, and the API reports zero values.
+            Value::Native(_) => place_shaped(th, call.ret_to, call.nres, call.shape, &[]),
+            other => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #1 to 'debug.setupvalue' (function expected, got {})",
+                        other.type_name()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn intrinsic_debug_upvalueid(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let n = self
+            .debug_check_int(call.arg_opt(th, 1), 2, "debug.upvalueid")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let f = call.arg(th, 0);
+        let r = match f {
+            Value::Closure(cid) => self.debug_upvalueid(cid, n),
+            // `lua_upvalueid` returns NULL for a C function (no
+            // upvalues); PUC pushes fail (nil) as a single value.
+            Value::Native(_) => Value::Nil,
+            other => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #1 to 'debug.upvalueid' (function expected, got {})",
+                        other.type_name()
+                    ),
+                ));
+            }
+        };
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[r]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_upvaluejoin(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // PUC's `checkupval` validates each (function, index) pair in
+        // order: index (#2/#4) then function (#1/#3) then upvalue
+        // existence. A native has no upvalues, so it fails the index
+        // check; a non-function fails the type check.
+        let n1 = self
+            .debug_check_int(call.arg_opt(th, 1), 2, "debug.upvaluejoin")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let c1 = self
+            .debug_check_upval(call.arg(th, 0), n1, 1, 2, "debug.upvaluejoin")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let n2 = self
+            .debug_check_int(call.arg_opt(th, 3), 4, "debug.upvaluejoin")
+            .map_err(|m| Self::rt_err(th, m))?;
+        let c2 = self
+            .debug_check_upval(call.arg(th, 2), n2, 3, 4, "debug.upvaluejoin")
+            .map_err(|m| Self::rt_err(th, m))?;
+        self.debug_upvaluejoin(c1, n1, c2, n2)
+            .map_err(|m| Self::rt_err(th, m))?;
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_getmetatable(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let v = call.arg(th, 0);
+        let r = match self.get_metatable(v) {
+            Some(mt) => Value::Table(mt),
+            None => Value::Nil,
+        };
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[r]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_setmetatable(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let v = call.arg(th, 0);
+        let mt = match call.arg(th, 1) {
+            Value::Nil => None,
+            Value::Table(t) => Some(t),
+            other => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #2 to 'setmetatable' (nil or table expected, got {})",
+                        other.type_name()
+                    ),
+                ));
+            }
+        };
+        self.set_raw_metatable(v, mt);
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[v]);
+        Ok(())
+    }
+
+    fn intrinsic_debug_getregistry(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        place_shaped(
+            th,
+            call.ret_to,
+            call.nres,
+            call.shape,
+            &[Value::Table(self.globals)],
+        );
+        Ok(())
+    }
+
+    fn intrinsic_debug_gethook(
+        &mut self,
+        th: &mut Thread,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        let target = match call.arg_opt(th, 0) {
+            None | Some(Value::Nil) => None,
+            Some(Value::Thread(t)) => Some(t),
+            Some(v) => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #1 to 'gethook' (thread expected, got {})",
+                        v.type_name()
+                    ),
+                ));
+            }
+        };
+        let (hook, mask, count) = match target {
+            Some(t) if t != self.current_thread => {
+                let o = &self.threads[t.0 as usize];
+                (o.hook.unwrap_or(Value::Nil), o.hook_mask, o.hook_count)
+            }
+            _ => (th.hook.unwrap_or(Value::Nil), th.hook_mask, th.hook_count),
+        };
+        // PUC returns a single `nil` (fail) when no hook is set,
+        // otherwise the hook, its mask string, and the count.
+        if hook == Value::Nil {
+            place_shaped(th, call.ret_to, call.nres, call.shape, &[Value::Nil]);
+            return Ok(());
+        }
+        let mut s = String::new();
+        if mask & HOOK_CALL != 0 {
+            s.push('c');
+        }
+        if mask & HOOK_RETURN != 0 {
+            s.push('r');
+        }
+        if mask & HOOK_LINE != 0 {
+            s.push('l');
+        }
+        let sv = self.new_string(s.as_bytes());
+        place_shaped(
+            th,
+            call.ret_to,
+            call.nres,
+            call.shape,
+            &[hook, sv, Value::Int(count)],
+        );
+        Ok(())
+    }
+
+    fn intrinsic_debug_sethook(
+        &mut self,
+        th: &mut Thread,
+        fuel: &mut i64,
+        call: IntrinsicCall,
+    ) -> Result<(), VmError> {
+        // `debug.sethook([thread,] hook, mask [, count])`
+        let (target, base_index) = match call.arg_opt(th, 0) {
+            Some(Value::Thread(t)) => (Some(t), 1usize),
+            _ => (None, 0usize),
+        };
+        let hook_opt = match call.arg(th, base_index) {
+            Value::Nil => None,
+            v @ (Value::Closure(_) | Value::Native(_)) => Some(v),
+            other => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #{} to 'sethook' (function expected, got {})",
+                        base_index + 1,
+                        other.type_name()
+                    ),
+                ));
+            }
+        };
+        let mut bits = 0u8;
+        match call.arg_opt(th, base_index + 1) {
+            None | Some(Value::Nil) => {}
+            Some(Value::Str(sid)) => {
+                for &c in self.strings.get(sid) {
+                    match c {
+                        b'c' => bits |= HOOK_CALL,
+                        b'r' => bits |= HOOK_RETURN,
+                        b'l' => bits |= HOOK_LINE,
+                        _ => {}
+                    }
+                }
+            }
+            Some(v) => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #{} to 'sethook' (string expected, got {})",
+                        base_index + 2,
+                        v.type_name()
+                    ),
+                ));
+            }
+        }
+        let count = match call.arg_opt(th, base_index + 2) {
+            None | Some(Value::Nil) => 0,
+            Some(Value::Int(n)) => n,
+            Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
+            Some(v) => {
+                return Err(Self::rt_err(
+                    th,
+                    format!(
+                        "bad argument #{} to 'sethook' (number expected, got {})",
+                        base_index + 3,
+                        v.type_name()
+                    ),
+                ));
+            }
+        };
+        let apply = |t: &mut Thread| {
+            t.hook = hook_opt;
+            t.hook_mask = bits;
+            t.hook_count = count.max(0);
+            t.hook_counter = count.max(0);
+        };
+        match target {
+            Some(t) if t != self.current_thread => {
+                apply(&mut self.threads[t.0 as usize]);
+            }
+            _ => apply(th),
+        }
+        // `debug.sethook` is itself a C function: if a return hook is
+        // now active on this thread, its return fires the hook (and the
+        // hook it just set observes it). A clearing call has already
+        // removed the hook, so nothing fires.
+        place_shaped(th, call.ret_to, call.nres, call.shape, &[]);
+        if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
+            self.fire_hook(th, fuel, "return", -1)?;
+        }
+        Ok(())
     }
 
     /// Number of resumers above `parent` in the live coroutine chain.
@@ -4198,14 +4391,7 @@ impl<C> Lua<C> {
                                 co_th.status = CoStatus::Running;
                                 let handler = if is_xpcall { Some(args[1]) } else { None };
                                 let r = self.protected_call(
-                                    &mut co_th,
-                                    fuel,
-                                    1,
-                                    extra,
-                                    0,
-                                    0,
-                                    handler,
-                                    true,
+                                    &mut co_th, fuel, 1, extra, 0, 0, handler, true,
                                 );
                                 self.threads[co.0 as usize] = co_th;
                                 r?;
@@ -4419,16 +4605,7 @@ impl<C> Lua<C> {
             self.close_job = Some(job);
             *fuel -= 1;
             // nres = 0 (multret) so an error's `false, err` pair both land.
-            return self.protected_call(
-                th,
-                fuel,
-                scratch,
-                2,
-                result_slot,
-                0,
-                None,
-                true,
-            );
+            return self.protected_call(th, fuel, scratch, 2, result_slot, 0, None, true);
         }
         // all handlers ran: kill the target and report
         self.finish_close(job.target);
