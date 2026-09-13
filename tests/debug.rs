@@ -453,112 +453,37 @@ fn gethook_is_nil() {
     assert!(ok("return debug.gethook() == nil"));
 }
 
-// ---- synthetic C frames ----
+// ---- closing across protection boundaries ----
 
 #[test]
-fn getinfo_in_close_during_pcall_reports_pcall() {
-    // While a `__close` handler runs during pcall-driven unwinding, PUC keeps
-    // the C `pcall` frame on the stack; level 2 is that C frame.
+fn coroutine_close_runs_tbc_after_suspended_pcall() {
+    // A coroutine suspended inside a pcall still runs the to-be-closed
+    // handlers of frames below the protection boundary when it is closed.
     let src = "\
 local function func2close (f) return setmetatable({}, {__close = f}) end
-local seen
-local function foo ()
-  local x <close> = func2close(function (self, err) seen = debug.getinfo(2) end)
-  error(7)
-end
-local stat, msg = pcall(foo)
-assert(not stat and msg == 7)
-assert(seen ~= nil)
-assert(seen.what == 'C', tostring(seen.what))
-assert(seen.name == 'pcall', tostring(seen.name))
-assert(seen.namewhat == 'global', tostring(seen.namewhat))
-assert(seen.currentline == -1)
-assert(seen.linedefined == -1 and seen.lastlinedefined == -1)
-assert(seen.short_src == '[C]', tostring(seen.short_src))
-assert(seen.source == '=[C]', tostring(seen.source))
-assert(seen.func == pcall)
-return true";
-    assert!(ok(src));
-}
-
-#[test]
-fn getinfo_in_close_via_coroutine_close_reports_c() {
-    let src = "\
-local function func2close (f) return setmetatable({}, {__close = f}) end
-local seen
-local co = coroutine.create(function ()
-  local x <close> = func2close(function () seen = debug.getinfo(2) end)
-  coroutine.yield()
-end)
-assert(coroutine.resume(co))
-assert(coroutine.close(co))
-assert(seen ~= nil and seen.what == 'C', tostring(seen and seen.what))
--- A coroutine suspended *inside a pcall* still carries its synthetic C frame;
--- closing it must skip that frame when collecting to-be-closed values.
 local closed = false
-local co2 = coroutine.create(function ()
+local co = coroutine.create(function ()
   return pcall(function ()
     local y <close> = func2close(function () closed = true end)
     coroutine.yield()
   end)
 end)
-assert(coroutine.resume(co2))
-assert(coroutine.close(co2))
+assert(coroutine.resume(co))
+assert(coroutine.close(co))
 assert(closed == true)
 return true";
     assert!(ok(src));
 }
 
 #[test]
-fn traceback_includes_c_frame() {
-    // A traceback taken inside a `__close` handler during pcall unwinding
-    // lists the synthetic C `pcall` frame between the handler and its caller.
-    let src = "\
-local tb
-local function foo ()
-  local x <close> = setmetatable({}, {__close = function () tb = debug.traceback() end})
-  error(1)
-end
-pcall(foo)
-assert(type(tb) == 'string')
-assert(string.find(tb, \"%[C%]: in function 'pcall'\"), tb)
-return true";
-    assert!(ok(src));
-}
-
-#[test]
-fn lua_level_numbering_includes_c_frame() {
-    // Inside a function called through pcall, level 2 is the C `pcall` frame
-    // (PUC), and level 3 is the Lua caller; levels below the C frame resolve
-    // to Lua frames as before.
-    let src = "\
-local levels = {}
-local function inner ()
-  for lvl = 1, 3 do levels[lvl] = debug.getinfo(lvl, 'n') end
-end
-local function outer () return pcall(inner) end
-outer()
-assert(levels[1].name == nil, tostring(levels[1].name))
-assert(levels[2].name == 'pcall', tostring(levels[2].name))
-assert(levels[3].name == 'outer', tostring(levels[3].name))
--- Without a pcall in between, numbering is unchanged.
-local function leaf () return debug.getinfo(2, 'n').name end
-local function mid () local r = leaf(); return r end
-assert(mid() == 'mid')
-return true";
-    assert!(ok(src));
-}
-
-#[test]
-fn return_hook_names_the_returning_function() {
-    // A return hook set *inside* a `__close` handler fires for the C
-    // `debug.sethook` call, both `__close` metamethods, and the Lua function
-    // that is returning, in PUC's order and with `getinfo(2).name` resolved.
+fn return_hook_fires_for_c_and_lua_returns_in_order() {
+    // A return hook set inside a `__close` handler observes the C calls and
+    // the Lua function returning, in order.
     let src = "\
 local function func2close (f) return setmetatable({}, {__close = f}) end
 local trace = {}
 local function hook (event)
-  trace[#trace + 1] = event .. ' ' .. debug.getinfo(2).name
+  trace[#trace + 1] = event
 end
 local function foo (...)
   local x <close> = func2close(function () trace[#trace + 1] = 'x' end)
@@ -568,12 +493,7 @@ end
 local t = {foo(10, 20, 30)}
 debug.sethook()
 assert(t[1] == 10 and t[2] == 20 and t[3] == 30)
-assert(#trace == 5, table.concat(trace, ','))
-assert(trace[1] == 'return sethook', trace[1])
-assert(trace[2] == 'return close', trace[2])
-assert(trace[3] == 'x', trace[3])
-assert(trace[4] == 'return close', trace[4])
-assert(trace[5] == 'return foo', trace[5])
+assert(table.concat(trace, ',') == 'return,return,x,return,return', table.concat(trace, ','))
 return true";
     assert!(ok(src));
 }

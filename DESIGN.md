@@ -183,16 +183,15 @@ through a capability the embedder installs explicitly.
   `table.sort`) are Lua closures carrying an `_ENV` upvalue, so
   `debug.getinfo` reports `what == "Lua"` for them instead of `"C"` and
   `debug.upvaluejoin` treats them like any closure.
-- Synthetic C frames are modelled for the `pcall`/`xpcall` boundaries: they
-  occupy a level with `what == "C"`, `currentline == -1`, `source == "=[C]"`,
-  and `name` (`"pcall"`/`"xpcall"`), so `debug.getinfo`/`debug.traceback`
-  match PUC while a `__close` handler runs during unwinding. A
-  `coroutine.close` C frame is also modelled (PUC reports no frame for a
-  close handler it drives), giving `what == "C"` there. The
-  `coroutine.yield`/`resume` boundaries are *not* modelled, so level 0 of a
-  suspended coroutine still names the yielding Lua frame (where PUC reports
-  the C `yield` frame), and PUC's `metamethod 'close'` frame naming is not
-  yet implemented.
+- Synthetic C frames are *not* modelled. PUC reports a C frame for the
+  `pcall`/`xpcall`/`coroutine.close` boundaries (and for `yield`/`resume`), so
+  `debug.getinfo`/`debug.traceback` level numbering around those boundaries
+  diverges: slew counts Lua frames only. slew still keeps an internal
+  `BoundaryFrame` to carry a protected call's `__close`/error-delivery
+  continuations, but it is invisible to the debug API. This is why upstream
+  `locals.lua` and `coroutine.lua` are excluded from the conformance set
+  (both assert on the missing C-frame levels). PUC's `metamethod 'close'`
+  frame naming is likewise not implemented.
 - `next` iteration order is stable per table state but not PUC's; per-call
   cost is O(n) (acceptable until tables move to an insertion-ordered map).
 

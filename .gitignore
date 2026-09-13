@@ -1,2 +1,5 @@
 /target
 /result
+
+# Editor/REPL scratch
+nvim.log

@@ -312,7 +312,7 @@ enum Pending {
     YieldStep,
     /// Re-raise an error after the collected `__close` handlers have run. Used
     /// when an error escapes a thread with no protection boundary: the closes
-    /// are staged on a synthetic frame, then the error propagates.
+    /// are staged on a boundary frame, then the error propagates.
     Reraise { err: Value },
 }
 
@@ -354,16 +354,11 @@ const HOOK_CALL: u8 = 1;
 const HOOK_RETURN: u8 = 2;
 const HOOK_LINE: u8 = 4;
 
-/// A synthetic C-level frame: a VM boundary (pcall/xpcall/coroutine.close)
-/// reported by `debug.getinfo`/`traceback` with `what == "C"`. It has no
-/// bytecode to run; it exists only to occupy a level and to carry the
-/// `__close`/error-delivery continuations of the protected call it guards.
-struct CFrame {
-    /// The C function this frame reports (`getinfo(...).func`).
-    func: Value,
-    /// `getinfo(...).name` and `namewhat` (e.g. `"pcall"`/`"global"`).
-    name: &'static str,
-    namewhat: &'static str,
+/// A boundary frame: no bytecode, never executed. It exists so a protected
+/// call has somewhere to stage the continuations it must run before the
+/// caller resumes (`__close` handlers, error delivery). It is deliberately
+/// invisible to `debug.getinfo`/`traceback`.
+struct BoundaryFrame {
     /// First stack slot safely above the caller's live data (scratch base at
     /// push time); used while this frame is the innermost frame.
     base: usize,
@@ -376,7 +371,7 @@ struct CFrame {
     boundary: Option<CBoundary>,
 }
 
-/// Protection metadata for a [`CFrame`] that guards a native callee.
+/// Protection metadata for a [`BoundaryFrame`] that guards a native callee.
 #[derive(Clone, Copy)]
 struct CBoundary {
     ret_to: usize,
@@ -391,56 +386,56 @@ struct HandlerUnwind;
 
 enum Frame {
     Lua(LuaFrame),
-    C(CFrame),
+    Boundary(BoundaryFrame),
 }
 
 impl Frame {
     fn as_lua(&self) -> &LuaFrame {
         match self {
             Frame::Lua(f) => f,
-            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+            Frame::Boundary(_) => unreachable!("boundary frame accessed as a Lua frame"),
         }
     }
 
     fn as_lua_mut(&mut self) -> &mut LuaFrame {
         match self {
             Frame::Lua(f) => f,
-            Frame::C(_) => unreachable!("C frame accessed as a Lua frame"),
+            Frame::Boundary(_) => unreachable!("boundary frame accessed as a Lua frame"),
         }
     }
 
-    fn is_c(&self) -> bool {
-        matches!(self, Frame::C(_))
+    fn is_boundary(&self) -> bool {
+        matches!(self, Frame::Boundary(_))
     }
 
     fn lua(&self) -> Option<&LuaFrame> {
         match self {
             Frame::Lua(f) => Some(f),
-            Frame::C(_) => None,
+            Frame::Boundary(_) => None,
         }
     }
 
     /// Whether this frame is an error-protection boundary. A Lua frame carries
-    /// the flag when it is a protected callee; a C frame carries it when the
-    /// protected callee was a native (see [`CFrame::boundary`]).
+    /// the flag when it is a protected callee; a boundary frame carries it when
+    /// the protected callee was a native (see [`BoundaryFrame::boundary`]).
     fn is_protected(&self) -> bool {
         match self {
             Frame::Lua(f) => f.protected,
-            Frame::C(c) => c.boundary.is_some(),
+            Frame::Boundary(c) => c.boundary.is_some(),
         }
     }
 
     fn pending(&self) -> &[Pending] {
         match self {
             Frame::Lua(f) => &f.pending,
-            Frame::C(f) => &f.pending,
+            Frame::Boundary(f) => &f.pending,
         }
     }
 
     fn pending_mut(&mut self) -> &mut Vec<Pending> {
         match self {
             Frame::Lua(f) => &mut f.pending,
-            Frame::C(f) => &mut f.pending,
+            Frame::Boundary(f) => &mut f.pending,
         }
     }
 }
@@ -449,7 +444,7 @@ impl Frame {
 fn frame_boundary(f: &Frame) -> (Option<Value>, bool) {
     match f {
         Frame::Lua(f) => (f.handler, f.handler_guard),
-        Frame::C(c) => (c.boundary.as_ref().and_then(|b| b.handler), false),
+        Frame::Boundary(c) => (c.boundary.as_ref().and_then(|b| b.handler), false),
     }
 }
 
@@ -471,13 +466,6 @@ fn annotate_metamethod_error(e: &mut VmError, name: &str) {
     {
         let _ = write!(m, " (metamethod '{name}')");
     }
-}
-
-/// Description of a synthetic C frame to push at a protected-call boundary.
-struct CSpec {
-    name: &'static str,
-    namewhat: &'static str,
-    func: Value,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -788,8 +776,6 @@ pub struct Lua<C = ()> {
 /// been closed. Driven by [`Pending::CloseStep`].
 struct CloseJob {
     target: ThreadId,
-    /// The `coroutine.close` C function, for the synthetic close frame.
-    func: Value,
     /// Values to close, innermost-first.
     items: Vec<Value>,
     idx: usize,
@@ -1554,13 +1540,6 @@ impl<C> Lua<C> {
                 let func = self.debug_getinfo_fn();
                 self.fill_native_info(tid, func, what);
             }
-            LevelFrame::C {
-                func,
-                name,
-                namewhat,
-            } => {
-                self.fill_c_info(tid, func, name, namewhat, what);
-            }
             LevelFrame::Lua {
                 proto,
                 pc,
@@ -1583,8 +1562,9 @@ impl<C> Lua<C> {
         Ok(true)
     }
 
-    /// Frame at `level` in `target` (or the running thread), or the C
-    /// function `getinfo` at current level 0. `None` when out of range.
+    /// Lua frame at `level` in `target` (or the running thread), or the C
+    /// function `getinfo` at current level 0. Boundary frames are invisible to
+    /// the debug API. `None` when out of range.
     fn debug_level_snapshot(
         &self,
         th: &Thread,
@@ -1602,82 +1582,59 @@ impl<C> Lua<C> {
             _ => Some(&th.frames[..]),
         }?;
         let level = level as usize;
+        // Boundary frames are invisible to the debug API, so levels are counted
+        // over Lua frames only. They are indexed by their position in the raw
+        // stack so call-site name lookup below still sees the real caller.
+        let lua: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.lua().is_some())
+            .map(|(i, _)| i)
+            .collect();
         let idx = if current {
             if level == 0 {
                 return Some(LevelFrame::Native);
             }
-            if level > frames.len() {
+            if level > lua.len() {
                 return None;
             }
-            frames.len() - level
+            lua[lua.len() - level]
         } else {
-            if level >= frames.len() {
+            if level >= lua.len() {
                 return None;
             }
-            frames.len() - 1 - level
+            lua[lua.len() - 1 - level]
         };
-        let fr = frames.get(idx)?;
-        match fr {
-            Frame::C(cf) => Some(LevelFrame::C {
-                func: cf.func,
-                name: cf.name,
-                namewhat: cf.namewhat,
-            }),
-            Frame::Lua(lf) => {
-                let name = lf
-                    .call_meta
-                    .map(|(nw, nm)| (nw, Box::from(nm)))
-                    .or_else(|| {
-                        if idx > 0 {
-                            frames[idx - 1].lua().and_then(|caller| {
-                                caller
-                                    .proto
-                                    .call_names
-                                    .get(caller.pc.wrapping_sub(1))
-                                    .cloned()
-                                    .flatten()
-                            })
-                        } else {
-                            None
-                        }
-                    });
-                Some(LevelFrame::Lua {
-                    proto: lf.proto.clone(),
-                    pc: lf.pc,
-                    closure: lf.closure,
-                    tailcall: lf.tailcall,
-                    name,
-                })
-            }
-        }
+        let lf = frames.get(idx)?.lua()?;
+        let name = lf
+            .call_meta
+            .map(|(nw, nm)| (nw, Box::from(nm)))
+            .or_else(|| {
+                if idx > 0 {
+                    frames[idx - 1].lua().and_then(|caller| {
+                        caller
+                            .proto
+                            .call_names
+                            .get(caller.pc.wrapping_sub(1))
+                            .cloned()
+                            .flatten()
+                    })
+                } else {
+                    None
+                }
+            });
+        Some(LevelFrame::Lua {
+            proto: lf.proto.clone(),
+            pc: lf.pc,
+            closure: lf.closure,
+            tailcall: lf.tailcall,
+            name,
+        })
     }
 
     fn info_set(&mut self, tid: TableId, name: &str, v: Value) {
         let k = self.new_string(name.as_bytes());
         self.tables[tid.0 as usize].set(k, v).unwrap();
-    }
-
-    /// C-boundary frame info: the same shape as a native function, but with
-    /// the call-site name PUC reports (`name`/`namewhat`).
-    fn fill_c_info(&mut self, tid: TableId, func: Value, name: &str, namewhat: &str, what: &[u8]) {
-        self.fill_native_info(tid, func, what);
-        if what.contains(&b'n') {
-            // A synthetic frame for a returning/called native carries no
-            // call-site name; derive it from the native itself (PUC names
-            // such functions, e.g. "sethook"/"yield").
-            let name = if name.is_empty() {
-                match func {
-                    Value::Native(n) => self.natives[n.0 as usize].name.clone(),
-                    _ => String::new(),
-                }
-            } else {
-                name.to_string()
-            };
-            let nv = self.new_string(name.as_bytes());
-            self.info_set(tid, "name", nv);
-            let nw = self.new_string(namewhat.as_bytes());
-            self.info_set(tid, "namewhat", nw);
-        }
     }
 
     fn fill_native_info(&mut self, tid: TableId, func: Value, what: &[u8]) {
@@ -1829,66 +1786,63 @@ impl<C> Lua<C> {
         }
         out.push_str("stack traceback:");
         // Level 0 is the running frame of `target`; for the current thread it
-        // behaves like level 1. Synthetic C frames occupy their own level, as
-        // in PUC. A level past the stack shows no frames (PUC `luaL_traceback`).
+        // behaves like level 1. Boundary frames are invisible to tracebacks, so
+        // levels are counted over Lua frames only. A level past the stack shows
+        // no frames (PUC `luaL_traceback`).
+        let lua: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.lua().is_some())
+            .map(|(i, _)| i)
+            .collect();
         let first = if current {
-            frames.len().checked_sub(level.max(1) as usize)
+            lua.len().checked_sub(level.max(1) as usize)
         } else {
-            frames.len().checked_sub(1 + level.max(0) as usize)
+            lua.len().checked_sub(1 + level.max(0) as usize)
         };
         let Some(first) = first else {
             return Ok(self.new_string(out.as_bytes()));
         };
-        for idx in (0..=first).rev() {
-            match &frames[idx] {
-                Frame::C(cf) => {
-                    out.push_str("\n\t[C]: in ");
-                    if cf.namewhat == "metamethod" {
-                        let _ = write!(out, "metamethod '{}'", cf.name);
-                    } else if cf.name.is_empty() {
-                        out.push('?');
+        for pos in (0..=first).rev() {
+            let idx = lua[pos];
+            let Frame::Lua(fr) = &frames[idx] else {
+                continue;
+            };
+            let line = fr
+                .proto
+                .lines
+                .get(fr.pc.wrapping_sub(1))
+                .copied()
+                .unwrap_or(0);
+            let src = short_source(&fr.proto.source);
+            let _ = write!(out, "\n\t{src}:{line}: in ");
+            let name: Option<(&'static str, Box<str>)> = fr
+                .call_meta
+                .map(|(nw, nm)| (nw, Box::from(nm)))
+                .or_else(|| {
+                    if idx > 0 {
+                        frames[idx - 1].lua().and_then(|caller| {
+                            caller
+                                .proto
+                                .call_names
+                                .get(caller.pc.wrapping_sub(1))
+                                .cloned()
+                                .flatten()
+                        })
                     } else {
-                        let _ = write!(out, "function '{}'", cf.name);
+                        None
                     }
+                });
+            match name {
+                Some(("metamethod", nm)) => {
+                    let _ = write!(out, "metamethod '{nm}'");
                 }
-                Frame::Lua(fr) => {
-                    let line = fr
-                        .proto
-                        .lines
-                        .get(fr.pc.wrapping_sub(1))
-                        .copied()
-                        .unwrap_or(0);
-                    let src = short_source(&fr.proto.source);
-                    let _ = write!(out, "\n\t{src}:{line}: in ");
-                    let name: Option<(&'static str, Box<str>)> = fr
-                        .call_meta
-                        .map(|(nw, nm)| (nw, Box::from(nm)))
-                        .or_else(|| {
-                            if idx > 0 {
-                                frames[idx - 1].lua().and_then(|caller| {
-                                    caller
-                                        .proto
-                                        .call_names
-                                        .get(caller.pc.wrapping_sub(1))
-                                        .cloned()
-                                        .flatten()
-                                })
-                            } else {
-                                None
-                            }
-                        });
-                    match name {
-                        Some(("metamethod", nm)) => {
-                            let _ = write!(out, "metamethod '{nm}'");
-                        }
-                        Some((nw, nm)) => {
-                            let _ = write!(out, "function '{nm}' ({nw})");
-                        }
-                        None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
-                        None => {
-                            let _ = write!(out, "function <{src}:{}>", fr.proto.linedefined);
-                        }
-                    }
+                Some((nw, nm)) => {
+                    let _ = write!(out, "function '{nm}' ({nw})");
+                }
+                None if fr.proto.linedefined == 0 => out.push_str("main chunk"),
+                None => {
+                    let _ = write!(out, "function <{src}:{}>", fr.proto.linedefined);
                 }
             }
         }
@@ -2048,31 +2002,17 @@ impl<C> Lua<C> {
     }
 
     /// Calls the current hook as an ordinary function, so it runs through the
-    /// regular (suspendable) machinery and can itself call `pcall` etc. An
-    /// optional synthetic C frame below it makes `debug.getinfo(2)` name a
-    /// native that is returning or being called (PUC keeps the C `CallInfo`).
+    /// regular (suspendable) machinery and can itself call `pcall` etc.
     fn fire_hook(
         &mut self,
         th: &mut Thread,
         fuel: &mut i64,
         event: &str,
         line: i64,
-        synth: Option<Value>,
     ) -> Result<(), VmError> {
         let Some(hook) = th.hook else {
             return Ok(());
         };
-        if let Some(func) = synth {
-            let base = th.frames.last().map_or(th.top, |_| scratch_base(th));
-            th.frames.push(Frame::C(CFrame {
-                func,
-                name: "",
-                namewhat: "",
-                base,
-                pending: Vec::new(),
-                boundary: None,
-            }));
-        }
         let ev = self.new_string(event.as_bytes());
         let ln = if line < 0 {
             Value::Nil
@@ -2246,7 +2186,7 @@ impl<C> Lua<C> {
                     Some(Ok(values)) => {
                         place_shaped(th, pending.ret_to, pending.nres, pending.shape, &values);
                         if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                            self.fire_hook(th, fuel, "return", -1, Some(pending.func))?;
+                            self.fire_hook(th, fuel, "return", -1)?;
                         }
                     }
                     Some(Err(message)) => {
@@ -2400,10 +2340,7 @@ impl<C> Lua<C> {
                     // frame below to stage them on, so synthesize one, run the
                     // closes, then re-raise the error.
                     let errv = self.err_value(&e);
-                    th.frames.push(Frame::C(CFrame {
-                        func: Value::Nil,
-                        name: "",
-                        namewhat: "",
+                    th.frames.push(Frame::Boundary(BoundaryFrame {
                         base: th.top,
                         pending: Vec::new(),
                         boundary: None,
@@ -2436,11 +2373,11 @@ impl<C> Lua<C> {
                 self.close_upvals(th, f.base);
                 (f.ret_to, f.nres, f.handler, f.handler_guard)
             }
-            Frame::C(c) => {
+            Frame::Boundary(c) => {
                 let b = c
                     .boundary
                     .as_ref()
-                    .expect("protected C frame carries a boundary");
+                    .expect("protected boundary frame carries a boundary");
                 (b.ret_to, b.nres, b.handler, false)
             }
         };
@@ -2481,17 +2418,17 @@ impl<C> Lua<C> {
         fuel: &mut i64,
     ) -> Result<Flow, VmError> {
         *fuel -= 1;
-        // A synthetic C frame whose continuations have all run is finished:
-        // pop it so the Lua frame below (owner of the protected call's result
-        // slots) resumes. C frames are only ever the innermost frame while
-        // they carry continuations.
-        while th.frames.last().is_some_and(Frame::is_c)
+        // A boundary frame whose continuations have all run is finished: pop it
+        // so the Lua frame below (owner of the protected call's result slots)
+        // resumes. Boundary frames are only ever innermost while they carry
+        // continuations.
+        while th.frames.last().is_some_and(Frame::is_boundary)
             && th.frames.last().unwrap().pending().is_empty()
         {
             th.frames.pop();
         }
         // A coroutine whose body was a protected call (`coroutine.create(pcall)`)
-        // has no Lua frame below its synthetic boundary: the delivered results
+        // has no Lua frame below its boundary: the delivered results
         // at slot 0 are the coroutine's return values.
         if th.frames.is_empty() {
             let top = th.top.min(th.stack.len());
@@ -2628,7 +2565,7 @@ impl<C> Lua<C> {
                 }
                 Pending::ReturnHookFire => {
                     if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                        self.fire_hook(th, fuel, "return", -1, None)?;
+                        self.fire_hook(th, fuel, "return", -1)?;
                     }
                 }
                 Pending::Reraise { err } => {
@@ -2641,7 +2578,6 @@ impl<C> Lua<C> {
                 }
                 Pending::YieldStep => {
                     let mut job = th.yield_job.take().expect("yield job staged");
-                    let yield_fn = job.func;
                     match job.stage {
                         0 => {
                             job.stage = 1;
@@ -2654,7 +2590,7 @@ impl<C> Lua<C> {
                                 .pending_mut()
                                 .push(Pending::YieldStep);
                             if self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL) {
-                                self.fire_hook(th, fuel, "call", -1, Some(yield_fn))?;
+                                self.fire_hook(th, fuel, "call", -1)?;
                             }
                         }
                         1 => {
@@ -2666,7 +2602,7 @@ impl<C> Lua<C> {
                                 .pending_mut()
                                 .push(Pending::YieldStep);
                             if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                                self.fire_hook(th, fuel, "return", -1, Some(yield_fn))?;
+                                self.fire_hook(th, fuel, "return", -1)?;
                             }
                         }
                         _ => self.perform_yield(th, &job),
@@ -2694,7 +2630,7 @@ impl<C> Lua<C> {
         if th.pending_call_hook {
             th.pending_call_hook = false;
             if Self::hook_on(th, HOOK_CALL) {
-                self.fire_hook(th, fuel, "call", -1, None)?;
+                self.fire_hook(th, fuel, "call", -1)?;
                 return Ok(Flow::Continue);
             }
         }
@@ -2703,7 +2639,7 @@ impl<C> Lua<C> {
             if th.hook_counter <= 0 {
                 th.hook_counter = th.hook_count;
                 let line = line_of(th) as i64;
-                self.fire_hook(th, fuel, "count", line, None)?;
+                self.fire_hook(th, fuel, "count", line)?;
                 return Ok(Flow::Continue);
             }
         }
@@ -2716,7 +2652,7 @@ impl<C> Lua<C> {
                 && lf.last_line != line
             {
                 lf.last_line = line;
-                self.fire_hook(th, fuel, "line", line, None)?;
+                self.fire_hook(th, fuel, "line", line)?;
                 return Ok(Flow::Continue);
             }
         }
@@ -2979,7 +2915,7 @@ impl<C> Lua<C> {
                 if Self::hook_on(th, HOOK_RETURN) {
                     let f = th.frames.last_mut().unwrap().as_lua_mut();
                     f.pending.push(Pending::FinishReturn { start, count });
-                    self.fire_hook(th, fuel, "return", -1, None)?;
+                    self.fire_hook(th, fuel, "return", -1)?;
                     return Ok(Flow::Continue);
                 }
                 let frame = th.frames.pop().unwrap();
@@ -3177,8 +3113,7 @@ impl<C> Lua<C> {
                         is_hook: false,
                     }));
                     if self.hook_suppress == 0 && Self::hook_on(th, HOOK_CALL) {
-                        let callee = th.stack[func_abs];
-                        self.fire_hook(th, fuel, "call", -1, Some(callee))?;
+                        self.fire_hook(th, fuel, "call", -1)?;
                     }
                     return Ok(());
                 }
@@ -3338,7 +3273,6 @@ impl<C> Lua<C> {
     ) -> Result<(), VmError> {
         match self.natives[nid.0 as usize].kind {
             NativeKind::Plain(f) => {
-                let fv = th.stack[func_abs];
                 let args = th.stack[func_abs + 1..func_abs + 1 + argc].to_vec();
                 let res = f(self, &args).map_err(|message| VmError {
                     val: ErrVal::Msg(message),
@@ -3348,7 +3282,7 @@ impl<C> Lua<C> {
                 })?;
                 place_shaped(th, ret_to, nres, shape, &res);
                 if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                    self.fire_hook(th, fuel, "return", -1)?;
                 }
                 Ok(())
             }
@@ -3380,7 +3314,7 @@ impl<C> Lua<C> {
                     NativeOutcome::Return(res) => {
                         place_shaped(th, ret_to, nres, shape, &res);
                         if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                            self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                            self.fire_hook(th, fuel, "return", -1)?;
                         }
                     }
                     NativeOutcome::Wait(wait) => {
@@ -3592,9 +3526,8 @@ impl<C> Lua<C> {
                         "bad argument #1 to 'pcall' (value expected)".into(),
                     ));
                 }
-                let pcall_fn = th.stack[func_abs];
                 if shape == RetShape::PrependTrue
-                    && let Some(f @ Frame::C(_)) = th.frames.last_mut()
+                    && let Some(f @ Frame::Boundary(_)) = th.frames.last_mut()
                 {
                     f.pending_mut().push(Pending::PrependShape {
                         ret_to,
@@ -3610,11 +3543,7 @@ impl<C> Lua<C> {
                     ret_to,
                     nres,
                     None,
-                    Some(CSpec {
-                        name: "pcall",
-                        namewhat: "global",
-                        func: pcall_fn,
-                    }),
+                    true,
                 )
             }
             Intrinsic::Xpcall => {
@@ -3628,7 +3557,6 @@ impl<C> Lua<C> {
                 // rebuild a contiguous window: [f, args...] (handler sits
                 // between f and the args in the original window)
                 let f = arg(th, 0);
-                let xpcall_fn = th.stack[func_abs];
                 let wb = scratch_base(th).max(func_abs + 1 + argc);
                 let n_args = argc - 2;
                 ensure_len(&mut th.stack, wb + 1 + n_args);
@@ -3636,7 +3564,7 @@ impl<C> Lua<C> {
                 th.stack
                     .copy_within(func_abs + 3..func_abs + 1 + argc, wb + 1);
                 if shape == RetShape::PrependTrue
-                    && let Some(cf @ Frame::C(_)) = th.frames.last_mut()
+                    && let Some(cf @ Frame::Boundary(_)) = th.frames.last_mut()
                 {
                     cf.pending_mut().push(Pending::PrependShape {
                         ret_to,
@@ -3652,11 +3580,7 @@ impl<C> Lua<C> {
                     ret_to,
                     nres,
                     Some(handler),
-                    Some(CSpec {
-                        name: "xpcall",
-                        namewhat: "global",
-                        func: xpcall_fn,
-                    }),
+                    true,
                 )
             }
             Intrinsic::Resume => {
@@ -3810,8 +3734,7 @@ impl<C> Lua<C> {
                         ),
                     ));
                 };
-                let close_fn = th.stack[func_abs];
-                self.begin_close(th, fuel, co, ret_to, nres, shape, close_fn)
+                self.begin_close(th, fuel, co, ret_to, nres, shape)
             }
             Intrinsic::Running => {
                 let cur = Value::Thread(self.current_thread);
@@ -4107,10 +4030,9 @@ impl<C> Lua<C> {
                 // now active on this thread, its return fires the hook (and the
                 // hook it just set observes it). A clearing call has already
                 // removed the hook, so nothing fires.
-                let fv = th.stack[func_abs];
                 place_shaped(th, ret_to, nres, shape, &[]);
                 if self.hook_suppress == 0 && Self::hook_on(th, HOOK_RETURN) {
-                    self.fire_hook(th, fuel, "return", -1, Some(fv))?;
+                    self.fire_hook(th, fuel, "return", -1)?;
                 }
                 Ok(())
             }
@@ -4275,7 +4197,6 @@ impl<C> Lua<C> {
                                 co_th.top = 2 + extra;
                                 co_th.status = CoStatus::Running;
                                 let handler = if is_xpcall { Some(args[1]) } else { None };
-                                let name = if is_xpcall { "xpcall" } else { "pcall" };
                                 let r = self.protected_call(
                                     &mut co_th,
                                     fuel,
@@ -4284,11 +4205,7 @@ impl<C> Lua<C> {
                                     0,
                                     0,
                                     handler,
-                                    Some(CSpec {
-                                        name,
-                                        namewhat: "global",
-                                        func: Value::Native(nid),
-                                    }),
+                                    true,
                                 );
                                 self.threads[co.0 as usize] = co_th;
                                 r?;
@@ -4391,7 +4308,6 @@ impl<C> Lua<C> {
     /// Starts `coroutine.close(co)`. Dead-and-clean and to-be-closed-free
     /// coroutines resolve immediately; otherwise a [`CloseJob`] is installed
     /// and driven by [`Pending::CloseStep`].
-    #[expect(clippy::too_many_arguments)]
     fn begin_close(
         &mut self,
         th: &mut Thread,
@@ -4400,7 +4316,6 @@ impl<C> Lua<C> {
         ret_to: usize,
         nres: u8,
         shape: RetShape,
-        func: Value,
     ) -> Result<(), VmError> {
         // Closing the running/normal coroutine is an error (catchable with
         // pcall), not a `false, msg` result.
@@ -4439,7 +4354,6 @@ impl<C> Lua<C> {
                 self.threads[co.0 as usize].status = CoStatus::Running;
                 self.close_job = Some(CloseJob {
                     target: co,
-                    func,
                     items,
                     idx: 0,
                     err: Value::Nil,
@@ -4497,7 +4411,6 @@ impl<C> Lua<C> {
             ensure_len(&mut th.stack, result_slot + 2);
             job.result_slot = result_slot;
             job.awaiting = true;
-            let close_fn = job.func;
             th.frames
                 .last_mut()
                 .unwrap()
@@ -4514,11 +4427,7 @@ impl<C> Lua<C> {
                 result_slot,
                 0,
                 None,
-                Some(CSpec {
-                    name: "coroutine.close",
-                    namewhat: "global",
-                    func: close_fn,
-                }),
+                true,
             );
         }
         // all handlers ran: kill the target and report
@@ -4689,21 +4598,19 @@ impl<C> Lua<C> {
         ret_to: usize,
         nres: u8,
         handler: Option<Value>,
-        c_frame: Option<CSpec>,
+        with_boundary: bool,
     ) -> Result<(), VmError> {
-        // Push the synthetic C frame *below* the protected callee: it is the
-        // boundary PUC keeps on the stack while `__close` handlers run during
-        // unwinding, so `debug.getinfo` sees it as the callee's caller.
-        if let Some(spec) = c_frame {
+        // Push the boundary frame *below* the protected callee: it is where the
+        // `__close`/error-delivery continuations are staged once the callee is
+        // unwound or returns.
+        if with_boundary {
             let base = th.frames.last().map_or(th.top, |_| scratch_base(th));
             // A native callee has no Lua frame to carry the protection flag,
-            // so this C frame is itself the boundary for any continuation it
-            // later stages (e.g. `pcall(tostring, v)` calling `__tostring`).
+            // so this boundary frame is itself the protection boundary for any
+            // continuation it later stages (e.g. `pcall(tostring, v)` calling
+            // `__tostring`).
             let native_boundary = !matches!(th.stack[f_abs], Value::Closure(_));
-            th.frames.push(Frame::C(CFrame {
-                func: spec.func,
-                name: spec.name,
-                namewhat: spec.namewhat,
+            th.frames.push(Frame::Boundary(BoundaryFrame {
                 base,
                 pending: Vec::new(),
                 boundary: native_boundary.then_some(CBoundary {
@@ -5361,7 +5268,7 @@ impl<C> Lua<C> {
             let discard = scratch + 2;
             ensure_len(&mut th.stack, discard + 2);
             let frames_before = th.frames.len();
-            self.protected_call(th, fuel, scratch, 1, discard, 0, None, None)?;
+            self.protected_call(th, fuel, scratch, 1, discard, 0, None, false)?;
             // A Lua-closure handler pushes a frame that is still running when
             // `protected_call` returns, so hold the depth guard until it
             // unwinds. A native handler (e.g. the file `__gc`) runs to
@@ -5893,8 +5800,7 @@ impl<C> Lua<C> {
                         }
                         mark_pending(&lf.pending, th, work, stack_len);
                     }
-                    Frame::C(cf) => {
-                        work.push(cf.func);
+                    Frame::Boundary(cf) => {
                         if let Some(b) = &cf.boundary
                             && let Some(h) = b.handler
                         {
@@ -6259,14 +6165,9 @@ impl<C> Execution<C> {
 // ---- free helpers ----
 
 /// A resolved `debug.getinfo` level: the running C function (current thread
-/// level 0), a synthetic C boundary frame, or a Lua frame's snapshot.
+/// level 0) or a Lua frame's snapshot.
 enum LevelFrame {
     Native,
-    C {
-        func: Value,
-        name: &'static str,
-        namewhat: &'static str,
-    },
     Lua {
         proto: Rc<Proto>,
         pc: usize,
@@ -6372,7 +6273,7 @@ fn jump(th: &mut Thread, off: i32) {
 }
 
 fn line_of(th: &Thread) -> u32 {
-    // When a synthetic C frame is innermost, report its caller's Lua line.
+    // Boundary frames carry no line info; report the nearest Lua frame's line.
     th.frames
         .iter()
         .rev()
@@ -6425,8 +6326,8 @@ fn frame_reg_extent(f: &LuaFrame) -> usize {
 fn scratch_base(th: &Thread) -> usize {
     match th.frames.last().unwrap() {
         Frame::Lua(f) => (f.base + f.proto.max_regs as usize).max(th.top),
-        // A synthetic C frame keeps the scratch base recorded at push time.
-        Frame::C(c) => c.base.max(th.top),
+        // A boundary frame keeps the scratch base recorded at push time.
+        Frame::Boundary(c) => c.base.max(th.top),
     }
 }
 
