@@ -1,0 +1,78 @@
+[package]
+name = "slew"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A suspendable Lua interpreter with strict, embedder-controlled execution budgets"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Dzejkop/slew"
+homepage = "https://github.com/Dzejkop/slew"
+documentation = "https://docs.rs/slew"
+readme = "README.md"
+keywords = ["lua", "interpreter", "vm", "sandbox", "embedding"]
+categories = ["development-tools", "emulators"]
+# Repo infrastructure that has no place in the published crate. Everything
+# else (src, tests, examples, DESIGN.md, README.md) ships.
+exclude = [
+    "/.github",
+    "/docs",
+    "/scripts",
+    "/flake.nix",
+    "/flake.lock",
+    "/release-plz.toml",
+    "/rustfmt.toml",
+]
+
+[dependencies]
+reedline = { version = "0.48.0", optional = true }
+
+[features]
+default = ["repl", "fs"]
+repl = ["dep:reedline"]
+# Built-in std::fs reader adapter (`Lua::set_fs_file_reader`). The core never
+# touches the filesystem itself; disable this for fs-less targets.
+fs = []
+
+[[bin]]
+name = "slew"
+path = "src/bin/repl.rs"
+required-features = ["repl"]
+
+[dev-dependencies]
+ratatui = "0.30.2"
+test-case = "3.3.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Lua numbers are `i64`/`f64` and indices are `usize`; the VM converts between
+# them constantly at well-defined truncating/wrapping boundaries. Rewriting
+# every such site with checked conversions would hurt readability without
+# changing behaviour.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+
+# The bytecode dispatcher and the stdlib entry points are deliberately long
+# `match` tables that mirror the reference interpreter; splitting them up makes
+# the control flow harder to follow.
+too_many_lines = "allow"
+
+# Numeric, pattern-matching and VM code follows PUC-Lua's terse naming
+# conventions (`i`, `n`, `x`, `y`, `s`, `ra`, `rb`, ...).
+many_single_char_names = "allow"
+similar_names = "allow"
+
+# `LuaConfig`-style types carry independent boolean switches, which is exactly
+# what this lint flags but reads better than a bitfield here.
+struct_excessive_bools = "allow"
+
+# Stdlib functions share a uniform `Result`-returning registration signature
+# even when a particular implementation cannot fail.
+unnecessary_wraps = "allow"
