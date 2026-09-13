@@ -104,19 +104,11 @@ local function reporter()
   while true do
     sched.sleep(20)
     local x, y = robot.pos()
-    log('at ' .. x .. ',' .. y .. ' facing ' .. robot.facing())
     sched.send(100, 'R@' .. x .. ',' .. y)
   end
 end
 
-local function listener()
-  while true do
-    local msg = sched.recv(100)
-    log('heard ' .. tostring(msg))
-  end
-end
-
-sched.run({ miner, reporter, listener })
+sched.run({ miner, reporter })
 ";
 
 pub(crate) const DEFAULT_EXPLORER: &str = r"-- Explorer program: wanders the world building a mental map.
@@ -193,12 +185,6 @@ local function explorer()
     sched.await(function() return not robot.busy() end)
     sense()
     steps = steps + 1
-    if steps % 30 == 0 then
-      log('mental map after ' .. steps .. ' steps:')
-      for _, row in ipairs(render_lines()) do
-        log('  ' .. row)
-      end
-    end
   end
 end
 
