@@ -347,16 +347,20 @@ impl App {
         if text.is_empty() {
             return;
         }
+
         if let Some(prompt) = self.prompt.take() {
             if prompt.wait.is_some() {
                 self.prompt = Some(prompt);
                 self.push_log("[ui] prompt is already waiting — press c to cancel".into());
                 return;
             }
+
             // Still running: abandon it so the new input can run.
             prompt.exec.abort(&mut self.lua);
         }
+
         self.input.clear();
+
         match self.lua.load_named("=prompt", &text) {
             Ok(chunk) => {
                 let exec = self
@@ -389,10 +393,12 @@ impl App {
         let speed = self.speed;
         // Wake anyone whose channel is ready before granting new fuel.
         self.deliver_pending();
+
         for runtime in &mut self.runtimes {
             runtime.advance(&mut self.lua, dt, speed);
         }
         self.advance_prompt();
+
         // A send from this frame can wake a column in the same frame.
         self.deliver_pending();
     }
@@ -401,6 +407,7 @@ impl App {
         for runtime in &mut self.runtimes {
             deliver_if_ready(&mut self.lua, &mut runtime.exec, &mut runtime.wait);
         }
+
         if let Some(prompt) = &mut self.prompt {
             deliver_if_ready(&mut self.lua, &mut prompt.exec, &mut prompt.wait);
         }

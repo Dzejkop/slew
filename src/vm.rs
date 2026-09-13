@@ -483,6 +483,15 @@ fn frame_close_meta(f: &Frame) -> bool {
     matches!(f, Frame::Lua(f) if f.call_meta == Some(("metamethod", "close")))
 }
 
+/// Whether a frame already carries a staged recovery chain: its `__close`
+/// handlers and final error delivery are in flight, so a fresh error folds
+/// into that chain instead of unwinding past it.
+fn frame_staged_recovery(f: &Frame) -> bool {
+    f.pending()
+        .iter()
+        .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
+}
+
 /// Appends PUC's `(metamethod 'name')` suffix to a non-callable metamethod
 /// error message (`attempt to call a number value (metamethod 'close')`).
 fn annotate_metamethod_error(e: &mut VmError, name: &str) {
@@ -2681,15 +2690,18 @@ impl<C> Lua<C> {
                     self.threads[cur.0 as usize] = th;
                     return Ok(RunOutcome::Pending(cur));
                 }
+
                 Ok(DispatchEnd::Waiting(wait)) => {
                     self.threads[cur.0 as usize] = th;
                     return Ok(RunOutcome::Waiting(cur, wait));
                 }
+
                 Ok(DispatchEnd::Switch(next)) => {
                     self.threads[cur.0 as usize] = th;
                     cur = next;
                     th = std::mem::take(&mut self.threads[cur.0 as usize]);
                 }
+
                 Ok(DispatchEnd::Finished(vals)) => {
                     // thread ran to completion
                     th.status = CoStatus::Dead;
@@ -2706,6 +2718,7 @@ impl<C> Lua<C> {
                         }
                     }
                 }
+
                 Err(mut e) => {
                     let mut root_line = None;
                     loop {
@@ -2833,6 +2846,7 @@ impl<C> Lua<C> {
                     }
                 }
                 Ok(Flow::Finished(vals)) => return Ok(DispatchEnd::Finished(vals)),
+
                 Err(mut e) => {
                     // capture the script's own call site before `recover`
                     // pops the frames it unwinds
@@ -2861,11 +2875,7 @@ impl<C> Lua<C> {
         // handler while unwinding. PUC's `luaD_closeprotected` keeps closing
         // instead of unwinding past the chain, passing the newest error object
         // to the remaining handlers and the final delivery. Fold it in.
-        let staged = th.frames.last().is_some_and(|f| {
-            f.pending()
-                .iter()
-                .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
-        });
+        let staged = th.frames.last().is_some_and(frame_staged_recovery);
         if staged {
             self.fold_staged(th, &e, Vec::new());
             return Ok(());
@@ -2940,11 +2950,7 @@ impl<C> Lua<C> {
             // A frame carrying a staged `DeliverError` is a recovery chain in
             // progress: the error came from a `__close` handler while
             // unwinding. Fold it into the chain and keep closing.
-            let staged = th.frames.last().is_some_and(|f| {
-                f.pending()
-                    .iter()
-                    .any(|p| matches!(p, Pending::DeliverError { .. } | Pending::Reraise { .. }))
-            });
+            let staged = th.frames.last().is_some_and(frame_staged_recovery);
             if staged {
                 self.fold_staged(th, &e, to_close);
                 return Ok(());

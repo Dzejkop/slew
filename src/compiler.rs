@@ -583,12 +583,14 @@ impl Compiler<'_> {
         let watermark = self.local_top();
         match s {
             Stmt::Empty => {}
+
             Stmt::Label(name, line) => {
                 // labels are normally handled by stmt_seq (which knows
                 // block-end position); a stray one is not last-in-block
                 let nact = self.funcs.last().unwrap().locals.len();
                 self.define_label(name, *line, false, nact)?;
             }
+
             Stmt::Goto { label, line } => {
                 self.at_line(*line);
                 let fs = self.funcs.last().unwrap();
@@ -613,6 +615,7 @@ impl Compiler<'_> {
                     });
                 }
             }
+
             Stmt::Local {
                 names,
                 values,
@@ -639,6 +642,7 @@ impl Compiler<'_> {
                 self.fs().free_reg = base + names.len() as u8;
                 return Ok(());
             }
+
             Stmt::LocalFunction { name, body } => {
                 self.at_line(body.line);
                 let reg = self.alloc_reg()?;
@@ -646,6 +650,7 @@ impl Compiler<'_> {
                 self.function_to_reg(body, format!("function '{name}'"), reg)?;
                 return Ok(());
             }
+
             Stmt::Function { target, body } => {
                 self.at_line(body.line);
                 let tmp = self.alloc_reg()?;
@@ -653,6 +658,7 @@ impl Compiler<'_> {
                 let t = self.target_of(target)?;
                 self.store(&t, tmp)?;
             }
+
             Stmt::Assign {
                 targets,
                 values,
@@ -674,10 +680,13 @@ impl Compiler<'_> {
                 // value there would over-retain it (e.g. a weak key).
                 self.clear_regs(tmp_start, base);
             }
+
             Stmt::ExprStat(e) => {
                 self.call_like(e, Some(0))?;
             }
+
             Stmt::Do(b) => self.block_scope(b)?,
+
             Stmt::While { cond, body } => {
                 let top = self.here();
                 let r = self.expr_to_any(cond)?;
@@ -698,6 +707,7 @@ impl Compiler<'_> {
                 self.patch_to_here(exit);
                 self.finish_loop();
             }
+
             Stmt::Repeat { body, cond } => {
                 let top = self.here();
                 let floor = self.enter_scope();
@@ -721,6 +731,7 @@ impl Compiler<'_> {
                 self.exit_scope(floor);
                 self.finish_loop();
             }
+
             Stmt::If { arms, else_block } => {
                 let mut end_jumps = Vec::new();
                 for (i, (cond, body)) in arms.iter().enumerate() {
@@ -745,6 +756,7 @@ impl Compiler<'_> {
                     self.patch_to_here(j);
                 }
             }
+
             Stmt::NumericFor {
                 var,
                 start,
@@ -789,6 +801,7 @@ impl Compiler<'_> {
                 self.finish_loop();
                 self.exit_scope(floor);
             }
+
             Stmt::GenericFor {
                 vars,
                 exprs,
@@ -862,6 +875,7 @@ impl Compiler<'_> {
                 self.finish_loop();
                 self.exit_scope(floor);
             }
+
             Stmt::Return { exprs, line } => {
                 self.at_line(*line);
                 // `return f(...)` in a function with no pending to-be-closed
@@ -879,6 +893,7 @@ impl Compiler<'_> {
                     n: enc(count),
                 });
             }
+
             Stmt::Break(line) => {
                 self.at_line(*line);
                 if self.funcs.last().unwrap().loops.is_empty() {
