@@ -187,143 +187,6 @@ impl Ctx {
     }
 }
 
-/// Suspends the caller until `chan` is non-empty. Mutates nothing.
-fn wait_nonempty(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_nonempty", WaitKind::NonEmpty)
-}
-
-/// Suspends the caller until `chan` has room. Mutates nothing.
-fn wait_room(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_room", WaitKind::Room)
-}
-
-fn wait_on(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-    name: &str,
-    make: fn(i64) -> WaitKind,
-) -> Result<NativeOutcome, String> {
-    let chan = int_arg(args, 0, name)?;
-    let state = ctx.context_mut();
-    state.waiting = Some(make(chan));
-    state.waits += 1;
-    Ok(NativeOutcome::Wait(NativeWait(state.waits)))
-}
-
-/// Appends one line to the shared log.
-fn log_message(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
-    let label = ctx.context().label.clone();
-    let log = Rc::clone(&ctx.context().log);
-    let text = args
-        .iter()
-        .map(|v| ctx.display_value(*v))
-        .collect::<Vec<_>>()
-        .join(" ");
-    push_log(&log, format!("[{label}] {text}"));
-    Ok(NativeOutcome::Return(Vec::new()))
-}
-
-fn int_arg(args: &[Value], index: usize, name: &str) -> Result<i64, String> {
-    match args.get(index) {
-        Some(Value::Int(n)) => Ok(*n),
-        Some(Value::Float(f)) if f.fract() == 0.0 => Ok(*f as i64),
-        Some(v) => Err(format!(
-            "bad argument #{} to '{name}' (number expected, got {})",
-            index + 1,
-            v.type_name()
-        )),
-        None => Err(format!(
-            "bad argument #{} to '{name}' (number expected, got no value)",
-            index + 1
-        )),
-    }
-}
-
-fn push_log(log: &Rc<RefCell<Vec<String>>>, line: String) {
-    let mut lines = log.borrow_mut();
-    lines.push(line);
-    if lines.len() > MAX_LOG_LINES {
-        let excess = lines.len() - MAX_LOG_LINES;
-        lines.drain(..excess);
-    }
-}
-
-/// Re-reads `channels[chan]` from Lua and reports whether `kind` is satisfied.
-/// Read-only: the dequeue/enqueue is done by the Lua side once it resumes.
-fn channel_ready(lua: &mut Lua<Ctx>, kind: WaitKind) -> bool {
-    let channels = lua.get_global("channels");
-    if !matches!(channels, Value::Table(_)) {
-        return false;
-    }
-    let entry = lua.table_get(channels, Value::Int(kind.channel()));
-    if !matches!(entry, Value::Table(_)) {
-        return false;
-    }
-    let first = field_int(lua, entry, "first");
-    let last = field_int(lua, entry, "last");
-    let cap = field_int(lua, entry, "cap");
-    let queued = last - first + 1;
-    match kind {
-        WaitKind::NonEmpty(_) => queued > 0,
-        WaitKind::Room(_) => queued < cap,
-    }
-}
-
-fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
-    let key = lua.new_string(name.as_bytes());
-    match lua.table_get(table, key) {
-        Value::Int(n) => n,
-        Value::Float(f) => f as i64,
-        _ => 0,
-    }
-}
-
-/// If `exec` is parked on a satisfied condition, hand it back to Lua.
-fn deliver_if_ready(lua: &mut Lua<Ctx>, exec: &mut Execution<Ctx>, wait: &mut Option<NativeWait>) {
-    let Some(token) = *wait else {
-        return;
-    };
-    let Some(kind) = exec.context().waiting else {
-        return;
-    };
-    if !channel_ready(lua, kind) {
-        return;
-    }
-    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-        *wait = None;
-        exec.context_mut().waiting = None;
-    }
-}
-
-/// Registers the natives and loads the channel prelude.
-fn install(lua: &mut Lua<Ctx>, log: &Rc<RefCell<Vec<String>>>) {
-    lua.register_suspendable_native("log", log_message);
-    lua.register_suspendable_native("__ch_wait_nonempty", wait_nonempty);
-    lua.register_suspendable_native("__ch_wait_room", wait_room);
-
-    let chunk = lua
-        .load_named("=ch", CHANNEL_PRELUDE)
-        .unwrap_or_else(|e| panic!("channel prelude does not compile: {e}"));
-    let mut exec = lua.execute_with_context(&chunk, Ctx::program("ch".into(), Rc::clone(log)));
-    loop {
-        match exec.step(lua, PRELUDE_FUEL) {
-            Ok(Step::Done(_)) => break,
-            Ok(Step::Pending) => {}
-            Ok(Step::Waiting(_)) => panic!("channel prelude must not wait"),
-            Err(e) => panic!("channel prelude failed: {e}"),
-        }
-    }
-}
-
-fn sources_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("slew-tui");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
 struct Runtime {
     id: i64,
     label: String,
@@ -421,13 +284,6 @@ impl Runtime {
             self.line = Some(line);
         }
     }
-}
-
-fn spawn_program(lua: &mut Lua<Ctx>, name: &str, source: &str, ctx: Ctx) -> Execution<Ctx> {
-    let chunk = lua
-        .load_named(name, source)
-        .unwrap_or_else(|e| panic!("{name} does not compile: {e}"));
-    lua.execute_with_context(&chunk, ctx)
 }
 
 /// A prompt invocation. It may block like any other program, so it persists
@@ -642,6 +498,152 @@ impl App {
         runtime.fuel_acc = 0.0;
         self.push_log(format!("[ui] restarted {label}"));
     }
+}
+
+// ---- native functions and helpers ----
+
+/// Suspends the caller until `chan` is non-empty. Mutates nothing.
+fn wait_nonempty(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    wait_on(ctx, args, "__ch_wait_nonempty", WaitKind::NonEmpty)
+}
+
+/// Suspends the caller until `chan` has room. Mutates nothing.
+fn wait_room(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    wait_on(ctx, args, "__ch_wait_room", WaitKind::Room)
+}
+
+fn wait_on(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+    name: &str,
+    make: fn(i64) -> WaitKind,
+) -> Result<NativeOutcome, String> {
+    let chan = int_arg(args, 0, name)?;
+    let state = ctx.context_mut();
+    state.waiting = Some(make(chan));
+    state.waits += 1;
+    Ok(NativeOutcome::Wait(NativeWait(state.waits)))
+}
+
+/// Appends one line to the shared log.
+fn log_message(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    let label = ctx.context().label.clone();
+    let log = Rc::clone(&ctx.context().log);
+    let text = args
+        .iter()
+        .map(|v| ctx.display_value(*v))
+        .collect::<Vec<_>>()
+        .join(" ");
+    push_log(&log, format!("[{label}] {text}"));
+    Ok(NativeOutcome::Return(Vec::new()))
+}
+
+fn int_arg(args: &[Value], index: usize, name: &str) -> Result<i64, String> {
+    match args.get(index) {
+        Some(Value::Int(n)) => Ok(*n),
+        Some(Value::Float(f)) if f.fract() == 0.0 => Ok(*f as i64),
+        Some(v) => Err(format!(
+            "bad argument #{} to '{name}' (number expected, got {})",
+            index + 1,
+            v.type_name()
+        )),
+        None => Err(format!(
+            "bad argument #{} to '{name}' (number expected, got no value)",
+            index + 1
+        )),
+    }
+}
+
+fn push_log(log: &Rc<RefCell<Vec<String>>>, line: String) {
+    let mut lines = log.borrow_mut();
+    lines.push(line);
+    if lines.len() > MAX_LOG_LINES {
+        let excess = lines.len() - MAX_LOG_LINES;
+        lines.drain(..excess);
+    }
+}
+
+/// Re-reads `channels[chan]` from Lua and reports whether `kind` is satisfied.
+/// Read-only: the dequeue/enqueue is done by the Lua side once it resumes.
+fn channel_ready(lua: &mut Lua<Ctx>, kind: WaitKind) -> bool {
+    let channels = lua.get_global("channels");
+    if !matches!(channels, Value::Table(_)) {
+        return false;
+    }
+    let entry = lua.table_get(channels, Value::Int(kind.channel()));
+    if !matches!(entry, Value::Table(_)) {
+        return false;
+    }
+    let first = field_int(lua, entry, "first");
+    let last = field_int(lua, entry, "last");
+    let cap = field_int(lua, entry, "cap");
+    let queued = last - first + 1;
+    match kind {
+        WaitKind::NonEmpty(_) => queued > 0,
+        WaitKind::Room(_) => queued < cap,
+    }
+}
+
+fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
+    let key = lua.new_string(name.as_bytes());
+    match lua.table_get(table, key) {
+        Value::Int(n) => n,
+        Value::Float(f) => f as i64,
+        _ => 0,
+    }
+}
+
+/// If `exec` is parked on a satisfied condition, hand it back to Lua.
+fn deliver_if_ready(lua: &mut Lua<Ctx>, exec: &mut Execution<Ctx>, wait: &mut Option<NativeWait>) {
+    let Some(token) = *wait else {
+        return;
+    };
+    let Some(kind) = exec.context().waiting else {
+        return;
+    };
+    if !channel_ready(lua, kind) {
+        return;
+    }
+    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
+        *wait = None;
+        exec.context_mut().waiting = None;
+    }
+}
+
+/// Registers the natives and loads the channel prelude.
+fn install(lua: &mut Lua<Ctx>, log: &Rc<RefCell<Vec<String>>>) {
+    lua.register_suspendable_native("log", log_message);
+    lua.register_suspendable_native("__ch_wait_nonempty", wait_nonempty);
+    lua.register_suspendable_native("__ch_wait_room", wait_room);
+
+    let chunk = lua
+        .load_named("=ch", CHANNEL_PRELUDE)
+        .unwrap_or_else(|e| panic!("channel prelude does not compile: {e}"));
+    let mut exec = lua.execute_with_context(&chunk, Ctx::program("ch".into(), Rc::clone(log)));
+    loop {
+        match exec.step(lua, PRELUDE_FUEL) {
+            Ok(Step::Done(_)) => break,
+            Ok(Step::Pending) => {}
+            Ok(Step::Waiting(_)) => panic!("channel prelude must not wait"),
+            Err(e) => panic!("channel prelude failed: {e}"),
+        }
+    }
+}
+
+fn sources_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("slew-tui");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn spawn_program(lua: &mut Lua<Ctx>, name: &str, source: &str, ctx: Ctx) -> Execution<Ctx> {
+    let chunk = lua
+        .load_named(name, source)
+        .unwrap_or_else(|e| panic!("{name} does not compile: {e}"));
+    lua.execute_with_context(&chunk, ctx)
 }
 
 fn ui(frame: &mut Frame, app: &App) {
