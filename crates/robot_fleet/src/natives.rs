@@ -1,14 +1,13 @@
 //! Host natives exposed to robot Lua: world actions, channels, lifecycle.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use slew::{Lua, NativeContext, NativeOutcome, NativeWait, Value};
+use slew::{Lua, NativeContext, NativeOutcome, Value};
 
 use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS};
-use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitReason, World};
+use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitKind};
 
 fn int_arg(
     _ctx: &NativeContext<'_, Ctx>,
@@ -254,33 +253,23 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
-/// Mints a token unique across the world, and therefore across any execution.
-fn mint_token(world: &Rc<RefCell<World>>) -> NativeWait {
-    let mut w = world.borrow_mut();
-    w.next_token += 1;
-    NativeWait(w.next_token)
-}
-
-/// Records a parked wait against the execution so the host can complete it
-/// once `reason` holds.
-fn park(ctx: &mut NativeContext<'_, Ctx>, reason: WaitReason, token: NativeWait) -> NativeOutcome {
-    ctx.context_mut().waiting.push((token, reason));
-    NativeOutcome::Wait(token)
-}
-
 /// Suspends until the robot's current job finishes (immediately if idle).
+///
+/// Parks the calling coroutine; the wait's kind is carried by the token, so
+/// the host can complete it even if another execution adopts the coroutine.
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
     if world.borrow().robots[rid].job.is_none() {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    let token = mint_token(&world);
-    Ok(park(ctx, WaitReason::ActionDone, token))
+    Ok(NativeOutcome::Wait(WaitKind::ActionDone.token()))
 }
 
-/// Suspends until channel `chan` has a message (immediately if it already
-/// does, or if the robot lacks a grant for it).
+/// Suspends until channel `chan` has a message. Parks the calling coroutine
+/// when the channel is empty; if it already has a message, or the robot lacks
+/// a grant for it, returns immediately (the caller's `try_recv` reports the
+/// grant).
 fn native_wait_nonempty(
     ctx: &mut NativeContext<'_, Ctx>,
     args: &[Value],
@@ -288,26 +277,24 @@ fn native_wait_nonempty(
     let chan = int_arg(ctx, args, 0, "wait_nonempty")?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (allowed, empty) = {
+    let (granted, empty) = {
         let w = world.borrow();
-        if w.grants[rid].contains(&chan) {
-            (
-                true,
-                w.channels.get(&chan).is_none_or(|c| c.items.is_empty()),
-            )
-        } else {
-            (false, false)
-        }
+        let granted = w.grants[rid].contains(&chan);
+        (
+            granted,
+            granted && w.channels.get(&chan).is_none_or(|c| c.items.is_empty()),
+        )
     };
-    if !allowed || !empty {
+    if !granted || !empty {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    let token = mint_token(&world);
-    Ok(park(ctx, WaitReason::ChannelNonEmpty(chan), token))
+    Ok(NativeOutcome::Wait(WaitKind::ChannelNonEmpty(chan).token()))
 }
 
-/// Suspends until channel `chan` has room for another message (immediately if
-/// it already does, or if the robot lacks a grant for it).
+/// Suspends until channel `chan` has room for another message. Parks the
+/// calling coroutine when the channel is full; if it already has room, or the
+/// robot lacks a grant for it, returns immediately (the caller's `try_send`
+/// reports the grant).
 fn native_wait_room(
     ctx: &mut NativeContext<'_, Ctx>,
     args: &[Value],
@@ -315,24 +302,21 @@ fn native_wait_room(
     let chan = int_arg(ctx, args, 0, "wait_room")?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (allowed, full) = {
+    let (granted, full) = {
         let w = world.borrow();
-        if w.grants[rid].contains(&chan) {
-            (
-                true,
-                w.channels
+        let granted = w.grants[rid].contains(&chan);
+        (
+            granted,
+            granted
+                && w.channels
                     .get(&chan)
                     .is_some_and(|c| c.items.len() >= c.cap),
-            )
-        } else {
-            (false, false)
-        }
+        )
     };
-    if !allowed || !full {
+    if !granted || !full {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    let token = mint_token(&world);
-    Ok(park(ctx, WaitReason::ChannelRoom(chan), token))
+    Ok(NativeOutcome::Wait(WaitKind::ChannelRoom(chan).token()))
 }
 
 /// Requests that the host shut this robot down after the current step.

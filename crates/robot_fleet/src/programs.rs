@@ -41,6 +41,9 @@ function sched.yield() coroutine.yield() end
 function sched.sleep(n) for _ = 1, n do coroutine.yield() end end
 function sched.await(pred) while not pred() do coroutine.yield() end end
 
+-- `try_recv`/`try_send` return `nil, "denied"|"empty"|"full"`; only `empty` and
+-- `full` are worth parking on (via the suspendable `wait_nonempty`/`wait_room`
+-- natives), any other reason is returned to the caller.
 function sched.recv(chan)
   while true do
     local m, err = ch.try_recv(chan)

@@ -133,11 +133,7 @@ pub(crate) fn boot_robot(
     lua.set_file_reader(make_reader(dir));
     install_natives(&mut lua);
 
-    let ctx = Ctx {
-        robot: id,
-        world,
-        waiting: Vec::new(),
-    };
+    let ctx = Ctx { robot: id, world };
     let prelude = lua
         .load_named("=prelude", PRELUDE)
         .map_err(BootError::Script)?;
