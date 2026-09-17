@@ -264,7 +264,7 @@ fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     if !busy {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    ctx.context_mut().wait = Some(WaitReason::ActionDone);
+    ctx.context_mut().wait_reason = Some(WaitReason::ActionDone);
     Ok(NativeOutcome::Wait(NativeWait(token)))
 }
 

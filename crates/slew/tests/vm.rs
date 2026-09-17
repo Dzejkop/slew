@@ -829,6 +829,9 @@ struct RobotContext {
     moves: Vec<(u32, String)>,
 }
 
+/// Test native that records a move and parks. It mints its token from the robot
+/// id so tests can name the wait as `NativeWait(robot)`; calls from one robot
+/// therefore share a token (see `duplicate_wait_tokens_complete_together`).
 fn move_robot(
     ctx: &mut NativeContext<'_, RobotContext>,
     args: &[Value],
@@ -877,14 +880,18 @@ fn suspendable_native_waits_for_host_completion() {
 }
 
 #[test]
-fn suspendable_native_resumes_inside_coroutine() {
+fn suspendable_native_parks_coroutine_without_blocking_execution() {
     let mut runtime = slew::Lua::<RobotContext>::new();
     runtime.register_suspendable_native("move", move_robot);
+    // The root resumes the coroutine (which parks on the native wait), then a
+    // second coroutine runs to completion while the first is still parked.
     let chunk = runtime
         .load(
-            "local co = coroutine.create(function() return move('south') end)\n\
-             local ok, moved = coroutine.resume(co)\n\
-             return ok, moved, coroutine.status(co)",
+            "local a = coroutine.create(function() move('south') end)\n\
+             local b = coroutine.create(function() b_ran = true; coroutine.yield() end)\n\
+             local ok, moved = coroutine.resume(a)\n\
+             coroutine.resume(b)\n\
+             return ok, moved, b_ran, coroutine.status(a)",
         )
         .unwrap();
     let mut exec = runtime.execute_with_context(
@@ -895,18 +902,341 @@ fn suspendable_native_resumes_inside_coroutine() {
         },
     );
 
-    assert_eq!(
-        exec.step(&mut runtime, 100_000).unwrap(),
-        Step::Waiting(NativeWait(11))
-    );
-    exec.complete_native(&mut runtime, NativeWait(11), Ok(vec![Value::Bool(true)]))
-        .unwrap();
+    // The whole execution must NOT block: `a` parks, `b` runs, root returns.
     let Step::Done(values) = exec.step(&mut runtime, 100_000).unwrap() else {
-        panic!("execution should complete")
+        panic!("coroutine wait must not block the execution");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume returns ok");
+    assert_eq!(values[1], Value::Nil, "a parking resume yields no values");
+    assert_eq!(values[2], Value::Bool(true), "b ran while a was parked");
+    assert_eq!(runtime.display_value(values[3]), "suspended");
+    assert_eq!(exec.context().moves, vec![(11, "south".into())]);
+}
+
+#[test]
+fn coroutine_wait_is_completable_and_resumes_past_native() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function() done = move('east') end)\n\
+             local n = 0\n\
+             while not done do\n\
+               coroutine.resume(co)\n\
+               n = n + 1\n\
+             end\n\
+             return n",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 5,
+            moves: Vec::new(),
+        },
+    );
+
+    // The driver loop spins, re-parking the coroutine each resume. The step
+    // runs out of fuel (Pending), never blocking the execution.
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(5)]);
+    // The native ran exactly once; re-resumes do not re-invoke it.
+    assert_eq!(exec.context().moves, vec![(5, "east".into())]);
+
+    exec.complete_native(&mut lua, NativeWait(5), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("completion should let the coroutine finish");
+    };
+    let Value::Int(n) = values[0] else { panic!() };
+    assert!(n > 0, "driver loop eventually saw the coroutine finish");
+}
+
+#[test]
+fn complete_native_rejects_unknown_and_already_completed_tokens() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua.load("return move('north')").unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 3,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(
+        exec.step(&mut lua, 100_000).unwrap(),
+        Step::Waiting(NativeWait(3))
+    );
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(3)]);
+    let err = exec
+        .complete_native(&mut lua, NativeWait(99), Ok(vec![]))
+        .unwrap_err();
+    assert_eq!(err, "execution is not waiting for this native call");
+    exec.complete_native(&mut lua, NativeWait(3), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let err = exec
+        .complete_native(&mut lua, NativeWait(3), Ok(vec![]))
+        .unwrap_err();
+    assert_eq!(err, "native call was already completed");
+}
+
+#[test]
+fn wait_during_staged_yield_hook_blocks_execution() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // A return hook fires while `coroutine.yield` is staged through its hook
+    // steps. A wait there must not park the coroutine (that would interleave
+    // with the deferred yield); it blocks the execution instead.
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function() coroutine.yield(11); return 22 end)\n\
+             debug.sethook(co, function() move('h') end, 'r')\n\
+             coroutine.resume(co)\n\
+             return coroutine.status(co)",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 9,
+            moves: Vec::new(),
+        },
+    );
+    assert!(
+        matches!(
+            exec.step(&mut lua, 100_000).unwrap(),
+            Step::Waiting(NativeWait(9))
+        ),
+        "a wait during a staged yield must block the execution"
+    );
+}
+
+#[test]
+fn wait_inside_create_pcall_is_completable() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // `coroutine.create(pcall)` runs the protected call on the coroutine's
+    // stack from inside the resumer's dispatch; the wait must still be tracked
+    // against (and completable by) the resuming execution.
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(pcall)\n\
+             local ok, moved\n\
+             while coroutine.status(co) ~= 'dead' do\n\
+               ok, moved = coroutine.resume(co, move, 'south')\n\
+             end\n\
+             return ok, moved",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 12,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(12)]);
+    exec.complete_native(&mut lua, NativeWait(12), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("create(pcall) wait should complete");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume succeeded");
+    assert_eq!(values[1], Value::Bool(true), "pcall returned move's result");
+}
+
+#[test]
+fn duplicate_wait_tokens_complete_together() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // The test native derives its token from the robot id, so both coroutines
+    // (same execution) park under NativeWait(7).
+    let chunk = lua
+        .load(
+            "local a = coroutine.create(function() a_done = move('south') end)\n\
+             local b = coroutine.create(function() b_done = move('north') end)\n\
+             coroutine.resume(a)\n\
+             coroutine.resume(b)\n\
+             while not (a_done and b_done) do\n\
+               coroutine.resume(a)\n\
+               coroutine.resume(b)\n\
+             end\n\
+             return a_done, b_done",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(7)]);
+    assert_eq!(exec.context().moves.len(), 2);
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("both coroutines should finish");
+    };
+    assert_eq!(values, vec![Value::Bool(true), Value::Bool(true)]);
+}
+
+#[test]
+fn coroutine_native_error_is_caught_by_inner_pcall() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function() return pcall(move, 'south') end)\n\
+             local ok, pc, msg\n\
+             while coroutine.status(co) ~= 'dead' do\n\
+               ok, pc, msg = coroutine.resume(co)\n\
+             end\n\
+             return ok, pc, msg",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 8,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(8)]);
+    exec.complete_native(&mut lua, NativeWait(8), Err("boom".into()))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("completion error should be caught inside the coroutine");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume itself succeeded");
+    assert_eq!(values[1], Value::Bool(false), "pcall caught the error");
+    assert_eq!(lua.display_value(values[2]), "boom");
+}
+
+#[test]
+fn parked_coroutine_can_be_adopted_by_another_execution() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // First execution parks `saved` (a global) and finishes, dropping its
+    // execution-scoped tracking.
+    let first = lua
+        .load(
+            "saved = coroutine.create(function() return move('east') end)\n\
+             return coroutine.resume(saved)",
+        )
+        .unwrap();
+    let mut e1 = lua.execute_with_context(
+        &first,
+        RobotContext {
+            robot: 1,
+            moves: Vec::new(),
+        },
+    );
+    assert!(matches!(e1.step(&mut lua, 100_000).unwrap(), Step::Done(_)));
+    assert!(
+        e1.pending_waits(&lua).is_empty(),
+        "a finished execution reports no outstanding waits"
+    );
+
+    // A second execution resumes the still-parked coroutine; the wait must be
+    // adopted by the resuming execution and be completable there.
+    let second = lua
+        .load("while true do coroutine.resume(saved) end")
+        .unwrap();
+    let mut e2 = lua.execute_with_context(
+        &second,
+        RobotContext {
+            robot: 2,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(e2.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(e2.pending_waits(&lua), vec![NativeWait(1)]);
+    e2.complete_native(&mut lua, NativeWait(1), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    assert!(
+        e2.pending_waits(&lua).is_empty(),
+        "completed wait is not pending"
+    );
+    let _ = e2.step(&mut lua, 100_000).unwrap();
+}
+
+#[test]
+fn parked_coroutine_survives_gc_and_completes() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function() done = move('west') end)\n\
+             local n = 0\n\
+             while not done do\n\
+               coroutine.resume(co)\n\
+               n = n + 1\n\
+               if n == 3 then collectgarbage('collect') end\n\
+             end\n\
+             return done",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 6,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    exec.complete_native(&mut lua, NativeWait(6), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("parked coroutine should survive collection and finish");
     };
     assert_eq!(values[0], Value::Bool(true));
-    assert_eq!(values[1], Value::Bool(true));
-    assert_eq!(runtime.display_value(values[2]), "dead");
+}
+
+#[test]
+fn wait_inside_non_yieldable_boundary_blocks_execution() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // `table.sort`'s comparator runs behind a non-yieldable C boundary, so a
+    // wait there cannot park just its coroutine: the execution blocks instead.
+    let chunk = lua
+        .load(
+            "local t = { 3, 1, 2 }\n\
+             local co = coroutine.create(function()\n\
+               table.sort(t, function(a, b) move('east') return a < b end)\n\
+             end)\n\
+             coroutine.resume(co)\n\
+             return 'after'",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 4,
+            moves: Vec::new(),
+        },
+    );
+    let mut waits = 0;
+    loop {
+        match exec.step(&mut lua, 100_000).unwrap() {
+            Step::Waiting(NativeWait(4)) => {
+                exec.complete_native(&mut lua, NativeWait(4), Ok(vec![Value::Bool(true)]))
+                    .unwrap();
+                waits += 1;
+            }
+            Step::Waiting(other) => panic!("unexpected wait {other:?}"),
+            Step::Done(values) => {
+                assert_eq!(lua.display_value(values[0]), "after");
+                break;
+            }
+            Step::Pending => panic!("execution should not run out of fuel"),
+        }
+    }
+    assert!(waits >= 1, "the comparator's wait blocked the execution");
 }
 
 #[test]

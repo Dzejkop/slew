@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use slew::{Lua, Step, Value};
 
-use crate::app::{App, boot_or_error};
-use crate::config::{MOVE_TICKS, ROBOTS};
+use crate::app::{App, boot_or_error, deliver_one};
+use crate::config::{MINE_TICKS, MOVE_TICKS, ROBOTS};
 use crate::natives::install_natives;
 use crate::programs::{DEFAULT_NAV, PRELUDE, default_program_for};
 use crate::runtime::{boot_robot, run_to_completion, sources_dir};
@@ -19,7 +19,7 @@ fn test_env(id: usize) -> (Lua<Ctx>, Rc<RefCell<World>>) {
     let ctx = Ctx {
         robot: id,
         world: Rc::clone(&world),
-        wait: None,
+        wait_reason: None,
     };
     let prelude = lua.load_named("=prelude", PRELUDE).unwrap();
     let mut pe = lua.execute_with_context(&prelude, ctx);
@@ -32,7 +32,7 @@ fn run_src(lua: &mut Lua<Ctx>, world: &Rc<RefCell<World>>, id: usize, src: &str)
     let ctx = Ctx {
         robot: id,
         world: Rc::clone(world),
-        wait: None,
+        wait_reason: None,
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
     loop {
@@ -131,7 +131,7 @@ fn blocked_coroutine_does_not_stall_others() {
     let ctx = Ctx {
         robot: 0,
         world: Rc::clone(&world),
-        wait: None,
+        wait_reason: None,
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
     for _ in 0..200 {
@@ -148,6 +148,50 @@ fn blocked_coroutine_does_not_stall_others() {
     }
     let log = world.borrow().log.borrow().join("\n");
     assert!(log.contains("tick 5"), "log was:\n{log}");
+}
+
+#[test]
+fn coroutine_wait_is_completed_by_the_host() {
+    let (mut lua, world) = test_env(0);
+    // An in-flight job makes `robot.wait()` park the calling coroutine.
+    world.borrow_mut().robots[0].job = Some(Job {
+        kind: JobKind::Mine,
+        remaining: MINE_TICKS,
+    });
+    let chunk = lua
+        .load_named(
+            "=t",
+            r"
+                sched.spawn(function() robot.wait(); done = true end)
+                sched.loop()
+                ",
+        )
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+        wait_reason: None,
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+
+    // The coroutine wait parks without blocking the execution, so it never
+    // surfaces as `Step::Waiting`; it is discovered via `pending_waits`.
+    assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
+    assert!(!exec.pending_waits(&lua).is_empty());
+
+    // Once the job finishes, the host driver must complete the coroutine wait.
+    world.borrow_mut().robots[0].job = None;
+    let mut root_wait = None;
+    deliver_one(&mut exec, &mut root_wait, &mut lua, &world);
+
+    loop {
+        match exec.step(&mut lua, 100_000).unwrap() {
+            Step::Done(_) => break,
+            Step::Pending => {}
+            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
+        }
+    }
+    assert_eq!(lua.get_global("done"), Value::Bool(true));
 }
 
 /// Force the default programs into place so App tests are hermetic.

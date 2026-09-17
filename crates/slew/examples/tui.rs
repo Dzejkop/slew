@@ -164,11 +164,12 @@ impl WaitKind {
 }
 
 /// Per-execution context. Channels themselves live in Lua; this only carries
-/// the log handle and the current wait.
+/// the log handle and the waits currently parked in this execution, keyed by
+/// their token so each can be completed only once its own condition holds.
 struct Ctx {
     label: String,
     log: Rc<RefCell<Vec<String>>>,
-    waiting: Option<WaitKind>,
+    waiting: Vec<(NativeWait, WaitKind)>,
     waits: u64,
 }
 
@@ -177,7 +178,7 @@ impl Ctx {
         Self {
             label,
             log,
-            waiting: None,
+            waiting: Vec::new(),
             waits: 0,
         }
     }
@@ -197,7 +198,9 @@ struct Runtime {
     rate: f64,
     /// Fractional fuel carried between frames.
     fuel_acc: f64,
-    /// Set while the execution is suspended on a `__ch_wait_*` native.
+    /// The root thread's wait token while the execution is blocked on a
+    /// `__ch_wait_*` native, as reported by `Step::Waiting`. A coroutine wait
+    /// leaves this `None`; those live in `Ctx::waiting` instead.
     wait: Option<NativeWait>,
     line: Option<u32>,
     finished: bool,
@@ -241,10 +244,11 @@ impl Runtime {
         if self.finished {
             return "done".into();
         }
-        match self.exec.context().waiting {
-            Some(WaitKind::NonEmpty(c)) => return format!("waiting on ch {c}"),
-            Some(WaitKind::Room(c)) => return format!("waiting for room on ch {c}"),
-            None => {}
+        if let Some((_, kind)) = self.exec.context().waiting.first() {
+            return match kind {
+                WaitKind::NonEmpty(c) => format!("waiting on ch {c}"),
+                WaitKind::Room(c) => format!("waiting for room on ch {c}"),
+            };
         }
         self.line
             .map_or_else(|| "…".into(), |l| format!("line {l}"))
@@ -530,9 +534,10 @@ fn wait_on(
 ) -> Result<NativeOutcome, String> {
     let chan = int_arg(args, 0, name)?;
     let state = ctx.context_mut();
-    state.waiting = Some(make(chan));
     state.waits += 1;
-    Ok(NativeOutcome::Wait(NativeWait(state.waits)))
+    let token = NativeWait(state.waits);
+    state.waiting.push((token, make(chan)));
+    Ok(NativeOutcome::Wait(token))
 }
 
 /// Appends one line to the shared log.
@@ -603,21 +608,37 @@ fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
     }
 }
 
-/// If `exec` is parked on a satisfied condition, hand it back to Lua.
-fn deliver_if_ready(lua: &mut Lua<Ctx>, exec: &mut Execution<Ctx>, wait: &mut Option<NativeWait>) {
-    let Some(token) = *wait else {
-        return;
-    };
-    let Some(kind) = exec.context().waiting else {
-        return;
-    };
-    if !channel_ready(lua, kind) {
+/// If `exec` has parked native calls whose own conditions are satisfied, hand
+/// them back to Lua. A wait on the root thread surfaces as `Step::Waiting` and
+/// is tracked in `root_wait`; a coroutine wait parks only that coroutine and
+/// never surfaces, so every wait (parking or blocking) is recorded in
+/// `Ctx::waiting` at call time and delivered from there.
+fn deliver_if_ready(
+    lua: &mut Lua<Ctx>,
+    exec: &mut Execution<Ctx>,
+    root_wait: &mut Option<NativeWait>,
+) {
+    if exec.is_finished() {
         return;
     }
-    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-        *wait = None;
-        exec.context_mut().waiting = None;
+    // Snapshot: `complete_native` needs `&mut exec`, so the list is cloned and
+    // stale/delivered entries are pruned in the one `retain` below.
+    let live = exec.pending_waits(lua);
+    let mut delivered = Vec::new();
+    for (token, kind) in exec.context().waiting.clone() {
+        if !live.contains(&token) || !channel_ready(lua, kind) {
+            continue;
+        }
+        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
+            if *root_wait == Some(token) {
+                *root_wait = None;
+            }
+            delivered.push(token);
+        }
     }
+    exec.context_mut()
+        .waiting
+        .retain(|(t, _)| live.contains(t) && !delivered.contains(t));
 }
 
 /// Registers the natives and loads the channel prelude.
@@ -1028,6 +1049,83 @@ mod tests {
             Ok(Step::Done(vals)) => assert_eq!(vals[0], Value::Int(99)),
             other => panic!("waiter should resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn coroutine_recv_parks_without_blocking_the_execution() {
+        let mut h = Harness::new();
+        // The recv runs in a coroutine driven by a scheduler loop, so its wait
+        // parks only the coroutine: the execution stays `Pending`, never
+        // `Waiting`; the host delivers it from the `Ctx::waiting` list.
+        let mut exec = h.spawn(
+            "local co = coroutine.create(function() got = ch.recv(7) end)\n\
+             while got == nil do coroutine.resume(co) end\n\
+             return got",
+        );
+        let mut wait = None;
+        let step = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
+        assert!(matches!(step, Step::Pending), "got {step:?}");
+        assert!(!exec.pending_waits(&h.lua).is_empty());
+
+        h.run("ch.send(7, 42)");
+        for _ in 0..64 {
+            deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+            match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
+                Step::Done(vals) => {
+                    assert_eq!(vals[0], Value::Int(42));
+                    return;
+                }
+                Step::Pending => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("coroutine recv never completed");
+    }
+
+    #[test]
+    fn coroutine_waits_are_delivered_per_channel() {
+        let mut h = Harness::new();
+        // Two coroutines in one execution wait on different channels; only the
+        // one whose channel becomes ready may be released.
+        let mut exec = h.spawn(
+            "local a = coroutine.create(function() got_a = ch.recv(11) end)\n\
+             local b = coroutine.create(function() got_b = ch.recv(12) end)\n\
+             while got_a == nil or got_b == nil do\n\
+               coroutine.resume(a)\n\
+               coroutine.resume(b)\n\
+             end\n\
+             return got_a, got_b",
+        );
+        let mut wait = None;
+        assert!(matches!(
+            exec.step(&mut h.lua, PROMPT_FUEL).unwrap(),
+            Step::Pending
+        ));
+        assert_eq!(exec.pending_waits(&h.lua).len(), 2);
+
+        h.run("ch.send(11, 'a')");
+        deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+        let _ = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
+        assert_eq!(
+            exec.pending_waits(&h.lua).len(),
+            1,
+            "only the ready channel's wait may be released"
+        );
+
+        h.run("ch.send(12, 'b')");
+        for _ in 0..64 {
+            deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+            match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
+                Step::Done(vals) => {
+                    assert_eq!(h.text(vals[0]), "a");
+                    assert_eq!(h.text(vals[1]), "b");
+                    return;
+                }
+                Step::Pending => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("coroutine waits never completed");
     }
 
     #[test]
