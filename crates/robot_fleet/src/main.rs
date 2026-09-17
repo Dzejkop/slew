@@ -50,7 +50,7 @@ enum Action {
 
 fn main() -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
-        eprintln!("robot_fleet example: needs an interactive terminal");
+        eprintln!("robot_fleet: needs an interactive terminal");
         return Ok(());
     }
 

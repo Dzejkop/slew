@@ -26,6 +26,20 @@ pub(crate) struct Robot {
 }
 
 impl Robot {
+    /// A robot with no runtime attached, used for a failed boot and as the
+    /// base for a freshly created robot.
+    pub(crate) fn blank(dir: PathBuf) -> Self {
+        Robot {
+            dir,
+            lua: None,
+            program: None,
+            program_wait: None,
+            prompt: None,
+            error: None,
+            line: None,
+        }
+    }
+
     pub(crate) fn status(&self) -> &'static str {
         if self.lua.is_none() {
             "off"

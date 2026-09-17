@@ -45,9 +45,29 @@ fn str_arg(
     }
 }
 
+/// `false, reason` — the shape every gated robot action returns when it cannot
+/// proceed.
+fn refuse(ctx: &mut NativeContext<'_, Ctx>, reason: &[u8]) -> NativeOutcome {
+    let s = ctx.new_string(reason);
+    NativeOutcome::Return(vec![Value::Bool(false), s])
+}
+
+/// Turns the robot using `turn`, returning nothing (like `robot.face`).
+fn rotate(
+    ctx: &mut NativeContext<'_, Ctx>,
+    turn: fn(Facing) -> Facing,
+) -> Result<NativeOutcome, String> {
+    let rid = ctx.context().robot;
+    let world = Rc::clone(&ctx.context().world);
+    let f = turn(world.borrow().robots[rid].facing);
+    world.borrow_mut().robots[rid].facing = f;
+    Ok(NativeOutcome::Return(Vec::new()))
+}
+
 fn value_to_msg(ctx: &NativeContext<'_, Ctx>, v: Value) -> Option<Msg> {
+    // `nil` is deliberately not a message: `sched.recv` treats `nil` as "nothing
+    // arrived", so a nil message could never be delivered.
     match v {
-        Value::Nil => Some(Msg::Nil),
         Value::Bool(b) => Some(Msg::Bool(b)),
         Value::Int(i) => Some(Msg::Int(i)),
         Value::Float(f) => Some(Msg::Float(f)),
@@ -58,7 +78,6 @@ fn value_to_msg(ctx: &NativeContext<'_, Ctx>, v: Value) -> Option<Msg> {
 
 fn msg_to_value(ctx: &mut NativeContext<'_, Ctx>, m: &Msg) -> Value {
     match m {
-        Msg::Nil => Value::Nil,
         Msg::Bool(b) => Value::Bool(*b),
         Msg::Int(i) => Value::Int(*i),
         Msg::Float(f) => Value::Float(*f),
@@ -92,22 +111,18 @@ fn begin_move(ctx: &mut NativeContext<'_, Ctx>, dx: i32, dy: i32) -> Result<Nati
     let world = Rc::clone(&ctx.context().world);
     let mut w = world.borrow_mut();
     if w.robots[rid].job.is_some() {
-        let s = ctx.new_string(b"busy");
-        return Ok(NativeOutcome::Return(vec![Value::Bool(false), s]));
+        return Ok(refuse(ctx, b"busy"));
     }
     let (x, y) = (w.robots[rid].x, w.robots[rid].y);
     let (nx, ny) = (x + dx, y + dy);
     if nx <= 0 || ny <= 0 || nx >= w.w - 1 || ny >= w.h - 1 {
-        let s = ctx.new_string(b"edge");
-        return Ok(NativeOutcome::Return(vec![Value::Bool(false), s]));
+        return Ok(refuse(ctx, b"edge"));
     }
     if w.at(nx, ny) == Some(Cell::Wall) {
-        let s = ctx.new_string(b"wall");
-        return Ok(NativeOutcome::Return(vec![Value::Bool(false), s]));
+        return Ok(refuse(ctx, b"wall"));
     }
     if w.occupied_by_other(rid, nx, ny) {
-        let s = ctx.new_string(b"occupied");
-        return Ok(NativeOutcome::Return(vec![Value::Bool(false), s]));
+        return Ok(refuse(ctx, b"occupied"));
     }
     w.robots[rid].job = Some(Job {
         kind: JobKind::Move(nx, ny),
@@ -132,22 +147,14 @@ fn native_back(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
 }
 
 fn native_left(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
-    let rid = ctx.context().robot;
-    let world = Rc::clone(&ctx.context().world);
-    let f = world.borrow().robots[rid].facing.left();
-    world.borrow_mut().robots[rid].facing = f;
-    Ok(NativeOutcome::Return(Vec::new()))
+    rotate(ctx, Facing::left)
 }
 
 fn native_right(
     ctx: &mut NativeContext<'_, Ctx>,
     _args: &[Value],
 ) -> Result<NativeOutcome, String> {
-    let rid = ctx.context().robot;
-    let world = Rc::clone(&ctx.context().world);
-    let f = world.borrow().robots[rid].facing.right();
-    world.borrow_mut().robots[rid].facing = f;
-    Ok(NativeOutcome::Return(Vec::new()))
+    rotate(ctx, Facing::right)
 }
 
 fn native_mine(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
@@ -155,8 +162,7 @@ fn native_mine(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     let world = Rc::clone(&ctx.context().world);
     let mut w = world.borrow_mut();
     if w.robots[rid].job.is_some() {
-        let s = ctx.new_string(b"busy");
-        return Ok(NativeOutcome::Return(vec![Value::Bool(false), s]));
+        return Ok(refuse(ctx, b"busy"));
     }
     let (x, y) = (w.robots[rid].x, w.robots[rid].y);
     match w.cells[(y * w.w + x) as usize] {
@@ -167,10 +173,7 @@ fn native_mine(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
             });
             Ok(NativeOutcome::Return(vec![Value::Bool(true)]))
         }
-        _ => {
-            let s = ctx.new_string(b"no ore");
-            Ok(NativeOutcome::Return(vec![Value::Bool(false), s]))
-        }
+        _ => Ok(refuse(ctx, b"no ore")),
     }
 }
 
@@ -320,7 +323,7 @@ fn native_try_send(
         return Err("bad argument #2 to 'try_send' (value expected)".into());
     };
     let msg = value_to_msg(ctx, *value).ok_or_else(|| {
-        "bad argument #2 to 'try_send' (message must be nil/bool/number/string)".to_string()
+        "bad argument #2 to 'try_send' (message must be bool/number/string)".to_string()
     })?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);

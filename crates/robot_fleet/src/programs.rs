@@ -185,6 +185,12 @@ local function explorer()
     sched.await(function() return not robot.busy() end)
     sense()
     steps = steps + 1
+    if steps % 30 == 0 then
+      log('mental map after ' .. steps .. ' steps:')
+      for _, row in ipairs(render_lines()) do
+        log('  ' .. row)
+      end
+    end
   end
 end
 

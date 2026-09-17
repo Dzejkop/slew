@@ -102,7 +102,6 @@ pub(crate) struct RobotState {
 /// are converted to this scalar representation at the native boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Msg {
-    Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
