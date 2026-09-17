@@ -1301,7 +1301,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "robot_fleet"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "color-eyre",
  "ratatui",
@@ -1463,7 +1463,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slew"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "color-eyre",
  "ratatui",
