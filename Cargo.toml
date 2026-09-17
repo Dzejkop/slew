@@ -17,6 +17,9 @@ slew = { path = "crates/slew", default-features = false }
 ratatui = "0.30.2"
 reedline = "0.48.0"
 test-case = "3.3.1"
+thiserror = "2"
+strum = { version = "0.27", features = ["derive"] }
+color-eyre = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -45,7 +48,8 @@ too_many_lines = "allow"
 many_single_char_names = "allow"
 similar_names = "allow"
 
-# `LuaConfig`-style types carry independent boolean switches, which is exactly
+# Flag-heavy types such as `stdlib::string::Flags` carry independent boolean
+# switches, which is exactly
 # what this lint flags but reads better than a bitfield here.
 struct_excessive_bools = "allow"
 

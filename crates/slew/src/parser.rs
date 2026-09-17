@@ -2,18 +2,12 @@
 
 use crate::ast::{Attrib, BinOp, Block, Expr, FuncBody, Stmt, UnOp};
 use crate::lexer::{LexError, Lexer, Token};
-use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("parse error at line {line}: {message}")]
 pub struct ParseError {
     pub message: String,
     pub line: u32,
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "parse error at line {}: {}", self.line, self.message)
-    }
 }
 
 impl From<LexError> for ParseError {
@@ -90,6 +84,16 @@ fn token_binop(tok: &Token) -> Option<BinOp> {
         Token::Tilde => BinOp::BXor,
         Token::Shl => BinOp::Shl,
         Token::Shr => BinOp::Shr,
+        _ => return None,
+    })
+}
+
+fn token_unop(tok: &Token) -> Option<UnOp> {
+    Some(match tok {
+        Token::Not => UnOp::Not,
+        Token::Minus => UnOp::Neg,
+        Token::Hash => UnOp::Len,
+        Token::Tilde => UnOp::BNot,
         _ => return None,
     })
 }
@@ -316,23 +320,18 @@ impl<'a> Parser<'a> {
         let mut target = Expr::Name(self.expect_name()?, line);
         let mut is_method = false;
         loop {
-            if self.check(&Token::Dot)? {
-                let key = self.expect_name()?;
-                target = Expr::Index {
-                    obj: Box::new(target),
-                    key: Box::new(Expr::Str(key.as_bytes().into())),
-                    line,
-                };
-            } else if self.check(&Token::Colon)? {
-                let key = self.expect_name()?;
-                target = Expr::Index {
-                    obj: Box::new(target),
-                    key: Box::new(Expr::Str(key.as_bytes().into())),
-                    line,
-                };
+            if self.check(&Token::Colon)? {
                 is_method = true;
+            } else if !self.check(&Token::Dot)? {
                 break;
-            } else {
+            }
+            let key = self.expect_name()?;
+            target = Expr::Index {
+                obj: Box::new(target),
+                key: Box::new(Expr::Str(key.as_bytes().into())),
+                line,
+            };
+            if is_method {
                 break;
             }
         }
@@ -459,44 +458,16 @@ impl<'a> Parser<'a> {
     /// Precedence climbing.
     fn sub_expr(&mut self, limit: u8) -> Result<Expr, ParseError> {
         let line = self.line;
-        let mut lhs = match &self.tok {
-            Token::Not => {
-                self.advance()?;
-                let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp {
-                    op: UnOp::Not,
-                    operand: Box::new(operand),
-                    line,
-                }
+        let mut lhs = if let Some(op) = token_unop(&self.tok) {
+            self.advance()?;
+            let operand = self.sub_expr(UNARY_PREC)?;
+            Expr::UnOp {
+                op,
+                operand: Box::new(operand),
+                line,
             }
-            Token::Minus => {
-                self.advance()?;
-                let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp {
-                    op: UnOp::Neg,
-                    operand: Box::new(operand),
-                    line,
-                }
-            }
-            Token::Hash => {
-                self.advance()?;
-                let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp {
-                    op: UnOp::Len,
-                    operand: Box::new(operand),
-                    line,
-                }
-            }
-            Token::Tilde => {
-                self.advance()?;
-                let operand = self.sub_expr(UNARY_PREC)?;
-                Expr::UnOp {
-                    op: UnOp::BNot,
-                    operand: Box::new(operand),
-                    line,
-                }
-            }
-            _ => self.simple_expr()?,
+        } else {
+            self.simple_expr()?
         };
         while let Some(op) = token_binop(&self.tok) {
             let (left, right) = binop_prec(op);

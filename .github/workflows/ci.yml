@@ -47,7 +47,7 @@ jobs:
           key: cargo-${{ runner.os }}-lint-${{ hashFiles('flake.lock', 'Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-lint-
       - run: nix develop --command cargo fmt --all -- --check
-      # Lint levels live in `[lints]` in Cargo.toml (all + pedantic); the
+      # Lint levels live in `[workspace.lints]` in the root Cargo.toml (all + pedantic); the
       # `-D warnings` turns any regression into a CI failure.
       - run: nix develop --command cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: nix develop --command cargo clippy --all-targets --no-default-features --locked -- -D warnings

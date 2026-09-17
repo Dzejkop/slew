@@ -614,3 +614,26 @@ assert(c == true and d == false and e == 'boom')
 return true";
     assert_eq!(eval(src), "true");
 }
+
+#[test]
+fn close_releases_escaped_upvalues() {
+    // A closure that escaped a closed coroutine must not read or write the
+    // coroutine's dead stack through a dangling open upvalue.
+    assert_eq!(
+        eval(
+            "local co = coroutine.create(function() \
+               local x = 7 \
+               local get = function() return x end \
+               local set = function(v) x = v end \
+               coroutine.yield(get, set) \
+             end) \
+             local ok, get, set = coroutine.resume(co) \
+             assert(ok) \
+             assert(coroutine.close(co) == true) \
+             assert(get() == 7) \
+             set(99) \
+             return get()"
+        ),
+        "99"
+    );
+}

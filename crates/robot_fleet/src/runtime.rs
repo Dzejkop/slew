@@ -26,6 +26,20 @@ pub(crate) struct Robot {
 }
 
 impl Robot {
+    /// A robot with no runtime attached, used for a failed boot and as the
+    /// base for a freshly created robot.
+    pub(crate) fn blank(dir: PathBuf) -> Self {
+        Robot {
+            dir,
+            lua: None,
+            program: None,
+            program_wait: None,
+            prompt: None,
+            error: None,
+            line: None,
+        }
+    }
+
     pub(crate) fn status(&self) -> &'static str {
         if self.lua.is_none() {
             "off"
@@ -83,16 +97,29 @@ pub(crate) fn make_reader(
     }
 }
 
+/// Why a robot failed to boot: its prelude or `init.lua` did not load or run.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BootError {
+    #[error("{0}")]
+    Script(#[source] slew::Error),
+    #[error("prelude suspended")]
+    Suspended,
+    #[error("cannot read init.lua: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("init.lua: {0}")]
+    Init(#[source] slew::Error),
+}
+
 pub(crate) fn run_to_completion(
     lua: &mut Lua<Ctx>,
     exec: &mut Execution<Ctx>,
-) -> Result<(), String> {
+) -> Result<(), BootError> {
     loop {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => return Ok(()),
             Ok(Step::Pending) => {}
-            Ok(Step::Waiting(_)) => return Err("prelude suspended".into()),
-            Err(e) => return Err(e.to_string()),
+            Ok(Step::Waiting(_)) => return Err(BootError::Suspended),
+            Err(e) => return Err(BootError::Script(e)),
         }
     }
 }
@@ -101,7 +128,7 @@ pub(crate) fn boot_robot(
     dir: &Path,
     id: usize,
     world: Rc<RefCell<World>>,
-) -> Result<(Lua<Ctx>, Execution<Ctx>), String> {
+) -> Result<(Lua<Ctx>, Execution<Ctx>), BootError> {
     let mut lua = Lua::<Ctx>::new();
     lua.set_file_reader(make_reader(dir));
     install_natives(&mut lua);
@@ -113,15 +140,12 @@ pub(crate) fn boot_robot(
     };
     let prelude = lua
         .load_named("=prelude", PRELUDE)
-        .map_err(|e| e.to_string())?;
+        .map_err(BootError::Script)?;
     let mut pexec = lua.execute_with_context(&prelude, ctx.clone());
     run_to_completion(&mut lua, &mut pexec)?;
 
-    let src =
-        std::fs::read(dir.join("init.lua")).map_err(|e| format!("cannot read init.lua: {e}"))?;
-    let chunk = lua
-        .load_named("init", &src)
-        .map_err(|e| format!("init.lua: {e}"))?;
+    let src = std::fs::read(dir.join("init.lua"))?;
+    let chunk = lua.load_named("init", &src).map_err(BootError::Init)?;
     let program = lua.execute_with_context(&chunk, ctx);
     Ok((lua, program))
 }

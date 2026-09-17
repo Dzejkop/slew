@@ -6,32 +6,27 @@ use std::rc::Rc;
 
 use crate::config::{MAP_H, MAP_W, MAX_LOG, ROBOTS, SHARED_CHANNEL};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumString, strum::IntoStaticStr)]
 pub(crate) enum Facing {
+    // `to_string` pins the canonical lower-case name returned by `name()` and
+    // is also accepted by `from_name`; `serialize` entries add aliases.
+    #[strum(to_string = "north", serialize = "North", serialize = "N")]
     North,
+    #[strum(to_string = "east", serialize = "East", serialize = "E")]
     East,
+    #[strum(to_string = "south", serialize = "South", serialize = "S")]
     South,
+    #[strum(to_string = "west", serialize = "West", serialize = "W")]
     West,
 }
 
 impl Facing {
     pub(crate) fn from_name(name: &[u8]) -> Option<Self> {
-        match name {
-            b"north" | b"North" | b"N" => Some(Self::North),
-            b"east" | b"East" | b"E" => Some(Self::East),
-            b"south" | b"South" | b"S" => Some(Self::South),
-            b"west" | b"West" | b"W" => Some(Self::West),
-            _ => None,
-        }
+        std::str::from_utf8(name).ok()?.parse().ok()
     }
 
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::North => "north",
-            Self::East => "east",
-            Self::South => "south",
-            Self::West => "west",
-        }
+        self.into()
     }
 
     pub(crate) fn delta(self) -> (i32, i32) {
@@ -102,7 +97,6 @@ pub(crate) struct RobotState {
 /// are converted to this scalar representation at the native boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Msg {
-    Nil,
     Bool(bool),
     Int(i64),
     Float(f64),

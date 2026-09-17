@@ -1,6 +1,7 @@
 //! Game state and robot lifecycle management.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use ratatui::layout::Rect;
 use slew::{Execution, Lua, NativeWait, Step};
 
 use crate::config::{ROBOTS, STEP_FUEL, TICK};
-use crate::runtime::{Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
+use crate::runtime::{BootError, Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
 use crate::world::{Ctx, Request, WaitReason, World};
 
 pub(crate) struct App {
@@ -24,6 +25,26 @@ pub(crate) struct App {
     pub(crate) clock: Duration,
 }
 
+/// Boots `id`'s program, turning a failure into an off robot that carries the
+/// error instead of taking down the whole app. The world log records it too,
+/// mirroring how `reboot` surfaces a failed reload.
+pub(crate) fn boot_or_error(dir: PathBuf, id: usize, world: &Rc<RefCell<World>>) -> Robot {
+    match boot_robot(&dir, id, Rc::clone(world)) {
+        Ok((lua, program)) => Robot {
+            lua: Some(lua),
+            program: Some(program),
+            ..Robot::blank(dir)
+        },
+        Err(e) => {
+            world.borrow().push_log(id, format!("boot error: {e}"));
+            Robot {
+                error: Some(e.to_string()),
+                ..Robot::blank(dir)
+            }
+        }
+    }
+}
+
 impl App {
     pub(crate) fn new() -> Self {
         let world = Rc::new(RefCell::new(World::generate()));
@@ -33,17 +54,7 @@ impl App {
             let dir = root.join(id.to_string());
             std::fs::create_dir_all(&dir).expect("create robot dir");
             ensure_default_files(&dir, id);
-            let (lua, program) = boot_robot(&dir, id, Rc::clone(&world))
-                .unwrap_or_else(|e| panic!("boot robot {id}: {e}"));
-            robots.push(Robot {
-                dir,
-                lua: Some(lua),
-                program: Some(program),
-                program_wait: None,
-                prompt: None,
-                error: None,
-                line: None,
-            });
+            robots.push(boot_or_error(dir, id, &world));
         }
         world
             .borrow()
@@ -234,7 +245,7 @@ impl App {
     }
 
     /// Creates the robot's `Lua` and program Execution. Assumes it is off.
-    pub(crate) fn boot_inner(&mut self, i: usize) -> Result<(), String> {
+    pub(crate) fn boot_inner(&mut self, i: usize) -> Result<(), BootError> {
         let dir = self.robots[i].dir.clone();
         let (lua, program) = boot_robot(&dir, i, Rc::clone(&self.world))?;
         self.robots[i].lua = Some(lua);
@@ -284,15 +295,7 @@ impl App {
         let dir = sources_dir().join(id.to_string());
         let _ = std::fs::create_dir_all(&dir);
         ensure_default_files(&dir, id);
-        self.robots.push(Robot {
-            dir,
-            lua: None,
-            program: None,
-            program_wait: None,
-            prompt: None,
-            error: None,
-            line: None,
-        });
+        self.robots.push(Robot::blank(dir));
         self.selected = id;
         match self.boot_inner(id) {
             Ok(()) => self.log(format!("[ui] created R{id}")),

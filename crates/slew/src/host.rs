@@ -18,7 +18,8 @@ use crate::value::TableId;
 
 /// A capability failure: a human message plus a C-style `errno` (`0` when not
 /// applicable). `io.*` turns these into `nil, message, errno` returns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
 pub struct HostError {
     pub message: String,
     pub errno: i32,

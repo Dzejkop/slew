@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use slew::{Lua, Step, Value};
 
-use crate::app::App;
+use crate::app::{App, boot_or_error};
 use crate::config::{MOVE_TICKS, ROBOTS};
 use crate::natives::install_natives;
 use crate::programs::{DEFAULT_NAV, PRELUDE, default_program_for};
@@ -75,6 +75,23 @@ fn channel_empty_reports_empty() {
     );
     let log = world.borrow().log.borrow().join("\n");
     assert!(log.contains("nil/empty"), "log was:\n{log}");
+}
+
+#[test]
+fn sending_nil_is_rejected() {
+    // `nil` cannot be distinguished from "nothing arrived" by `sched.recv`,
+    // so it must be refused rather than silently dropped into the channel.
+    let (mut lua, world) = test_env(0);
+    run_src(
+        &mut lua,
+        &world,
+        0,
+        "local ok, err = pcall(ch.try_send, 0, nil) \
+         log(tostring(ok) .. '/' .. tostring(err))",
+    );
+    let log = world.borrow().log.borrow().join("\n");
+    assert!(log.contains("false/"), "log was:\n{log}");
+    assert!(log.contains("message must be"), "log was:\n{log}");
 }
 
 #[test]
@@ -153,6 +170,15 @@ fn app_boots_and_runs() {
     }
     for (i, r) in app.robots.iter().enumerate() {
         assert!(r.error.is_none(), "robot {i} errored: {:?}", r.error);
+        assert!(
+            r.lua.is_some() && r.program.is_some(),
+            "robot {i} did not boot a program"
+        );
+        assert!(
+            matches!(r.status(), "running" | "waiting"),
+            "robot {i} status was {}",
+            r.status()
+        );
     }
     let log = app.world.borrow().log.borrow().join("\n");
     assert!(log.contains("[R"), "log was:\n{log}");
@@ -183,6 +209,21 @@ fn probe_reports_neighbors() {
     let log = world.borrow().log.borrow().join("\n");
     assert!(log.contains("ore"), "log was:\n{log}");
     assert!(log.contains("wall"), "log was:\n{log}");
+}
+
+#[test]
+fn boot_failure_leaves_robot_off_with_error() {
+    let dir = std::env::temp_dir().join(format!("slew-boot-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("init.lua"), "this is not lua (").unwrap();
+    let world = Rc::new(RefCell::new(World::generate()));
+    let robot = boot_or_error(dir.clone(), 0, &world);
+    assert!(robot.lua.is_none(), "failed boot must leave the robot off");
+    assert!(robot.error.is_some(), "the boot error should be retained");
+    assert_eq!(robot.status(), "off");
+    let log = world.borrow().log.borrow().join("\n");
+    assert!(log.contains("boot error"), "log was:\n{log}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -263,4 +304,35 @@ fn boot_isolates_robots() {
     assert_eq!(la.get_global("seed"), Value::Int(1111));
     assert_eq!(lb.get_global("seed"), Value::Int(2222));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn facing_name_and_aliases_round_trip() {
+    use crate::world::Facing;
+    // `name()` feeds the Lua-facing `robot.facing()`; the bundled `nav.turn`
+    // keys on the lower-case words, so it must not pick up a title-cased alias.
+    for (facing, name) in [
+        (Facing::North, "north"),
+        (Facing::East, "east"),
+        (Facing::South, "south"),
+        (Facing::West, "west"),
+    ] {
+        assert_eq!(facing.name(), name, "canonical name must stay lower-case");
+        assert_eq!(Facing::from_name(name.as_bytes()), Some(facing));
+        // Capitalised initial ("N") and full word ("North") are accepted aliases.
+        assert_eq!(
+            Facing::from_name(name[..1].to_uppercase().as_bytes()),
+            Some(facing)
+        );
+        let capitalised = {
+            let mut c = name.to_string();
+            c.replace_range(..1, &name[..1].to_uppercase());
+            c
+        };
+        assert_eq!(Facing::from_name(capitalised.as_bytes()), Some(facing));
+    }
+    assert_eq!(Facing::from_name(b"N"), Some(Facing::North));
+    assert_eq!(Facing::from_name(b"n"), None);
+    assert_eq!(Facing::from_name(b"NORTH"), None);
+    assert_eq!(Facing::from_name(b"north "), None);
 }

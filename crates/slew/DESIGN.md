@@ -52,8 +52,8 @@ source ──lexer──▶ tokens ──parser──▶ AST ──compiler─�
 - **VM** (`vm.rs`): the stackless dispatch loop described above.
 - **Heap** (`value.rs`): all GC objects (strings, tables, closures, threads) live in
   arenas owned by the `Lua` state, referenced by index handles. `Value` is `Copy`.
-  Strings are interned. Real mark-sweep GC is a later milestone; handle-based
-  design keeps it tractable (no `unsafe`, no `Rc` cycles).
+  Strings are interned. A mark-sweep collector (M5) reclaims these arenas; the
+  handle-based design keeps that tractable (no `unsafe`, no `Rc` cycles).
 
 ## Semantics targets (Lua 5.4)
 
@@ -174,9 +174,13 @@ through a capability the embedder installs explicitly.
 - Binary chunks carry PUC 5.4's header and `LUAC_INT`/`LUAC_NUM` sentinels,
   but the proto body after them is slew-specific (see `src/stdlib/dump.rs`),
   so dumps round-trip through slew's `load` and are not portable to PUC's
-  `luac`/`undump`.
-- `package.cpath`/`package.loadlib` are inert; dynamic C libraries are not
-  supported.
+  `luac`/`undump`. The reader validates the decoded proto (register, constant,
+  upvalue, sub-proto and jump-target operands, parallel debug tables) and caps
+  sub-proto nesting, so a crafted chunk is rejected as `nil, message` rather
+  than indexing out of bounds; `string.dump` enforces the same nesting cap so
+  anything slew can dump, slew can load.
+- `package.cpath` is inert and there is no `package.loadlib`; dynamic C
+  libraries are not supported.
 - `debug` is implemented as VM intrinsics (`getinfo`, `traceback`, the
   upvalue API, and the metatable bypass). One deviation follows from the
   architecture: prelude stdlib functions (e.g. `pairs`, `ipairs`,

@@ -624,7 +624,15 @@ fn n_lines_stub<C>(_lua: &mut Lua<C>, _args: &[Value]) -> Result<Vec<Value>, Str
 }
 
 fn n_tostring<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
-    let uid = want_file(lua, args, 0, "tostring")?;
+    // Unlike the operations that route through `want_file`, `__tostring` is
+    // valid on a closed handle (PUC reports "file (closed)"), so inspect the
+    // userdata directly.
+    let Value::Userdata(uid) = arg(args, 0) else {
+        let got = arg(args, 0).type_name();
+        return Err(format!(
+            "bad argument #1 to 'tostring' (FILE* expected, got {got})"
+        ));
+    };
     let s = if lua.userdata[uid.0 as usize].closed {
         "file (closed)".to_string()
     } else {
