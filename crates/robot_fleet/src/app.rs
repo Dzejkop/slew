@@ -118,10 +118,10 @@ impl App {
             } = &mut self.robots[i];
             let Some(lua) = lua.as_mut() else { continue };
             if let Some(exec) = program.as_mut() {
-                deliver_one(exec, program_wait, lua, &world, i);
+                deliver_one(exec, program_wait, lua, &world);
             }
             if let Some(p) = prompt.as_mut() {
-                deliver_one(&mut p.exec, &mut p.wait, lua, &world, i);
+                deliver_one(&mut p.exec, &mut p.wait, lua, &world);
             }
         }
     }
@@ -211,7 +211,7 @@ impl App {
                 let ctx = Ctx {
                     robot: i,
                     world,
-                    wait: None,
+                    wait_reason: None,
                 };
                 let exec = lua.execute_with_context(&chunk, ctx);
                 *prompt = Some(Prompt { exec, wait: None });
@@ -353,23 +353,36 @@ impl App {
     }
 }
 
-/// Completes a parked native call once its condition holds.
+/// Completes parked native calls once their condition holds.
+///
+/// A wait on the program's root thread surfaces as `Step::Waiting` and is
+/// tracked in `root_wait`. A wait on a coroutine parks only that coroutine and
+/// never surfaces, so it is rediscovered here via [`Execution::pending_waits`].
 pub(crate) fn deliver_one(
     exec: &mut Execution<Ctx>,
-    wait: &mut Option<NativeWait>,
+    root_wait: &mut Option<NativeWait>,
     lua: &mut Lua<Ctx>,
     world: &Rc<RefCell<World>>,
-    rid: usize,
 ) {
-    let Some(token) = *wait else { return };
-    let reason = exec.context().wait;
-    let ready =
-        matches!(reason, Some(WaitReason::ActionDone)) && world.borrow().robots[rid].job.is_none();
+    let rid = exec.context().robot;
+    let ready = matches!(exec.context().wait_reason, Some(WaitReason::ActionDone))
+        && world.borrow().robots[rid].job.is_none();
     if !ready {
         return;
     }
-    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-        *wait = None;
-        exec.context_mut().wait = None;
+    if let Some(token) = root_wait.take() {
+        if exec.complete_native(lua, token, Ok(Vec::new())).is_err() {
+            // Leave the request in place so the status stays "waiting" and the
+            // completion is retried on the next tick.
+            *root_wait = Some(token);
+            return;
+        }
     }
+    // Every wait in this execution shares the `ActionDone` reason, so once the
+    // job is done they are all ready. `pending_waits` only yields open tokens,
+    // so each completion succeeds.
+    for token in exec.pending_waits(lua) {
+        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
+    }
+    exec.context_mut().wait_reason = None;
 }

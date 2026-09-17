@@ -306,5 +306,5 @@ pub(crate) enum WaitReason {
 pub(crate) struct Ctx {
     pub(crate) robot: usize,
     pub(crate) world: Rc<RefCell<World>>,
-    pub(crate) wait: Option<WaitReason>,
+    pub(crate) wait_reason: Option<WaitReason>,
 }
