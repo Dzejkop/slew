@@ -1,5 +1,6 @@
 //! Host natives exposed to robot Lua: world actions, channels, lifecycle.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -7,7 +8,7 @@ use std::rc::Rc;
 use slew::{Lua, NativeContext, NativeOutcome, NativeWait, Value};
 
 use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS};
-use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitReason};
+use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitReason, World};
 
 fn int_arg(
     _ctx: &NativeContext<'_, Ctx>,
@@ -253,19 +254,85 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
+/// Mints a token unique across the world, and therefore across any execution.
+fn mint_token(world: &Rc<RefCell<World>>) -> NativeWait {
+    let mut w = world.borrow_mut();
+    w.next_token += 1;
+    NativeWait(w.next_token)
+}
+
+/// Records a parked wait against the execution so the host can complete it
+/// once `reason` holds.
+fn park(ctx: &mut NativeContext<'_, Ctx>, reason: WaitReason, token: NativeWait) -> NativeOutcome {
+    ctx.context_mut().waiting.push((token, reason));
+    NativeOutcome::Wait(token)
+}
+
+/// Suspends until the robot's current job finishes (immediately if idle).
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (token, busy) = {
-        let mut w = world.borrow_mut();
-        w.next_token += 1;
-        (w.next_token, w.robots[rid].job.is_some())
-    };
-    if !busy {
+    if world.borrow().robots[rid].job.is_none() {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    ctx.context_mut().wait_reason = Some(WaitReason::ActionDone);
-    Ok(NativeOutcome::Wait(NativeWait(token)))
+    let token = mint_token(&world);
+    Ok(park(ctx, WaitReason::ActionDone, token))
+}
+
+/// Suspends until channel `chan` has a message (immediately if it already
+/// does, or if the robot lacks a grant for it).
+fn native_wait_nonempty(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "wait_nonempty")?;
+    let rid = ctx.context().robot;
+    let world = Rc::clone(&ctx.context().world);
+    let (allowed, empty) = {
+        let w = world.borrow();
+        if w.grants[rid].contains(&chan) {
+            (
+                true,
+                w.channels.get(&chan).is_none_or(|c| c.items.is_empty()),
+            )
+        } else {
+            (false, false)
+        }
+    };
+    if !allowed || !empty {
+        return Ok(NativeOutcome::Return(Vec::new()));
+    }
+    let token = mint_token(&world);
+    Ok(park(ctx, WaitReason::ChannelNonEmpty(chan), token))
+}
+
+/// Suspends until channel `chan` has room for another message (immediately if
+/// it already does, or if the robot lacks a grant for it).
+fn native_wait_room(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "wait_room")?;
+    let rid = ctx.context().robot;
+    let world = Rc::clone(&ctx.context().world);
+    let (allowed, full) = {
+        let w = world.borrow();
+        if w.grants[rid].contains(&chan) {
+            (
+                true,
+                w.channels
+                    .get(&chan)
+                    .is_some_and(|c| c.items.len() >= c.cap),
+            )
+        } else {
+            (false, false)
+        }
+    };
+    if !allowed || !full {
+        return Ok(NativeOutcome::Return(Vec::new()));
+    }
+    let token = mint_token(&world);
+    Ok(park(ctx, WaitReason::ChannelRoom(chan), token))
 }
 
 /// Requests that the host shut this robot down after the current step.
@@ -393,6 +460,8 @@ pub(crate) fn install_natives(lua: &mut Lua<Ctx>) {
     lua.register_suspendable_native("__wait", native_wait);
     lua.register_suspendable_native("__try_send", native_try_send);
     lua.register_suspendable_native("__try_recv", native_try_recv);
+    lua.register_suspendable_native("__ch_wait_nonempty", native_wait_nonempty);
+    lua.register_suspendable_native("__ch_wait_room", native_wait_room);
     lua.register_suspendable_native("__shutdown", native_shutdown);
     lua.register_suspendable_native("__reboot", native_reboot);
     lua.register_suspendable_native("__probe", native_probe);
