@@ -21,6 +21,7 @@ use crate::value::{
 use std::fmt;
 use std::fmt::Write as _;
 use std::rc::Rc;
+use strum::IntoEnumIterator as _;
 
 /// Default cap on call-frame depth; a deliberately bounded execution profile
 /// knob (recursion consumes heap, not the host stack).
@@ -31,14 +32,18 @@ const MAX_CALL_DEPTH: usize = 10_000;
 /// scratch base, so chasing N levels costs O(N) space, not O(N^2).
 const MAX_META_CHAIN: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Parse(ParseError),
-    Compile(CompileError),
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+    #[error(transparent)]
     Runtime(RuntimeError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("runtime error: {message}")]
 pub struct RuntimeError {
     /// Rendered error message (position-prefixed for VM-raised errors).
     pub message: String,
@@ -51,30 +56,6 @@ pub struct RuntimeError {
     /// Handy for progress reporting: a script that calls a helper still
     /// reports its own call site here.
     pub root_line: u32,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Parse(e) => write!(f, "{e}"),
-            Error::Compile(e) => write!(f, "{e}"),
-            Error::Runtime(e) => write!(f, "runtime error: {}", e.message),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<ParseError> for Error {
-    fn from(e: ParseError) -> Self {
-        Error::Parse(e)
-    }
-}
-
-impl From<CompileError> for Error {
-    fn from(e: CompileError) -> Self {
-        Error::Compile(e)
-    }
 }
 
 /// Internal in-flight error: either a raw Lua value (from `error()`) or a
@@ -635,61 +616,58 @@ pub struct Execution<C = ()> {
 }
 
 /// Metamethod identifiers; indexes into `Lua::mm_names`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumIter, strum::IntoStaticStr)]
 #[repr(usize)]
 pub(crate) enum Mm {
+    #[strum(serialize = "__index")]
     Index,
+    #[strum(serialize = "__newindex")]
     NewIndex,
+    #[strum(serialize = "__call")]
     Call,
+    #[strum(serialize = "__add")]
     Add,
+    #[strum(serialize = "__sub")]
     Sub,
+    #[strum(serialize = "__mul")]
     Mul,
+    #[strum(serialize = "__div")]
     Div,
+    #[strum(serialize = "__mod")]
     Mod,
+    #[strum(serialize = "__pow")]
     Pow,
+    #[strum(serialize = "__unm")]
     Unm,
+    #[strum(serialize = "__idiv")]
     IDiv,
+    #[strum(serialize = "__band")]
     BAnd,
+    #[strum(serialize = "__bor")]
     BOr,
+    #[strum(serialize = "__bxor")]
     BXor,
+    #[strum(serialize = "__bnot")]
     BNot,
+    #[strum(serialize = "__shl")]
     Shl,
+    #[strum(serialize = "__shr")]
     Shr,
+    #[strum(serialize = "__concat")]
     Concat,
+    #[strum(serialize = "__len")]
     Len,
+    #[strum(serialize = "__eq")]
     Eq,
+    #[strum(serialize = "__lt")]
     Lt,
+    #[strum(serialize = "__le")]
     Le,
+    #[strum(serialize = "__tostring")]
     ToString,
+    #[strum(serialize = "__close")]
     Close,
 }
-
-const MM_NAMES: [&str; 24] = [
-    "__index",
-    "__newindex",
-    "__call",
-    "__add",
-    "__sub",
-    "__mul",
-    "__div",
-    "__mod",
-    "__pow",
-    "__unm",
-    "__idiv",
-    "__band",
-    "__bor",
-    "__bxor",
-    "__bnot",
-    "__shl",
-    "__shr",
-    "__concat",
-    "__len",
-    "__eq",
-    "__lt",
-    "__le",
-    "__tostring",
-    "__close",
-];
 
 fn mm_of_arith(op: ArithOp) -> Mm {
     match op {
@@ -1487,9 +1465,8 @@ impl<C> Lua<C> {
     #[must_use]
     pub fn new() -> Self {
         let mut strings = Strings::default();
-        let mm_names = MM_NAMES
-            .iter()
-            .map(|n| strings.intern_fixed(n.as_bytes()))
+        let mm_names = Mm::iter()
+            .map(|m| strings.intern_fixed(<&str>::from(m).as_bytes()))
             .collect();
         let mut lua = Lua {
             strings,

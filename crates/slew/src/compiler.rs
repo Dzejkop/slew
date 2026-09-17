@@ -11,19 +11,13 @@ use crate::bytecode::{
 };
 use crate::value::{Strings, Value};
 use std::collections::HashMap;
-use std::fmt;
 use std::rc::Rc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("compile error at line {line}: {message}")]
 pub struct CompileError {
     pub message: String,
     pub line: u32,
-}
-
-impl fmt::Display for CompileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "compile error at line {}: {}", self.line, self.message)
-    }
 }
 
 /// Compiles a parsed [`Block`] into a [`Proto`].

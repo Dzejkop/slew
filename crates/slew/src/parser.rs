@@ -2,18 +2,12 @@
 
 use crate::ast::{Attrib, BinOp, Block, Expr, FuncBody, Stmt, UnOp};
 use crate::lexer::{LexError, Lexer, Token};
-use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("parse error at line {line}: {message}")]
 pub struct ParseError {
     pub message: String,
     pub line: u32,
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "parse error at line {}: {}", self.line, self.message)
-    }
 }
 
 impl From<LexError> for ParseError {

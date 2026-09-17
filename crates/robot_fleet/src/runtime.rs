@@ -97,16 +97,29 @@ pub(crate) fn make_reader(
     }
 }
 
+/// Why a robot failed to boot: its prelude or `init.lua` did not load or run.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BootError {
+    #[error("prelude: {0}")]
+    Prelude(#[source] slew::Error),
+    #[error("prelude suspended")]
+    Suspended,
+    #[error("cannot read init.lua: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("init.lua: {0}")]
+    Init(#[source] slew::Error),
+}
+
 pub(crate) fn run_to_completion(
     lua: &mut Lua<Ctx>,
     exec: &mut Execution<Ctx>,
-) -> Result<(), String> {
+) -> Result<(), BootError> {
     loop {
         match exec.step(lua, 1_000_000) {
             Ok(Step::Done(_)) => return Ok(()),
             Ok(Step::Pending) => {}
-            Ok(Step::Waiting(_)) => return Err("prelude suspended".into()),
-            Err(e) => return Err(e.to_string()),
+            Ok(Step::Waiting(_)) => return Err(BootError::Suspended),
+            Err(e) => return Err(BootError::Prelude(e)),
         }
     }
 }
@@ -115,7 +128,7 @@ pub(crate) fn boot_robot(
     dir: &Path,
     id: usize,
     world: Rc<RefCell<World>>,
-) -> Result<(Lua<Ctx>, Execution<Ctx>), String> {
+) -> Result<(Lua<Ctx>, Execution<Ctx>), BootError> {
     let mut lua = Lua::<Ctx>::new();
     lua.set_file_reader(make_reader(dir));
     install_natives(&mut lua);
@@ -127,15 +140,12 @@ pub(crate) fn boot_robot(
     };
     let prelude = lua
         .load_named("=prelude", PRELUDE)
-        .map_err(|e| e.to_string())?;
+        .map_err(BootError::Prelude)?;
     let mut pexec = lua.execute_with_context(&prelude, ctx.clone());
     run_to_completion(&mut lua, &mut pexec)?;
 
-    let src =
-        std::fs::read(dir.join("init.lua")).map_err(|e| format!("cannot read init.lua: {e}"))?;
-    let chunk = lua
-        .load_named("init", &src)
-        .map_err(|e| format!("init.lua: {e}"))?;
+    let src = std::fs::read(dir.join("init.lua"))?;
+    let chunk = lua.load_named("init", &src).map_err(BootError::Init)?;
     let program = lua.execute_with_context(&chunk, ctx);
     Ok((lua, program))
 }

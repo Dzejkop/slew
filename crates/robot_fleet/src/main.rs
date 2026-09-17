@@ -48,7 +48,8 @@ enum Action {
     Edit(usize),
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
     if !std::io::stdout().is_terminal() {
         eprintln!("robot_fleet: needs an interactive terminal");
         return Ok(());

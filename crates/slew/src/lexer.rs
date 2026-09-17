@@ -155,16 +155,11 @@ impl fmt::Display for Token {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("lex error at line {line}: {message}")]
 pub struct LexError {
     pub message: String,
     pub line: u32,
-}
-
-impl fmt::Display for LexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "lex error at line {}: {}", self.line, self.message)
-    }
 }
 
 #[derive(Clone)]

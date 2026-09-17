@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use slew::{Execution, Lua, NativeWait, Step};
 
 use crate::config::{ROBOTS, STEP_FUEL, TICK};
-use crate::runtime::{Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
+use crate::runtime::{BootError, Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
 use crate::world::{Ctx, Request, WaitReason, World};
 
 pub(crate) struct App {
@@ -38,7 +38,7 @@ pub(crate) fn boot_or_error(dir: PathBuf, id: usize, world: &Rc<RefCell<World>>)
         Err(e) => {
             world.borrow().push_log(id, format!("boot error: {e}"));
             Robot {
-                error: Some(e),
+                error: Some(e.to_string()),
                 ..Robot::blank(dir)
             }
         }
@@ -245,7 +245,7 @@ impl App {
     }
 
     /// Creates the robot's `Lua` and program Execution. Assumes it is off.
-    pub(crate) fn boot_inner(&mut self, i: usize) -> Result<(), String> {
+    pub(crate) fn boot_inner(&mut self, i: usize) -> Result<(), BootError> {
         let dir = self.robots[i].dir.clone();
         let (lua, program) = boot_robot(&dir, i, Rc::clone(&self.world))?;
         self.robots[i].lua = Some(lua);
