@@ -11,11 +11,12 @@ local raw = {
   carrying = __carrying, drop = __drop, scan = __scan, wait = __wait,
   probe = __probe, shutdown = __shutdown, reboot = __reboot,
   send = __try_send, recv = __try_recv,
+  wait_nonempty = __ch_wait_nonempty, wait_room = __ch_wait_room,
 }
 __log = nil __face = nil __forward = nil __back = nil __left = nil __right = nil
 __mine = nil __busy = nil __pos = nil __facing = nil __carrying = nil __drop = nil
 __scan = nil __wait = nil __probe = nil __shutdown = nil __reboot = nil
-__try_send = nil __try_recv = nil
+__try_send = nil __try_recv = nil __ch_wait_nonempty = nil __ch_wait_room = nil
 
 log = raw.log
 robot = {
@@ -25,7 +26,7 @@ robot = {
   carrying = raw.carrying, drop = raw.drop, scan = raw.scan, wait = raw.wait,
   probe = raw.probe, shutdown = raw.shutdown, reboot = raw.reboot,
 }
-ch = { try_send = raw.send, try_recv = raw.recv }
+ch = { try_send = raw.send, try_recv = raw.recv, wait_nonempty = raw.wait_nonempty, wait_room = raw.wait_room }
 
 sched = {}
 local tasks = {}
@@ -40,19 +41,24 @@ function sched.yield() coroutine.yield() end
 function sched.sleep(n) for _ = 1, n do coroutine.yield() end end
 function sched.await(pred) while not pred() do coroutine.yield() end end
 
+-- `try_recv`/`try_send` return `nil, "denied"|"empty"|"full"`; only `empty` and
+-- `full` are worth parking on (via the suspendable `wait_nonempty`/`wait_room`
+-- natives), any other reason is returned to the caller.
 function sched.recv(chan)
   while true do
-    local m = ch.try_recv(chan)
+    local m, err = ch.try_recv(chan)
     if m ~= nil then return m end
-    coroutine.yield()
+    if err ~= 'empty' then return nil, err end
+    ch.wait_nonempty(chan)
   end
 end
 
 function sched.send(chan, msg)
   while true do
-    local ok = ch.try_send(chan, msg)
+    local ok, err = ch.try_send(chan, msg)
     if ok then return true end
-    coroutine.yield()
+    if err ~= 'full' then return nil, err end
+    ch.wait_room(chan)
   end
 end
 
@@ -92,7 +98,7 @@ local function miner()
         robot.face(nav.turn(robot.facing()))
       end
     end
-    sched.await(function() return not robot.busy() end)
+    robot.wait()
     if robot.carrying() >= 5 then
       local n = robot.drop()
       log('dropped ' .. n .. ' ore')
@@ -182,7 +188,7 @@ local function explorer()
   while true do
     robot.face(choose())
     robot.forward()
-    sched.await(function() return not robot.busy() end)
+    robot.wait()
     sense()
     steps = steps + 1
     if steps % 30 == 0 then

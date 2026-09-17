@@ -4,10 +4,10 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use slew::{Lua, NativeContext, NativeOutcome, NativeWait, Value};
+use slew::{Lua, NativeContext, NativeOutcome, Value};
 
 use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS};
-use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitReason};
+use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitKind};
 
 fn int_arg(
     _ctx: &NativeContext<'_, Ctx>,
@@ -253,19 +253,55 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
+/// Suspends until the robot's current job finishes. Parks the calling
+/// coroutine; on the execution's root thread, or where the VM cannot park, it
+/// blocks the execution instead (see [`NativeOutcome::Wait`]).
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (token, busy) = {
-        let mut w = world.borrow_mut();
-        w.next_token += 1;
-        (w.next_token, w.robots[rid].job.is_some())
-    };
-    if !busy {
+    let wait = WaitKind::ActionDone(rid);
+    if wait.is_ready(&world.borrow()) {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    ctx.context_mut().wait = Some(WaitReason::ActionDone);
-    Ok(NativeOutcome::Wait(NativeWait(token)))
+    Ok(NativeOutcome::Wait(wait.token()))
+}
+
+/// Suspends until channel `chan` has a message. Parks the calling coroutine
+/// when the channel is empty; if it already has a message, or the robot lacks
+/// a grant for it, returns immediately (the caller's `try_recv` reports the
+/// grant).
+fn native_wait_nonempty(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "wait_nonempty")?;
+    let rid = ctx.context().robot;
+    let world = Rc::clone(&ctx.context().world);
+    let wait = WaitKind::ChannelNonEmpty(chan);
+    let w = world.borrow();
+    if !w.grants[rid].contains(&chan) || wait.is_ready(&w) {
+        return Ok(NativeOutcome::Return(Vec::new()));
+    }
+    Ok(NativeOutcome::Wait(wait.token()))
+}
+
+/// Suspends until channel `chan` has room for another message. Parks the
+/// calling coroutine when the channel is full; if it already has room, or the
+/// robot lacks a grant for it, returns immediately (the caller's `try_send`
+/// reports the grant).
+fn native_wait_room(
+    ctx: &mut NativeContext<'_, Ctx>,
+    args: &[Value],
+) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "wait_room")?;
+    let rid = ctx.context().robot;
+    let world = Rc::clone(&ctx.context().world);
+    let wait = WaitKind::ChannelRoom(chan);
+    let w = world.borrow();
+    if !w.grants[rid].contains(&chan) || wait.is_ready(&w) {
+        return Ok(NativeOutcome::Return(Vec::new()));
+    }
+    Ok(NativeOutcome::Wait(wait.token()))
 }
 
 /// Requests that the host shut this robot down after the current step.
@@ -393,6 +429,8 @@ pub(crate) fn install_natives(lua: &mut Lua<Ctx>) {
     lua.register_suspendable_native("__wait", native_wait);
     lua.register_suspendable_native("__try_send", native_try_send);
     lua.register_suspendable_native("__try_recv", native_try_recv);
+    lua.register_suspendable_native("__ch_wait_nonempty", native_wait_nonempty);
+    lua.register_suspendable_native("__ch_wait_room", native_wait_room);
     lua.register_suspendable_native("__shutdown", native_shutdown);
     lua.register_suspendable_native("__reboot", native_reboot);
     lua.register_suspendable_native("__probe", native_probe);
