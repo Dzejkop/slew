@@ -156,31 +156,48 @@ enum WaitKind {
 }
 
 impl WaitKind {
+    /// The kind occupies the top byte of the token; the channel id the rest.
+    /// Channel ids are non-negative and well under 2^56, as the example uses.
+    const KIND_SHIFT: u32 = 56;
+    const CHANNEL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
     fn channel(self) -> i64 {
         match self {
             WaitKind::NonEmpty(c) | WaitKind::Room(c) => c,
         }
     }
+
+    /// The token naming this wait. Encoding the kind in the token keeps a wait
+    /// completable if another runtime's execution adopts its coroutine.
+    fn token(self) -> NativeWait {
+        let (bits, chan) = match self {
+            WaitKind::NonEmpty(c) => (1, c),
+            WaitKind::Room(c) => (2, c),
+        };
+        NativeWait(((bits as u64) << Self::KIND_SHIFT) | (chan as u64 & Self::CHANNEL_MASK))
+    }
+
+    /// The wait a token names, or `None` for a token this host did not mint.
+    fn from_token(token: NativeWait) -> Option<Self> {
+        let chan = (token.0 & Self::CHANNEL_MASK) as i64;
+        match token.0 >> Self::KIND_SHIFT {
+            1 => Some(WaitKind::NonEmpty(chan)),
+            2 => Some(WaitKind::Room(chan)),
+            _ => None,
+        }
+    }
 }
 
 /// Per-execution context. Channels themselves live in Lua; this only carries
-/// the log handle and the waits currently parked in this execution, keyed by
-/// their token so each can be completed only once its own condition holds.
+/// the log handle.
 struct Ctx {
     label: String,
     log: Rc<RefCell<Vec<String>>>,
-    waiting: Vec<(NativeWait, WaitKind)>,
-    waits: u64,
 }
 
 impl Ctx {
     fn program(label: String, log: Rc<RefCell<Vec<String>>>) -> Self {
-        Self {
-            label,
-            log,
-            waiting: Vec::new(),
-            waits: 0,
-        }
+        Self { label, log }
     }
 
     fn prompt(log: Rc<RefCell<Vec<String>>>) -> Self {
@@ -200,7 +217,7 @@ struct Runtime {
     fuel_acc: f64,
     /// The root thread's wait token while the execution is blocked on a
     /// `__ch_wait_*` native, as reported by `Step::Waiting`. A coroutine wait
-    /// leaves this `None`; those live in `Ctx::waiting` instead.
+    /// leaves this `None`; those are discovered from `Execution::pending_waits`.
     wait: Option<NativeWait>,
     line: Option<u32>,
     finished: bool,
@@ -237,18 +254,19 @@ impl Runtime {
         }
     }
 
-    fn status(&self) -> String {
+    fn status(&self, lua: &Lua<Ctx>) -> String {
         if let Some(e) = &self.error {
             return format!("error: {e}");
         }
         if self.finished {
             return "done".into();
         }
-        if let Some((_, kind)) = self.exec.context().waiting.first() {
-            return match kind {
-                WaitKind::NonEmpty(c) => format!("waiting on ch {c}"),
-                WaitKind::Room(c) => format!("waiting for room on ch {c}"),
-            };
+        for token in self.exec.pending_waits(lua) {
+            match WaitKind::from_token(token) {
+                Some(WaitKind::NonEmpty(c)) => return format!("waiting on ch {c}"),
+                Some(WaitKind::Room(c)) => return format!("waiting for room on ch {c}"),
+                None => {}
+            }
         }
         self.line
             .map_or_else(|| "…".into(), |l| format!("line {l}"))
@@ -409,11 +427,11 @@ impl App {
 
     fn deliver_pending(&mut self) {
         for runtime in &mut self.runtimes {
-            deliver_if_ready(&mut self.lua, &mut runtime.exec, &mut runtime.wait);
+            deliver_ready(&mut self.lua, &mut runtime.exec, &mut runtime.wait);
         }
 
         if let Some(prompt) = &mut self.prompt {
-            deliver_if_ready(&mut self.lua, &mut prompt.exec, &mut prompt.wait);
+            deliver_ready(&mut self.lua, &mut prompt.exec, &mut prompt.wait);
         }
     }
 
@@ -515,29 +533,20 @@ impl App {
 
 /// Suspends the caller until `chan` is non-empty. Mutates nothing.
 fn wait_nonempty(
-    ctx: &mut NativeContext<'_, Ctx>,
+    _ctx: &mut NativeContext<'_, Ctx>,
     args: &[Value],
 ) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_nonempty", WaitKind::NonEmpty)
+    wait_on(args, "__ch_wait_nonempty", WaitKind::NonEmpty)
 }
 
 /// Suspends the caller until `chan` has room. Mutates nothing.
-fn wait_room(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_room", WaitKind::Room)
+fn wait_room(_ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    wait_on(args, "__ch_wait_room", WaitKind::Room)
 }
 
-fn wait_on(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-    name: &str,
-    make: fn(i64) -> WaitKind,
-) -> Result<NativeOutcome, String> {
+fn wait_on(args: &[Value], name: &str, make: fn(i64) -> WaitKind) -> Result<NativeOutcome, String> {
     let chan = int_arg(args, 0, name)?;
-    let state = ctx.context_mut();
-    state.waits += 1;
-    let token = NativeWait(state.waits);
-    state.waiting.push((token, make(chan)));
-    Ok(NativeOutcome::Wait(token))
+    Ok(NativeOutcome::Wait(make(chan).token()))
 }
 
 /// Appends one line to the shared log.
@@ -611,9 +620,9 @@ fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
 /// If `exec` has parked native calls whose own conditions are satisfied, hand
 /// them back to Lua. A wait on the root thread surfaces as `Step::Waiting` and
 /// is tracked in `root_wait`; a coroutine wait parks only that coroutine and
-/// never surfaces, so every wait (parking or blocking) is recorded in
-/// `Ctx::waiting` at call time and delivered from there.
-fn deliver_if_ready(
+/// never surfaces, so it is rediscovered through [`Execution::pending_waits`].
+/// The token encodes the wait kind, so adoption by another execution is safe.
+fn deliver_ready(
     lua: &mut Lua<Ctx>,
     exec: &mut Execution<Ctx>,
     root_wait: &mut Option<NativeWait>,
@@ -621,24 +630,17 @@ fn deliver_if_ready(
     if exec.is_finished() {
         return;
     }
-    // Snapshot: `complete_native` needs `&mut exec`, so the list is cloned and
-    // stale/delivered entries are pruned in the one `retain` below.
-    let live = exec.pending_waits(lua);
-    let mut delivered = Vec::new();
-    for (token, kind) in exec.context().waiting.clone() {
-        if !live.contains(&token) || !channel_ready(lua, kind) {
+    for token in exec.pending_waits(lua) {
+        let Some(kind) = WaitKind::from_token(token) else {
+            continue;
+        };
+        if !channel_ready(lua, kind) {
             continue;
         }
-        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-            if *root_wait == Some(token) {
-                *root_wait = None;
-            }
-            delivered.push(token);
+        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() && *root_wait == Some(token) {
+            *root_wait = None;
         }
     }
-    exec.context_mut()
-        .waiting
-        .retain(|(t, _)| live.contains(t) && !delivered.contains(t));
 }
 
 /// Registers the natives and loads the channel prelude.
@@ -685,7 +687,7 @@ fn ui(frame: &mut Frame, app: &App) {
 
     let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(columns);
     for (i, area) in areas.iter().enumerate() {
-        draw_runtime(frame, *area, &app.runtimes[i], i == app.selected);
+        draw_runtime(frame, *area, &app.runtimes[i], i == app.selected, &app.lua);
     }
 
     draw_log(frame, log_area, app);
@@ -706,7 +708,7 @@ fn ui(frame: &mut Frame, app: &App) {
     );
 }
 
-fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool) {
+fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool, lua: &Lua<Ctx>) {
     let current_line = Style::new().bg(Color::Indexed(236));
     let lines: Vec<Line> = runtime
         .source
@@ -739,7 +741,7 @@ fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool
         if selected { "▸" } else { " " },
         runtime.id,
         runtime.rate,
-        runtime.status()
+        runtime.status(lua)
     );
     let style = if runtime.error.is_some() {
         Style::new().fg(Color::Red)
@@ -982,7 +984,7 @@ mod tests {
             wait: &mut Option<NativeWait>,
         ) -> Result<Step, Error> {
             for _ in 0..64 {
-                deliver_if_ready(&mut self.lua, exec, wait);
+                deliver_ready(&mut self.lua, exec, wait);
                 let step = exec.step(&mut self.lua, PROMPT_FUEL)?;
                 if let Step::Waiting(w) = &step {
                     *wait = Some(*w);
@@ -1056,7 +1058,7 @@ mod tests {
         let mut h = Harness::new();
         // The recv runs in a coroutine driven by a scheduler loop, so its wait
         // parks only the coroutine: the execution stays `Pending`, never
-        // `Waiting`; the host delivers it from the `Ctx::waiting` list.
+        // `Waiting`; the host discovers it from `Execution::pending_waits`.
         let mut exec = h.spawn(
             "local co = coroutine.create(function() got = ch.recv(7) end)\n\
              while got == nil do coroutine.resume(co) end\n\
@@ -1069,7 +1071,7 @@ mod tests {
 
         h.run("ch.send(7, 42)");
         for _ in 0..64 {
-            deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+            deliver_ready(&mut h.lua, &mut exec, &mut wait);
             match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
                 Step::Done(vals) => {
                     assert_eq!(vals[0], Value::Int(42));
@@ -1104,7 +1106,7 @@ mod tests {
         assert_eq!(exec.pending_waits(&h.lua).len(), 2);
 
         h.run("ch.send(11, 'a')");
-        deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+        deliver_ready(&mut h.lua, &mut exec, &mut wait);
         let _ = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
         assert_eq!(
             exec.pending_waits(&h.lua).len(),
@@ -1114,7 +1116,7 @@ mod tests {
 
         h.run("ch.send(12, 'b')");
         for _ in 0..64 {
-            deliver_if_ready(&mut h.lua, &mut exec, &mut wait);
+            deliver_ready(&mut h.lua, &mut exec, &mut wait);
             match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
                 Step::Done(vals) => {
                     assert_eq!(h.text(vals[0]), "a");

@@ -11,7 +11,7 @@ use slew::{Execution, Lua, NativeWait, Step};
 
 use crate::config::{ROBOTS, STEP_FUEL, TICK};
 use crate::runtime::{BootError, Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
-use crate::world::{Ctx, Request, WaitReason, World};
+use crate::world::{Ctx, Request, WaitKind, World};
 
 pub(crate) struct App {
     pub(crate) world: Rc<RefCell<World>>,
@@ -118,10 +118,10 @@ impl App {
             } = &mut self.robots[i];
             let Some(lua) = lua.as_mut() else { continue };
             if let Some(exec) = program.as_mut() {
-                deliver_one(exec, program_wait, lua, &world);
+                deliver_ready(exec, program_wait, lua, &world);
             }
             if let Some(p) = prompt.as_mut() {
-                deliver_one(&mut p.exec, &mut p.wait, lua, &world);
+                deliver_ready(&mut p.exec, &mut p.wait, lua, &world);
             }
         }
     }
@@ -208,11 +208,7 @@ impl App {
         let Some(lua) = lua.as_mut() else { return };
         match lua.load_named("=prompt", text.as_bytes()) {
             Ok(chunk) => {
-                let ctx = Ctx {
-                    robot: i,
-                    world,
-                    waiting: Vec::new(),
-                };
+                let ctx = Ctx { robot: i, world };
                 let exec = lua.execute_with_context(&chunk, ctx);
                 *prompt = Some(Prompt { exec, wait: None });
             }
@@ -353,50 +349,29 @@ impl App {
     }
 }
 
-/// Whether the world condition a parked wait is waiting for currently holds.
-fn wait_ready(world: &World, rid: usize, reason: WaitReason) -> bool {
-    match reason {
-        WaitReason::ActionDone => world.robots[rid].job.is_none(),
-        WaitReason::ChannelNonEmpty(chan) => world
-            .channels
-            .get(&chan)
-            .is_some_and(|c| !c.items.is_empty()),
-        WaitReason::ChannelRoom(chan) => world
-            .channels
-            .get(&chan)
-            .is_none_or(|c| c.items.len() < c.cap),
-    }
-}
-
 /// Completes parked native calls once their own condition holds.
 ///
 /// A wait on the program's root thread surfaces as `Step::Waiting` and is
 /// tracked in `root_wait`. A wait on a coroutine parks only that coroutine and
-/// never surfaces, so every wait is recorded in `Ctx::waiting` and rediscovered
-/// here (see [`Execution::pending_waits`]).
-pub(crate) fn deliver_one(
+/// never surfaces, so every parked token is rediscovered here through
+/// [`Execution::pending_waits`]. The token encodes what it is waiting for, so
+/// a wait stays completable after another execution adopts its coroutine.
+pub(crate) fn deliver_ready(
     exec: &mut Execution<Ctx>,
     root_wait: &mut Option<NativeWait>,
     lua: &mut Lua<Ctx>,
     world: &Rc<RefCell<World>>,
 ) {
     let rid = exec.context().robot;
-    // Snapshot: `complete_native` needs `&mut exec`, so the list is cloned and
-    // stale/delivered entries are pruned in the one `retain` below.
-    let live = exec.pending_waits(lua);
-    let mut delivered = Vec::new();
-    for (token, reason) in exec.context().waiting.clone() {
-        if !live.contains(&token) || !wait_ready(&world.borrow(), rid, reason) {
+    for token in exec.pending_waits(lua) {
+        let Some(kind) = WaitKind::from_token(token) else {
+            continue;
+        };
+        if !kind.is_ready(&world.borrow(), rid) {
             continue;
         }
-        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-            if *root_wait == Some(token) {
-                *root_wait = None;
-            }
-            delivered.push(token);
+        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() && *root_wait == Some(token) {
+            *root_wait = None;
         }
     }
-    exec.context_mut()
-        .waiting
-        .retain(|(t, _)| live.contains(t) && !delivered.contains(t));
 }

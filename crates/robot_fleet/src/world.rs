@@ -121,7 +121,6 @@ pub(crate) struct World {
     /// Pending lifecycle actions requested by robot programs.
     pub(crate) requests: Vec<Option<Request>>,
     pub(crate) log: Rc<RefCell<Vec<String>>>,
-    pub(crate) next_token: u64,
 }
 
 impl World {
@@ -193,7 +192,6 @@ impl World {
             grants,
             requests: (0..ROBOTS).map(|_| None).collect(),
             log: Rc::new(RefCell::new(Vec::new())),
-            next_token: 0,
         }
     }
 
@@ -298,10 +296,11 @@ pub(crate) enum Request {
     Reboot,
 }
 
-/// What a parked native wait is waiting for. The host re-checks the matching
-/// world condition each frame and completes the wait when it holds.
+/// What a parked native wait is waiting for. The kind is encoded in the
+/// [`NativeWait`] token (see [`WaitKind::token`]) so a wait stays completable
+/// when another execution adopts the parked coroutine.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaitReason {
+pub(crate) enum WaitKind {
     /// The robot's current job has finished (`robot.wait()`).
     ActionDone,
     /// The channel has at least one message (`ch.wait_nonempty`).
@@ -310,12 +309,59 @@ pub(crate) enum WaitReason {
     ChannelRoom(i64),
 }
 
+impl WaitKind {
+    /// The kind occupies the top byte of the token; the channel id the rest.
+    /// Channel ids are non-negative and well under 2^56, as the game uses.
+    const KIND_SHIFT: u32 = 56;
+    const CHANNEL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+    fn kind_bits(self) -> u64 {
+        match self {
+            WaitKind::ActionDone => 0,
+            WaitKind::ChannelNonEmpty(_) => 1,
+            WaitKind::ChannelRoom(_) => 2,
+        }
+    }
+
+    /// The token naming this wait.
+    pub(crate) fn token(self) -> NativeWait {
+        let channel = match self {
+            WaitKind::ActionDone => 0,
+            WaitKind::ChannelNonEmpty(c) | WaitKind::ChannelRoom(c) => c as u64,
+        };
+        NativeWait((self.kind_bits() << Self::KIND_SHIFT) | (channel & Self::CHANNEL_MASK))
+    }
+
+    /// The wait a token names, or `None` for a token this host did not mint.
+    pub(crate) fn from_token(token: NativeWait) -> Option<Self> {
+        let channel = (token.0 & Self::CHANNEL_MASK) as i64;
+        match token.0 >> Self::KIND_SHIFT {
+            0 => Some(WaitKind::ActionDone),
+            1 => Some(WaitKind::ChannelNonEmpty(channel)),
+            2 => Some(WaitKind::ChannelRoom(channel)),
+            _ => None,
+        }
+    }
+
+    /// Whether the world condition this wait is waiting for currently holds.
+    pub(crate) fn is_ready(self, world: &World, rid: usize) -> bool {
+        match self {
+            WaitKind::ActionDone => world.robots[rid].job.is_none(),
+            WaitKind::ChannelNonEmpty(chan) => world
+                .channels
+                .get(&chan)
+                .is_some_and(|c| !c.items.is_empty()),
+            WaitKind::ChannelRoom(chan) => world
+                .channels
+                .get(&chan)
+                .is_none_or(|c| c.items.len() < c.cap),
+        }
+    }
+}
+
 /// Per-execution context. All of a robot's executions share the `Rc`s.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     pub(crate) robot: usize,
     pub(crate) world: Rc<RefCell<World>>,
-    /// Waits parked by this execution, keyed by token so each is completed
-    /// only once its own condition holds.
-    pub(crate) waiting: Vec<(NativeWait, WaitReason)>,
 }

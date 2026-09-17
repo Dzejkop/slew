@@ -626,10 +626,12 @@ pub enum Step {
     Done(Vec<Value>),
     /// Fuel ran out; call `step` again to continue.
     Pending,
-    /// A native call on the root thread — or on a coroutine that cannot yield
+    /// A native call on the root thread — or on a coroutine that cannot park
     /// where it was called — is waiting for the host to complete it. A wait on
-    /// a yieldable coroutine does not surface here: it parks the coroutine and
-    /// keeps the execution runnable (see [`Execution::pending_waits`]).
+    /// a coroutine that can park normally does not surface here: it suspends
+    /// just that coroutine and keeps the execution runnable (see
+    /// [`Execution::pending_waits`]). A parked coroutine re-resumed where it
+    /// cannot park (e.g. inside a driver) blocks the execution instead.
     Waiting(NativeWait),
 }
 
