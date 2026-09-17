@@ -20,7 +20,9 @@
 
 use std::rc::Rc;
 
-use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
+use crate::bytecode::{
+    ArithOp, CmpOp, Instr, MAX_REGS, Proto, UNPATCHED_CLOSE, UnaryOp, UpvalDesc,
+};
 use crate::value::Value;
 use crate::vm::Lua;
 
@@ -35,6 +37,9 @@ const SENTINEL_NUM: f64 = 370.5;
 /// Marks slew's own payload so a PUC-format body is rejected clearly.
 const PAYLOAD_MAGIC: &[u8] = b"SLW1";
 const VERSION: u8 = 1;
+/// Maximum nesting of sub-protos accepted from a binary chunk: an untrusted
+/// chunk must not be able to exhaust the host stack.
+const MAX_PROTO_DEPTH: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Writer
@@ -115,6 +120,20 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+}
+
+/// Allocates a buffer for `n` decoded elements without letting a crafted
+/// length prefix abort the host: `n` comes straight from the untrusted chunk,
+/// and each element consumes at least one byte, so `n.min(remaining)` is a
+/// safe upper bound on what can actually be read.
+fn new_vec<T>(r: &Reader<'_>, n: usize) -> Result<Vec<T>, String> {
+    let mut v = Vec::new();
+    v.try_reserve(n.min(r.remaining()))
+        .map_err(|_| "not enough memory".to_string())?;
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -149,11 +168,16 @@ pub(super) fn n_dump<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, 
     w.f64(SENTINEL_NUM);
     w.buf.extend_from_slice(PAYLOAD_MAGIC);
     w.u8(VERSION);
-    write_proto(&mut w, lua, &proto);
+    write_proto(&mut w, lua, &proto, 0)?;
     Ok(vec![lua.new_string(&w.buf)])
 }
 
-fn write_proto<C>(w: &mut Writer, lua: &Lua<C>, p: &Proto) {
+fn write_proto<C>(w: &mut Writer, lua: &Lua<C>, p: &Proto, depth: usize) -> Result<(), String> {
+    // Keep the writer symmetric with the reader's nesting cap so a program
+    // slew can dump is also one slew can load.
+    if depth > MAX_PROTO_DEPTH {
+        return Err("unable to dump given function (too deeply nested)".into());
+    }
     w.bytes(p.source.as_bytes());
     w.bytes(p.name.as_bytes());
     w.u8(p.nparams);
@@ -198,7 +222,7 @@ fn write_proto<C>(w: &mut Writer, lua: &Lua<C>, p: &Proto) {
 
     w.u32(p.protos.len() as u32);
     for proto in &p.protos {
-        write_proto(w, lua, proto);
+        write_proto(w, lua, proto, depth + 1)?;
     }
 
     w.u32(p.call_names.len() as u32);
@@ -217,6 +241,7 @@ fn write_proto<C>(w: &mut Writer, lua: &Lua<C>, p: &Proto) {
     for e in &p.reg_extent {
         w.u8(*e);
     }
+    Ok(())
 }
 
 fn write_const<C>(w: &mut Writer, lua: &Lua<C>, v: Value) {
@@ -482,14 +507,151 @@ pub(super) fn undump<C>(
     if r.u8()? != VERSION {
         return Err("bad binary format (unsupported slew bytecode version)".into());
     }
-    let proto = read_proto(&mut r, lua)?;
+    let proto = read_proto(&mut r, lua, 0)?;
     if r.pos != bytes.len() {
         return Err("trailing bytes in binary chunk".into());
     }
+    validate_proto(&proto)?;
     Ok(lua.make_function_from_proto(Rc::new(proto), env))
 }
 
-fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
+fn validate_proto(p: &Proto) -> Result<(), String> {
+    let bad = |what: &str| Err(format!("bad binary format ({what})"));
+    if p.max_regs == 0 || p.max_regs > MAX_REGS {
+        return bad("register count out of range");
+    }
+    let regs = p.max_regs as usize;
+    if p.nparams > p.max_regs {
+        return bad("too many parameters");
+    }
+    let ncode = p.code.len();
+    if p.lines.len() != ncode || p.reg_extent.len() != ncode || p.call_names.len() != ncode {
+        return bad("debug tables are not parallel to code");
+    }
+    if p.upval_names.len() != p.upvals.len() {
+        return bad("upvalue names are not parallel to upvalues");
+    }
+    // Every register the instruction names, and every static run it reads or
+    // writes, must fit the frame's `max_regs` slots. Counts use the VM's
+    // encoding: `0` is the open form and `n` means `n - 1` items for the
+    // multi-value fields (`Call`/`TailCall` `nargs`, `Return`, `Vararg`),
+    // while `LoadNil`/`SetList`/`Concat` carry a raw count.
+    let one = |r: u8| (r as usize) < regs; // a named register slot
+    let at_most = |r: u8| r as usize <= regs; // ...or the one-past-end watermark
+    let run = |base: u8, count: usize| (base as usize) < regs && base as usize + count <= regs;
+    for (pc, ins) in p.code.iter().enumerate() {
+        let regs_ok = match *ins {
+            Instr::LoadK { dst, .. }
+            | Instr::LoadBool { dst, .. }
+            | Instr::GetUpval { dst, .. }
+            | Instr::NewTable { dst }
+            | Instr::Closure { dst, .. } => one(dst),
+            Instr::LoadNil { dst, n } => run(dst, n as usize),
+            Instr::Move { dst, src } | Instr::Unary { dst, src, .. } => one(dst) && one(src),
+            Instr::SetUpval { src, .. } | Instr::Test { src, .. } => one(src),
+            Instr::GetIndex { dst, obj, key } => one(dst) && one(obj) && one(key),
+            Instr::GetField { dst, obj, .. } => one(dst) && one(obj),
+            Instr::SetIndex { obj, key, src } => one(obj) && one(key) && one(src),
+            Instr::SetField { obj, src, .. } => one(obj) && one(src),
+            // `n == 0` takes its count from the dynamic top, so only the
+            // object and base slots are pinned.
+            Instr::SetList { obj, base, n, .. } => {
+                one(obj) && one(base) && (n == 0 || run(base, n as usize))
+            }
+            Instr::Arith { dst, lhs, rhs, .. } | Instr::Cmp { dst, lhs, rhs, .. } => {
+                one(dst) && one(lhs) && one(rhs)
+            }
+            // `n == 0` is likewise open; `n` is the raw register count.
+            Instr::Concat { dst, base, n } => {
+                one(dst) && one(base) && (n == 0 || run(base, n as usize))
+            }
+            // `nargs` is `count + 1`; the callee sits at `base`, so the window
+            // is `base .. base + nargs - 1` (`0` is the open call).
+            Instr::Call { base, nargs, .. } | Instr::TailCall { base, nargs } => {
+                one(base) && run(base, nargs.max(1) as usize)
+            }
+            // `n == 1` returns no values, and `n == 0` runs from `base` up to
+            // the dynamic top, so neither pins a static window; `base` may sit
+            // just past the last register (`free_reg == max_regs` is a shape
+            // the compiler emits).
+            Instr::Return { base, n } => {
+                if n <= 1 {
+                    at_most(base)
+                } else {
+                    run(base, (n - 1) as usize)
+                }
+            }
+            // `n == 1` copies no varargs; `n == 0` copies the whole list.
+            Instr::Vararg { dst, n } => one(dst) && (n <= 1 || run(dst, (n - 1) as usize)),
+            // `UNPATCHED_CLOSE` never names a register; `Jump` names none.
+            Instr::Close {
+                from: UNPATCHED_CLOSE,
+            }
+            | Instr::Jump { .. } => true,
+            Instr::Close { from } => one(from),
+            Instr::Tbc { reg, .. } => one(reg),
+            Instr::ForPrep { base, .. } | Instr::ForLoop { base, .. } => run(base, 4),
+            Instr::TForLoop { base, .. } => run(base, 5),
+        };
+        if !regs_ok {
+            return bad("register operand out of range");
+        }
+        match *ins {
+            Instr::LoadK { k, .. }
+            | Instr::GetField { k, .. }
+            | Instr::SetField { k, .. }
+            | Instr::Tbc { name: k, .. } => {
+                if k as usize >= p.consts.len() {
+                    return bad("constant index out of range");
+                }
+            }
+            Instr::Closure { p: child, .. } => {
+                if child as usize >= p.protos.len() {
+                    return bad("sub-prototype index out of range");
+                }
+            }
+            Instr::GetUpval { up, .. } | Instr::SetUpval { up, .. } => {
+                if up as usize >= p.upvals.len() {
+                    return bad("upvalue index out of range");
+                }
+            }
+            Instr::Jump { off }
+            | Instr::Test { off, .. }
+            | Instr::ForPrep { off, .. }
+            | Instr::ForLoop { off, .. }
+            | Instr::TForLoop { off, .. } => {
+                // Offsets are relative to the instruction after the jump.
+                let target = pc as i64 + 1 + i64::from(off);
+                if target < 0 || target as usize >= ncode {
+                    return bad("jump target out of range");
+                }
+            }
+            _ => {}
+        }
+    }
+    // A child closure captures from *this* frame, so its descriptors must
+    // resolve against this proto's registers and upvalue list.
+    for child in &p.protos {
+        for d in &child.upvals {
+            match *d {
+                UpvalDesc::Local(r) if r >= p.max_regs => {
+                    return bad("upvalue register out of range");
+                }
+                UpvalDesc::Upval(i) if i as usize >= p.upvals.len() => {
+                    return bad("upvalue index out of range");
+                }
+                _ => {}
+            }
+        }
+        validate_proto(child)?;
+    }
+    Ok(())
+}
+
+fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>, depth: usize) -> Result<Proto, String> {
+    if depth > MAX_PROTO_DEPTH {
+        return Err("binary chunk too deeply nested".into());
+    }
     let source = String::from_utf8_lossy(r.bytes()?).into_owned();
     let name = String::from_utf8_lossy(r.bytes()?).into_owned();
     let nparams = r.u8()?;
@@ -499,25 +661,25 @@ fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
     let lastlinedefined = r.u32()?;
 
     let n = r.u32()? as usize;
-    let mut code = Vec::with_capacity(n);
+    let mut code = new_vec(r, n)?;
     for _ in 0..n {
         code.push(read_instr(r)?);
     }
 
     let n = r.u32()? as usize;
-    let mut lines = Vec::with_capacity(n);
+    let mut lines = new_vec(r, n)?;
     for _ in 0..n {
         lines.push(r.u32()?);
     }
 
     let n = r.u32()? as usize;
-    let mut consts = Vec::with_capacity(n);
+    let mut consts = new_vec(r, n)?;
     for _ in 0..n {
         consts.push(read_const(r, lua)?);
     }
 
     let n = r.u32()? as usize;
-    let mut upvals = Vec::with_capacity(n);
+    let mut upvals = new_vec(r, n)?;
     for _ in 0..n {
         let tag = r.u8()?;
         let reg = r.u8()?;
@@ -529,7 +691,7 @@ fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
     }
 
     let n = r.u32()? as usize;
-    let mut upval_names = Vec::with_capacity(n);
+    let mut upval_names = new_vec(r, n)?;
     for _ in 0..n {
         upval_names.push(
             String::from_utf8_lossy(r.bytes()?)
@@ -539,13 +701,13 @@ fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
     }
 
     let n = r.u32()? as usize;
-    let mut protos = Vec::with_capacity(n);
+    let mut protos = new_vec(r, n)?;
     for _ in 0..n {
-        protos.push(Rc::new(read_proto(r, lua)?));
+        protos.push(Rc::new(read_proto(r, lua, depth + 1)?));
     }
 
     let n = r.u32()? as usize;
-    let mut call_names = Vec::with_capacity(n);
+    let mut call_names = new_vec(r, n)?;
     for _ in 0..n {
         if r.u8()? == 0 {
             call_names.push(None);
@@ -558,11 +720,13 @@ fn read_proto<C>(r: &mut Reader, lua: &mut Lua<C>) -> Result<Proto, String> {
         }
     }
 
+    // `reg_extent` is a GC rooting hint, so a chunk must not be able to
+    // under-report it: root the whole declared frame for loaded protos.
     let n = r.u32()? as usize;
-    let mut reg_extent = Vec::with_capacity(n);
     for _ in 0..n {
-        reg_extent.push(r.u8()?);
+        let _ = r.u8()?;
     }
+    let reg_extent = vec![max_regs; code.len()];
 
     Ok(Proto {
         code,
@@ -758,4 +922,104 @@ fn cmp_from_index(i: u8) -> Result<CmpOp, String> {
         3 => CmpOp::Le,
         _ => return Err("bad binary format (comparison op)".into()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a proto over `code` with parallel debug tables, so a test can
+    /// vary one field and see the validator's verdict.
+    fn proto_with(code: Vec<Instr>, consts: Vec<Value>, max_regs: u8) -> Proto {
+        let n = code.len();
+        Proto {
+            code,
+            source: Rc::from("=t"),
+            lines: vec![0; n],
+            consts,
+            protos: Vec::new(),
+            upval_names: Vec::new(),
+            upvals: Vec::new(),
+            nparams: 0,
+            is_vararg: true,
+            max_regs,
+            reg_extent: vec![max_regs; n],
+            name: "t".into(),
+            linedefined: 0,
+            lastlinedefined: 0,
+            call_names: vec![None; n],
+        }
+    }
+
+    #[test]
+    fn validate_proto_accepts_a_well_formed_proto() {
+        let p = proto_with(
+            vec![
+                Instr::LoadK { dst: 0, k: 0 },
+                Instr::Jump { off: 0 },
+                Instr::Return { base: 0, n: 2 },
+            ],
+            vec![Value::Int(1)],
+            2,
+        );
+        assert_eq!(validate_proto(&p), Ok(()));
+    }
+
+    #[test]
+    fn validate_proto_rejects_out_of_range_operands() {
+        // Constant index past the constant table.
+        let p = proto_with(
+            vec![
+                Instr::LoadK { dst: 0, k: 7 },
+                Instr::Return { base: 0, n: 2 },
+            ],
+            vec![Value::Int(1)],
+            2,
+        );
+        assert!(validate_proto(&p).is_err());
+
+        // Register operand beyond max_regs.
+        let p = proto_with(vec![Instr::Move { dst: 9, src: 0 }], Vec::new(), 2);
+        assert!(validate_proto(&p).is_err());
+
+        // A `Call` whose static argument window does not fit the frame.
+        let p = proto_with(
+            vec![Instr::Call {
+                base: 0,
+                nargs: 9,
+                nres: 0,
+            }],
+            Vec::new(),
+            2,
+        );
+        assert!(validate_proto(&p).is_err());
+
+        // Jump landing past the end of the code.
+        let p = proto_with(vec![Instr::Jump { off: 100 }], Vec::new(), 2);
+        assert!(validate_proto(&p).is_err());
+
+        // GetUpval with no upvalues declared.
+        let p = proto_with(vec![Instr::GetUpval { dst: 0, up: 0 }], Vec::new(), 2);
+        assert!(validate_proto(&p).is_err());
+
+        // Debug tables not parallel to the code.
+        let mut p = proto_with(vec![Instr::Return { base: 0, n: 1 }], Vec::new(), 2);
+        p.lines.clear();
+        assert!(validate_proto(&p).is_err());
+    }
+
+    #[test]
+    fn validate_proto_rejects_a_bad_sub_proto() {
+        // Closure referring to a sub-proto that does not exist.
+        let p = proto_with(vec![Instr::Closure { dst: 0, p: 3 }], Vec::new(), 2);
+        assert!(validate_proto(&p).is_err());
+
+        // A child capture register that the parent frame cannot provide.
+        let mut child = proto_with(vec![Instr::Return { base: 0, n: 1 }], Vec::new(), 2);
+        child.upvals = vec![UpvalDesc::Local(9)];
+        child.upval_names = vec!["x".into()];
+        let mut p = proto_with(vec![Instr::Closure { dst: 0, p: 0 }], Vec::new(), 2);
+        p.protos = vec![Rc::new(child)];
+        assert!(validate_proto(&p).is_err());
+    }
 }

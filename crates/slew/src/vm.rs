@@ -15,8 +15,8 @@ use crate::compiler::{CompileError, compile};
 use crate::host::{Host, HostObject, Userdata};
 use crate::parser::{ParseError, parse};
 use crate::value::{
-    ClosId, NativeId, StrRef, Strings, Table, TableId, ThreadId, UpvalId, UserdataId, Value,
-    float_to_exact_int, fmt_number,
+    ClosId, F64_TWO_POW_63, NativeId, StrRef, Strings, Table, TableId, ThreadId, UpvalId,
+    UserdataId, Value, float_to_exact_int, fmt_number,
 };
 use std::fmt;
 use std::fmt::Write as _;
@@ -1297,35 +1297,36 @@ fn to_float(v: Value) -> Option<f64> {
     }
 }
 
-/// `i < f` with exact semantics across the full i64/f64 ranges.
-fn int_lt_float(i: i64, f: f64) -> bool {
+/// Compares an integer against a float exactly across the full i64/f64 ranges.
+/// `or_equal` selects `i <= f`; otherwise `i < f`.
+fn int_cmp_float(i: i64, f: f64, or_equal: bool) -> bool {
     if f.is_nan() {
         return false;
     }
-    if f >= 9.223_372_036_854_776e18 {
+    if f >= F64_TWO_POW_63 {
         return true; // f >= 2^63 > any i64
     }
-    if f < -9.223_372_036_854_776e18 {
+    if f < -F64_TWO_POW_63 {
         return false;
     }
     let ff = f.floor();
     let fi = ff as i64;
-    i < fi || (i == fi && f > ff)
+    if or_equal {
+        // `ff` is the floor, so `i <= f` iff `i <= ff`.
+        i <= fi
+    } else {
+        i < fi || (i == fi && f > ff)
+    }
 }
 
+/// `i < f`.
+fn int_lt_float(i: i64, f: f64) -> bool {
+    int_cmp_float(i, f, false)
+}
+
+/// `i <= f`.
 fn int_le_float(i: i64, f: f64) -> bool {
-    if f.is_nan() {
-        return false;
-    }
-    if f >= 9.223_372_036_854_776e18 {
-        return true;
-    }
-    if f < -9.223_372_036_854_776e18 {
-        return false;
-    }
-    let ff = f.floor();
-    let fi = ff as i64;
-    i < fi || (i == fi && f >= ff)
+    int_cmp_float(i, f, true)
 }
 
 /// Converts a float limit of an integer `for` loop per Lua 5.4 (floor/ceil
@@ -1335,16 +1336,16 @@ fn for_int_limit(f: f64, step_positive: bool) -> Option<i64> {
         return None;
     }
     if step_positive {
-        if f < -9.223_372_036_854_776e18 {
+        if f < -F64_TWO_POW_63 {
             None
-        } else if f >= 9.223_372_036_854_776e18 {
+        } else if f >= F64_TWO_POW_63 {
             Some(i64::MAX)
         } else {
             Some(f.floor() as i64)
         }
-    } else if f >= 9.223_372_036_854_776e18 {
+    } else if f >= F64_TWO_POW_63 {
         None
-    } else if f < -9.223_372_036_854_776e18 {
+    } else if f < -F64_TWO_POW_63 {
         Some(i64::MIN)
     } else {
         Some(f.ceil() as i64)
@@ -1766,8 +1767,7 @@ impl<C> Lua<C> {
     /// Panics if the global table rejects the new entry.
     pub fn register_native(&mut self, name: &str, f: NativeFn<C>) -> Value {
         let v = self.add_native(name, f);
-        let k = self.new_string(name.as_bytes());
-        self.tables[self.globals.0 as usize].set(k, v).unwrap();
+        self.set_global(name, v);
         v
     }
 
@@ -1783,8 +1783,7 @@ impl<C> Lua<C> {
     /// Panics if the global table rejects the new entry.
     pub fn register_suspendable_native(&mut self, name: &str, f: SuspendableNativeFn<C>) -> Value {
         let v = self.add_suspendable_native(name, f);
-        let k = self.new_string(name.as_bytes());
-        self.tables[self.globals.0 as usize].set(k, v).unwrap();
+        self.set_global(name, v);
         v
     }
 
@@ -1813,8 +1812,7 @@ impl<C> Lua<C> {
 
     pub(crate) fn register_intrinsic(&mut self, name: &str, i: Intrinsic) -> Value {
         let v = self.add_native_kind(name, NativeKind::Intrinsic(i));
-        let k = self.new_string(name.as_bytes());
-        self.tables[self.globals.0 as usize].set(k, v).unwrap();
+        self.set_global(name, v);
         v
     }
 
@@ -3283,6 +3281,12 @@ impl<C> Lua<C> {
         }
         let (instr, base) = {
             let f = th.frames.last_mut().unwrap().as_lua_mut();
+            if f.pc >= f.proto.code.len() {
+                return Err(Self::rt_err(
+                    th,
+                    "control fell off the end of a function".into(),
+                ));
+            }
             let i = f.proto.code[f.pc];
             f.pc += 1;
             (i, f.base)
@@ -3419,8 +3423,14 @@ impl<C> Lua<C> {
         n: u8,
         start: u32,
     ) -> Result<Flow, VmError> {
-        let Value::Table(t) = th.stack[base + obj as usize] else {
-            unreachable!("SetList on non-table")
+        let obj_val = th.stack[base + obj as usize];
+        let Value::Table(t) = obj_val else {
+            // Only reachable from a crafted binary chunk (`SetList` is always
+            // emitted on a freshly built table).
+            return Err(Self::rt_err(
+                th,
+                format!("attempt to index a {} value", obj_val.type_name()),
+            ));
         };
         let first = base + b as usize;
         let count = if n == 0 {
@@ -3742,7 +3752,15 @@ impl<C> Lua<C> {
                     jump(th, off);
                 }
             }
-            _ => unreachable!("ForLoop after ForPrep normalization"),
+            _ => {
+                // Only reachable from a crafted binary chunk: the compiler
+                // always emits `ForPrep` before `ForLoop`, which normalizes
+                // the control/limit/step registers to all-int or all-float.
+                return Err(Self::rt_err(
+                    th,
+                    "'for' loop control/limit/step must be a number".into(),
+                ));
+            }
         }
         Ok(Flow::Continue)
     }
@@ -5424,7 +5442,11 @@ impl<C> Lua<C> {
 
     /// Puts a coroutine into the dead state, dropping its frames and stack.
     fn finish_close(&mut self, co: ThreadId) {
-        let ct = &mut self.threads[co.0 as usize];
+        // Closures that escaped the coroutine can still reference its open
+        // upvalues; close them before the stack disappears, or a later read or
+        // write would index a dead stack.
+        let mut ct = std::mem::take(&mut self.threads[co.0 as usize]);
+        self.close_upvals(&mut ct, 0);
         ct.status = CoStatus::Dead;
         ct.frames.clear();
         ct.stack.clear();
@@ -5433,6 +5455,7 @@ impl<C> Lua<C> {
         ct.resume_ret = None;
         ct.yield_ret = None;
         ct.close_error = None;
+        self.threads[co.0 as usize] = ct;
     }
 
     /// Calls the value at `f_abs` under error protection: results arrive as

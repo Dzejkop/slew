@@ -478,3 +478,189 @@ fn string_dump_round_trips_and_loads_binary() {
         "true"
     );
 }
+
+#[test]
+fn undump_rejects_absurd_element_counts() {
+    // A crafted chunk that claims a `u32::MAX`-long `code` array must be
+    // rejected as truncated, not abort the host by reserving gigabytes.
+    let mut lua = Lua::new();
+    assert_eq!(
+        eval(
+            &mut lua,
+            r"
+            local bytes = {
+            -- PUC header (signature/version/format/sizes) == \27Lua\84\0\25\147\r\n\26\n\4\8\8
+              27, 76, 117, 97, 0x54, 0, 0x19, 0x93, 13, 10, 26, 10, 4, 8, 8,
+            -- LUAC_INT sentinel 0x5678 (i64 LE)
+              0x78, 0x56, 0, 0, 0, 0, 0, 0,
+            -- LUAC_NUM sentinel 370.5 (f64 LE)
+              0, 0, 0, 0, 0, 0x28, 0x77, 0x40,
+            -- slew payload magic SLW1 + version 1
+              83, 76, 87, 49, 1,
+            -- proto: empty source, empty name, nparams/is_vararg/max_regs
+              0, 0, 0, 0,
+              0, 0, 0, 0,
+              0, 0, 0,
+            -- linedefined, lastlinedefined
+              0, 0, 0, 0,
+              0, 0, 0, 0,
+            -- code length = u32::MAX (the absurd count under test)
+              0xff, 0xff, 0xff, 0xff
+            }
+            local c = string.char(table.unpack(bytes))
+            local f, err = load(c)
+            return f == nil and string.find(err, 'truncated') ~= nil
+            "
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn crafted_chunks_error_instead_of_panicking() {
+    // Chunks that pass validation but drive the VM into states the compiler
+    // never emits must raise Lua errors at call time; a chunk with an
+    // out-of-range operand is rejected by `load` up front. Neither may abort
+    // the host process.
+    let mut lua = Lua::new();
+    assert_eq!(
+        eval(
+            &mut lua,
+            r"
+            local function chunk(code_bytes, max_regs)
+              local head = string.char(27,76,117,97,0x54,0,0x19,0x93,13,10,26,10,4,8,8)
+              local sent = string.char(0x78,0x56,0,0,0,0,0,0)
+                .. string.char(0,0,0,0,0,0x28,0x77,0x40) .. 'SLW1' .. string.char(1)
+              local function u32(n)
+                return string.char(n%256, math.floor(n/256)%256,
+                                    math.floor(n/65536)%256, math.floor(n/16777216)%256)
+              end
+              return head..sent
+                .. u32(0)..u32(0)..string.char(0,0,max_regs)..u32(0)..u32(0)
+                .. u32(1)..code_bytes..u32(1)..u32(0)
+                .. u32(0)..u32(0)..u32(0)..u32(0)
+                .. u32(1)..string.char(0)..u32(1)..string.char(max_regs)
+            end
+
+            -- SetList{obj:1,base:0,n:1,start:1}: 11 = SetList tag, then
+            -- obj/base/n as u8 and start as u32.
+            local a = assert(load(chunk(string.char(11,1,0,1,1,0,0,0), 2)))
+            local ok1, e1 = pcall(a)
+            -- ForLoop{base:0,off:-1} with no preceding ForPrep: 26 = ForLoop
+            -- tag, base u8, off i32.
+            local b = assert(load(chunk(string.char(26,0,255,255,255,255), 4)))
+            local ok2, e2 = pcall(b)
+            -- Call{base:0,nargs:255,nres:0}: 18 = Call tag, base/nargs/nres.
+            local c, e3 = load(chunk(string.char(18,0,255,0), 2))
+
+            return ok1 == false and string.find(e1, 'attempt to index') ~= nil
+               and ok2 == false and string.find(e2, 'must be a number') ~= nil
+               and c == nil and string.find(e3, 'register operand out of range') ~= nil
+            "
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn dumped_protos_with_tables_and_bare_returns_round_trip() {
+    // `string.dump` output must load back: the validator's register bounds
+    // must accept everything the compiler emits (table constructors and
+    // zero-value returns are the tight cases).
+    let mut lua = Lua::new();
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = function() return {1, 2, 3} end \
+             local g = assert(load(string.dump(f))) \
+             return #g()"
+        ),
+        "3"
+    );
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = function() local a, b return a, b end \
+             local g = assert(load(string.dump(f))) \
+             return tostring(g())"
+        ),
+        "nil"
+    );
+    // A zero-value `return` after locals puts `base` at the register watermark.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = function() local a, b return end \
+             local g = assert(load(string.dump(f))) \
+             return select('#', g())"
+        ),
+        "0"
+    );
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = assert(load('local a, b return')) \
+             local g = assert(load(string.dump(f))) \
+             return select('#', g())"
+        ),
+        "0"
+    );
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = function(...) local s = 0 for i = 1, select('#', ...) do s = s + 1 end return s end \
+             local g = assert(load(string.dump(f))) \
+             return g(1, 2, 3)"
+        ),
+        "3"
+    );
+    // A generic `for` with more variables than the iterator call's 3-slot
+    // staging window exercises the result-register accounting.
+    assert_eq!(
+        eval(
+            &mut lua,
+            "local f = function() \
+               for a, b, c, d in pairs({x = 1}) do return a, b, c, d end \
+             end \
+             local g = assert(load(string.dump(f))) \
+             return g()"
+        ),
+        "x"
+    );
+}
+
+#[test]
+fn crafted_empty_code_chunk_errors_at_call_time() {
+    // A proto with no instructions must not make the VM fetch `code[0]`.
+    let mut lua = Lua::new();
+    assert_eq!(
+        eval(
+            &mut lua,
+            r"
+            local bytes = {
+              27, 76, 117, 97, 0x54, 0, 0x19, 0x93, 13, 10, 26, 10, 4, 8, 8,
+              0x78, 0x56, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0x28, 0x77, 0x40,
+              83, 76, 87, 49, 1,
+              0, 0, 0, 0,  -- source
+              0, 0, 0, 0,  -- name
+              0, 0, 1,     -- nparams / is_vararg / max_regs
+              0, 0, 0, 0,  -- linedefined
+              0, 0, 0, 0,  -- lastlinedefined
+              0, 0, 0, 0,  -- code length 0
+              0, 0, 0, 0,  -- lines length 0
+              0, 0, 0, 0,  -- consts
+              0, 0, 0, 0,  -- upvals
+              0, 0, 0, 0,  -- upval names
+              0, 0, 0, 0,  -- sub-protos
+              0, 0, 0, 0,  -- call names
+              0, 0, 0, 0   -- reg extent
+            }
+            local f = assert(load(string.char(table.unpack(bytes))))
+            local ok, err = pcall(f)
+            return ok == false and string.find(err, 'fell off the end') ~= nil
+            "
+        ),
+        "true"
+    );
+}

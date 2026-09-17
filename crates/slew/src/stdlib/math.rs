@@ -286,9 +286,9 @@ fn n_random<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     if args.len() > 2 {
         return Err("wrong number of arguments".into());
     }
-    match (arg(args, 0), arg(args, 1)) {
-        (Value::Nil, _) => Ok(vec![Value::Float(i2d(rv))]),
-        (_, Value::Nil) => {
+    match args.len() {
+        0 => Ok(vec![Value::Float(i2d(rv))]),
+        1 => {
             let up = int(args, 0, "random")?;
             if up == 0 {
                 // single 0: full random integer

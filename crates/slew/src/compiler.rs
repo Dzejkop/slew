@@ -6,7 +6,9 @@
 //! args) are built from consecutive temporaries so the VM can splice frames.
 
 use crate::ast::{Attrib, BinOp, Block, Expr, FuncBody, Stmt, UnOp};
-use crate::bytecode::{ArithOp, CmpOp, Instr, Proto, UnaryOp, UpvalDesc};
+use crate::bytecode::{
+    ArithOp, CmpOp, Instr, MAX_REGS, Proto, UNPATCHED_CLOSE, UnaryOp, UpvalDesc,
+};
 use crate::value::{Strings, Value};
 use std::collections::HashMap;
 use std::fmt;
@@ -85,8 +87,8 @@ struct LoopCtx {
 }
 
 /// A `goto` whose label hasn't been seen yet. `close_pc` points at a
-/// placeholder `Close` (from=255, a no-op) patched when the target's
-/// register floor is known.
+/// placeholder `Close` (`from = UNPATCHED_CLOSE`, a no-op) patched when the
+/// target's register floor is known.
 struct PendingGoto {
     name: Box<str>,
     close_pc: usize,
@@ -230,6 +232,14 @@ enum Target {
     Field { obj: u8, k: u16 },
 }
 
+/// How [`Compiler::emit_call`] emits a call: a plain `Call` (whose result
+/// count is `None` for an open/multret tail) or a frame-reusing `TailCall`.
+#[derive(Clone, Copy)]
+enum CallKind {
+    Call(Option<usize>),
+    Tail,
+}
+
 struct Compiler<'h> {
     strings: &'h mut Strings,
     funcs: Vec<FuncState>,
@@ -295,7 +305,7 @@ impl Compiler<'_> {
 
     fn alloc_reg(&mut self) -> Result<u8, CompileError> {
         let fs = self.fs();
-        if fs.free_reg >= 250 {
+        if fs.free_reg >= MAX_REGS {
             return self.err("function or expression too complex (out of registers)");
         }
         let r = fs.free_reg;
@@ -602,7 +612,9 @@ impl Compiler<'_> {
                     self.emit(Instr::Jump { off });
                 } else {
                     // forward goto: placeholder Close (no-op until patched)
-                    let close_pc = self.emit(Instr::Close { from: 255 });
+                    let close_pc = self.emit(Instr::Close {
+                        from: UNPATCHED_CLOSE,
+                    });
                     let jump_pc = self.emit(Instr::Jump { off: 0 });
                     let nact = self.funcs.last().unwrap().locals.len();
                     self.funcs.last_mut().unwrap().gotos.push(PendingGoto {
@@ -845,7 +857,9 @@ impl Compiler<'_> {
                 // call site: iterator(state, control) -> vars
                 let nvars = vars.len();
                 let save = self.fs().free_reg;
-                let tmp = self.alloc_regs(3)?;
+                // The call returns `nvars` values into `tmp..`, so the window
+                // must fit even when the loop has more than 3 variables.
+                let tmp = self.alloc_regs(nvars.max(3))?;
                 self.emit(Instr::Move {
                     dst: tmp,
                     src: base,
@@ -1162,48 +1176,7 @@ impl Compiler<'_> {
     /// register; for fixed `nres` the result registers stay allocated.
     fn call_like(&mut self, e: &Expr, nres: Option<usize>) -> Result<u8, CompileError> {
         let base = self.alloc_reg()?;
-        match e {
-            Expr::Call { func, args, line } => {
-                self.at_line(*line);
-                let name = self.callee_name(func);
-                self.expr_to_reg(func, base)?;
-                self.fs().free_reg = base + 1;
-                let argc = self.compile_args(args)?;
-                self.at_line(*line);
-                let idx = self.emit(Instr::Call {
-                    base,
-                    nargs: argc.map_or(0, |c| c as u8 + 1),
-                    nres: enc(nres),
-                });
-                self.fs().call_names[idx] = name;
-            }
-            Expr::MethodCall {
-                obj,
-                name,
-                args,
-                line,
-            } => {
-                self.at_line(*line);
-                let selfr = self.alloc_reg()?; // base + 1
-                self.expr_to_reg(obj, selfr)?;
-                self.fs().free_reg = base + 2;
-                let k = self.str_const(name.as_bytes())?;
-                self.emit(Instr::GetField {
-                    dst: base,
-                    obj: selfr,
-                    k,
-                });
-                let argc = self.compile_args(args)?;
-                self.at_line(*line);
-                let idx = self.emit(Instr::Call {
-                    base,
-                    nargs: argc.map_or(0, |c| c as u8 + 2),
-                    nres: enc(nres),
-                });
-                self.fs().call_names[idx] = Some(("method", name.clone()));
-            }
-            _ => unreachable!("call_like on non-call"),
-        }
+        self.emit_call(e, base, CallKind::Call(nres))?;
         // release the call window, keep fixed results
         self.fs().free_reg = base + nres.unwrap_or(0) as u8;
         let watermark = self.local_top();
@@ -1220,10 +1193,24 @@ impl Compiler<'_> {
         Ok(base)
     }
 
-    /// Compiles `return <call>` as a proper tail call. Mirrors `call_like`
-    /// but emits `TailCall` (open results) so the VM reuses the frame.
+    /// Compiles `return <call>` as a proper tail call. Emits an open-result
+    /// `TailCall` so the VM reuses the frame.
     fn tail_call_like(&mut self, e: &Expr) -> Result<(), CompileError> {
         let base = self.alloc_reg()?;
+        self.emit_call(e, base, CallKind::Tail)
+    }
+
+    /// Emits the call for `e` with the callee placed at `base`. Both call
+    /// shapes share the callee/self-slot layout.
+    fn emit_call(&mut self, e: &Expr, base: u8, kind: CallKind) -> Result<(), CompileError> {
+        let instr = |nargs: u8| match kind {
+            CallKind::Tail => Instr::TailCall { base, nargs },
+            CallKind::Call(nres) => Instr::Call {
+                base,
+                nargs,
+                nres: enc(nres),
+            },
+        };
         match e {
             Expr::Call { func, args, line } => {
                 self.at_line(*line);
@@ -1232,10 +1219,7 @@ impl Compiler<'_> {
                 self.fs().free_reg = base + 1;
                 let argc = self.compile_args(args)?;
                 self.at_line(*line);
-                let idx = self.emit(Instr::TailCall {
-                    base,
-                    nargs: argc.map_or(0, |c| c as u8 + 1),
-                });
+                let idx = self.emit(instr(argc.map_or(0, |c| c as u8 + 1)));
                 self.fs().call_names[idx] = name;
             }
             Expr::MethodCall {
@@ -1256,30 +1240,20 @@ impl Compiler<'_> {
                 });
                 let argc = self.compile_args(args)?;
                 self.at_line(*line);
-                let idx = self.emit(Instr::TailCall {
-                    base,
-                    nargs: argc.map_or(0, |c| c as u8 + 2),
-                });
+                let idx = self.emit(instr(argc.map_or(0, |c| c as u8 + 2)));
                 self.fs().call_names[idx] = Some(("method", name.clone()));
             }
-            _ => unreachable!("tail_call_like on non-call"),
+            _ => unreachable!("emit_call on non-call"),
         }
         Ok(())
     }
 
     /// Compiles call arguments into consecutive registers above the current
-    /// free register. Returns Some(count) or None for an open tail.
+    /// free register. Returns `Some(count)`, or `None` when the last argument
+    /// is a multret expression (an open tail). Shares `explist_open`'s layout;
+    /// only the discarded base register differs.
     fn compile_args(&mut self, args: &[Expr]) -> Result<Option<usize>, CompileError> {
-        for (i, a) in args.iter().enumerate() {
-            let last = i + 1 == args.len();
-            if last && a.is_multret() {
-                self.multret_tail(a, None)?;
-                return Ok(None);
-            }
-            let r = self.alloc_reg()?;
-            self.expr_to_reg(a, r)?;
-        }
-        Ok(Some(args.len()))
+        Ok(self.explist_open(args)?.1)
     }
 
     // ---- expressions ----

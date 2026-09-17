@@ -11,17 +11,12 @@ documentation = "https://docs.rs/slew"
 readme = "README.md"
 keywords = ["lua", "interpreter", "vm", "sandbox", "embedding"]
 categories = ["development-tools", "emulators"]
-# Repo infrastructure that has no place in the published crate. Everything
-# else (src, tests, examples, DESIGN.md, README.md) ships.
-exclude = [
-    "/.github",
-    "/docs",
-    "/scripts",
-    "/flake.nix",
-    "/flake.lock",
-    "/release-plz.toml",
-    "/rustfmt.toml",
-]
+
+# `cargo test` only *compiles* examples by default; run the TUI example's
+# channel/prompt tests as part of the normal test target.
+[[example]]
+name = "tui"
+test = true
 
 [dependencies]
 reedline = { workspace = true, optional = true }

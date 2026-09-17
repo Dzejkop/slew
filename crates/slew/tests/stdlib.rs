@@ -428,6 +428,28 @@ fn table_concat_pack_unpack() {
 }
 
 #[test]
+fn select_index_forms_and_errors() {
+    // Only a string starting with '#' is the count form (PUC luaB_select).
+    assert_eq!(eval("return select('#', 10, 20, 30)"), "3");
+    assert!(run_err("return select('abc', 10, 20)").contains("number expected"));
+    // A negative index counts back from the end.
+    assert_eq!(eval("return select(-1, 10, 20, 30)"), "30");
+    assert_eq!(eval_multi("return select(-2, 10, 20, 30)"), ["20", "30"]);
+    // ...but an index before the first vararg is out of range, not clamped.
+    assert!(run_err("return select(-4, 10, 20, 30)").contains("index out of range"));
+    assert_eq!(
+        eval_multi("return select(-3, 10, 20, 30)"),
+        ["10", "20", "30"]
+    );
+    // Index 0 and fractional indices are out of range / not integers; integral
+    // floats and numeric strings coerce like luaL_checkinteger.
+    assert!(run_err("return select(0, 10)").contains("index out of range"));
+    assert!(run_err("return select(1.5, 10, 20)").contains("no integer representation"));
+    assert_eq!(eval_multi("return select(2.0, 10, 20, 30)"), ["20", "30"]);
+    assert_eq!(eval_multi("return select('2', 10, 20, 30)"), ["20", "30"]);
+}
+
+#[test]
 fn ipairs_wraps_at_maxinteger() {
     assert_eq!(
         eval(
@@ -758,6 +780,9 @@ fn math_random_deterministic() {
 #[test_case("local x, y = math.randomseed(123, 456) local a = math.random(0) math.randomseed(x, y) return math.random(0) == a and type(x) == 'number' and type(y) == 'number'" => "true"; "randomseed_returns_seed_words_and_reseeding_repeats")]
 #[test_case("math.randomseed(1) for i = 1, 500 do local r = math.random(7) assert(r >= 1 and r <= 7) end for i = 1, 500 do local r = math.random(-3, 3) assert(r >= -3 and r <= 3) end return 'ok'" => "ok"; "single_arg_bound_projects_into_range")]
 #[test_case("return (pcall(math.random, 1, 2, 3))" => "false"; "more_than_two_args_is_error")]
+#[test_case("return (pcall(math.random, nil))" => "false"; "explicit_nil_single_arg_is_error")]
+#[test_case("return (pcall(math.random, 1, nil))" => "false"; "explicit_nil_second_arg_is_error")]
+#[test_case("return (pcall(math.random, nil, 3))" => "false"; "explicit_nil_first_arg_is_error")]
 #[test_case("return (pcall(math.random, math.maxinteger, math.maxinteger - 1))" => "false"; "reversed_maxinteger_bounds_is_error")]
 fn math_random_matches_puc_xoshiro(src: &str) -> String {
     eval(src)

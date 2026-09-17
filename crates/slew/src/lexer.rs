@@ -70,8 +70,42 @@ pub enum Token {
     Eof,
 }
 
+/// The Lua 5.4 reserved words. One table drives both directions (`keyword`
+/// text → token, `keyword_str` token → text) so they cannot drift apart.
+const KEYWORDS: &[(&str, Token)] = &[
+    ("and", Token::And),
+    ("break", Token::Break),
+    ("do", Token::Do),
+    ("else", Token::Else),
+    ("elseif", Token::Elseif),
+    ("end", Token::End),
+    ("false", Token::False),
+    ("for", Token::For),
+    ("function", Token::Function),
+    ("goto", Token::Goto),
+    ("if", Token::If),
+    ("in", Token::In),
+    ("local", Token::Local),
+    ("nil", Token::Nil),
+    ("not", Token::Not),
+    ("or", Token::Or),
+    ("repeat", Token::Repeat),
+    ("return", Token::Return),
+    ("then", Token::Then),
+    ("true", Token::True),
+    ("until", Token::Until),
+    ("while", Token::While),
+];
+
+fn keyword_str(t: &Token) -> Option<&'static str> {
+    KEYWORDS.iter().find(|(_, k)| k == t).map(|(s, _)| *s)
+}
+
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(kw) = keyword_str(self) {
+            return f.write_str(kw);
+        }
         match self {
             Token::Name(n) => write!(f, "{n}"),
             Token::Int(i) => write!(f, "{i}"),
@@ -80,28 +114,6 @@ impl fmt::Display for Token {
             Token::Eof => write!(f, "<eof>"),
             t => {
                 let s = match t {
-                    Token::And => "and",
-                    Token::Break => "break",
-                    Token::Do => "do",
-                    Token::Else => "else",
-                    Token::Elseif => "elseif",
-                    Token::End => "end",
-                    Token::False => "false",
-                    Token::For => "for",
-                    Token::Function => "function",
-                    Token::Goto => "goto",
-                    Token::If => "if",
-                    Token::In => "in",
-                    Token::Local => "local",
-                    Token::Nil => "nil",
-                    Token::Not => "not",
-                    Token::Or => "or",
-                    Token::Repeat => "repeat",
-                    Token::Return => "return",
-                    Token::Then => "then",
-                    Token::True => "true",
-                    Token::Until => "until",
-                    Token::While => "while",
                     Token::Plus => "+",
                     Token::Minus => "-",
                     Token::Star => "*",
@@ -163,31 +175,10 @@ pub struct Lexer<'a> {
 }
 
 fn keyword(s: &str) -> Option<Token> {
-    Some(match s {
-        "and" => Token::And,
-        "break" => Token::Break,
-        "do" => Token::Do,
-        "else" => Token::Else,
-        "elseif" => Token::Elseif,
-        "end" => Token::End,
-        "false" => Token::False,
-        "for" => Token::For,
-        "function" => Token::Function,
-        "goto" => Token::Goto,
-        "if" => Token::If,
-        "in" => Token::In,
-        "local" => Token::Local,
-        "nil" => Token::Nil,
-        "not" => Token::Not,
-        "or" => Token::Or,
-        "repeat" => Token::Repeat,
-        "return" => Token::Return,
-        "then" => Token::Then,
-        "true" => Token::True,
-        "until" => Token::Until,
-        "while" => Token::While,
-        _ => return None,
-    })
+    KEYWORDS
+        .iter()
+        .find(|(k, _)| *k == s)
+        .map(|(_, t)| t.clone())
 }
 
 impl<'a> Lexer<'a> {
@@ -213,6 +204,20 @@ impl<'a> Lexer<'a> {
 
     fn peek2(&self) -> Option<u8> {
         self.src.get(self.pos + 1).copied()
+    }
+
+    /// Rejects a numeral immediately followed by an identifier character
+    /// (`0x10g`, `1or 2`): the intended token boundary is ambiguous, so PUC
+    /// reports a malformed number rather than splitting the token.
+    fn end_number(&self) -> Result<(), LexError> {
+        if self
+            .peek()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            self.err("malformed number")
+        } else {
+            Ok(())
+        }
     }
 
     fn bump(&mut self) -> Option<u8> {
@@ -481,6 +486,7 @@ impl<'a> Lexer<'a> {
                     _ => break,
                 }
             }
+            self.end_number()?;
             let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
             if is_float {
                 match parse_hex_float(&text[2..]) {
@@ -516,12 +522,7 @@ impl<'a> Lexer<'a> {
                     _ => break,
                 }
             }
-            if self
-                .peek()
-                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-            {
-                return self.err("malformed number");
-            }
+            self.end_number()?;
             let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
             if is_float {
                 text.parse::<f64>()
@@ -919,8 +920,24 @@ mod tests {
         assert!(l.next_token().is_err());
         let mut l = Lexer::new(b"[[unfinished");
         assert!(l.next_token().is_err());
-        let mut l = Lexer::new(b"3a");
-        assert!(l.next_token().is_err());
+        // A numeral immediately followed by an identifier character is
+        // malformed in both the decimal and the hex form (PUC `read_numeral`).
+        assert_eq!(lex_err("3a"), "malformed number");
+        assert_eq!(lex_err("0x10g"), "malformed number");
+        assert_eq!(lex_err("0x10or 3"), "malformed number");
+        assert_eq!(lex_err("0x1p2z"), "malformed number");
+    }
+
+    #[test]
+    fn keywords_round_trip() {
+        // `keyword` (text -> token) and `Display` (token -> text) are driven by
+        // one table; every reserved word must survive both directions.
+        for (text, tok) in KEYWORDS {
+            assert_eq!(keyword(text), Some(tok.clone()));
+            assert_eq!(tok.to_string(), *text);
+            assert_eq!(lex(text), vec![tok.clone()]);
+        }
+        assert_eq!(keyword("not_a_keyword"), None);
     }
 
     #[test]

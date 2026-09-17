@@ -570,19 +570,49 @@ fn parse_int_base(s: &str, base: i64) -> Option<i64> {
     Some(if negate { v.wrapping_neg() } else { v })
 }
 
-fn n_select<C>(_lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
+fn n_select<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
     let rest = args.get(1..).unwrap_or(&[]);
-    match arg(args, 0) {
-        Value::Str(_) => Ok(vec![Value::Int(rest.len() as i64)]), // select('#', ...)
-        Value::Int(i) if i > 0 => {
-            let start = (i as usize - 1).min(rest.len());
-            Ok(rest[start..].to_vec())
+    // PUC only treats a string starting with '#' as the count form; any other
+    // string falls through to the integer check below.
+    if let Value::Str(id) = arg(args, 0)
+        && lua.strings.get(id).first() == Some(&b'#')
+    {
+        return Ok(vec![Value::Int(rest.len() as i64)]);
+    }
+    // `luaL_checkinteger`: integral floats and numeric strings coerce.
+    let not_int =
+        || "bad argument #1 to 'select' (number has no integer representation)".to_string();
+    let idx = match arg(args, 0) {
+        Value::Int(i) => i,
+        Value::Float(f) => crate::value::float_to_exact_int(f).ok_or_else(not_int)?,
+        Value::Str(s) => match parse_number(lua.strings.get(s)) {
+            Some(Value::Int(i)) => i,
+            Some(Value::Float(f)) => crate::value::float_to_exact_int(f).ok_or_else(not_int)?,
+            _ => {
+                return Err("bad argument #1 to 'select' (number expected, got string)".to_string());
+            }
+        },
+        v => {
+            return Err(format!(
+                "bad argument #1 to 'select' (number expected, got {})",
+                v.type_name()
+            ));
         }
-        Value::Int(i) if i < 0 => {
-            let start = rest.len().saturating_sub(i.unsigned_abs() as usize);
-            Ok(rest[start..].to_vec())
+    };
+    if idx < 0 {
+        // PUC computes a 1-based index and rejects anything before the first
+        // vararg instead of clamping.
+        let n = idx.unsigned_abs() as usize;
+        if n > rest.len() {
+            return Err("bad argument #1 to 'select' (index out of range)".into());
         }
-        _ => Err("bad argument #1 to 'select' (index out of range)".into()),
+        Ok(rest[rest.len() - n..].to_vec())
+    } else if idx >= 1 {
+        let start = (idx as usize - 1).min(rest.len());
+        Ok(rest[start..].to_vec())
+    } else {
+        // Index 0 is not in range (PUC's `1 <= i` check).
+        Err("bad argument #1 to 'select' (index out of range)".into())
     }
 }
 

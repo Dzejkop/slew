@@ -1,8 +1,8 @@
 //! Values, interned strings, and tables.
 //!
 //! All GC objects live in arenas owned by the `Lua` state and are referenced
-//! by index handles, which keeps `Value` `Copy` and makes a future mark-sweep
-//! collector straightforward (no `Rc` cycles, no unsafe).
+//! by index handles, which keeps `Value` `Copy` and lets the mark-sweep
+//! collector traverse them directly (no `Rc` cycles, no unsafe).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -302,10 +302,15 @@ pub fn to_key(v: Value) -> Result<HKey, &'static str> {
     })
 }
 
+/// `2^63` exactly, as an `f64`. Lua 5.4's int/float comparison and conversion
+/// boundaries are defined by `-2^63 <= n < 2^63`, so both the inclusive lower
+/// and exclusive upper bound derive from this constant.
+pub(crate) const F64_TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
 /// `Some(i)` iff `f` represents exactly the integer `i` (in i64 range).
 #[must_use]
 pub fn float_to_exact_int(f: f64) -> Option<i64> {
-    if f.fract() == 0.0 && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&f) {
+    if f.fract() == 0.0 && (-F64_TWO_POW_63..F64_TWO_POW_63).contains(&f) {
         Some(f as i64)
     } else {
         None

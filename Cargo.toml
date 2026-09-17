@@ -45,7 +45,8 @@ too_many_lines = "allow"
 many_single_char_names = "allow"
 similar_names = "allow"
 
-# `LuaConfig`-style types carry independent boolean switches, which is exactly
+# Flag-heavy types such as `stdlib::string::Flags` carry independent boolean
+# switches, which is exactly
 # what this lint flags but reads better than a bitfield here.
 struct_excessive_bools = "allow"
 

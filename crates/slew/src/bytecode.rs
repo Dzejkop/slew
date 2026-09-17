@@ -8,6 +8,16 @@
 use crate::value::Value;
 use std::rc::Rc;
 
+/// `Close` register value for a forward `goto` that needed no scope close.
+/// It is only re-patched when the jump actually leaves captured or
+/// to-be-closed locals, so the VM (and the binary-chunk reader) must treat it
+/// as a no-op rather than as a register number.
+pub const UNPATCHED_CLOSE: u8 = 255;
+
+/// Register ceiling per function frame. The compiler refuses to allocate
+/// beyond it, and the binary-chunk reader rejects protos that claim more.
+pub const MAX_REGS: u8 = 250;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithOp {
     Add,
@@ -222,8 +232,11 @@ impl Instr {
                 m(m(dst, lhs), rhs).saturating_add(1)
             }
             Instr::Concat { dst, base, n } => m(dst.saturating_add(1), base.saturating_add(n)),
-            // 255 is the unpatched `Close` placeholder.
-            Instr::Jump { .. } | Instr::Close { from: 255 } => 0,
+            // `UNPATCHED_CLOSE` marks a not-yet-patched forward `goto`.
+            Instr::Jump { .. }
+            | Instr::Close {
+                from: UNPATCHED_CLOSE,
+            } => 0,
             Instr::Call { base, .. } | Instr::TailCall { base, .. } => base.saturating_add(1),
             Instr::Return { base, n } => {
                 if n == 0 {

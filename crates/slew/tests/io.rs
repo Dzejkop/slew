@@ -241,6 +241,26 @@ fn closed_file_use_errors() {
 }
 
 #[test]
+fn tostring_on_a_closed_file_reports_closed() {
+    let mut lua = with_host();
+    let name = format!("slew_tostring_closed_{}", std::process::id());
+    let src = format!(
+        r#"
+        local f = assert(io.open("{name}", "w"))
+        f:close()
+        return tostring(f)
+        "#
+    );
+    let vals = run(&mut lua, &src);
+    let _ = std::fs::remove_file(std::env::temp_dir().join(&name));
+    assert_eq!(
+        lua.str_bytes(vals[0]),
+        Some(&b"file (closed)"[..]),
+        "a closed handle is still printable"
+    );
+}
+
+#[test]
 fn io_open_missing_returns_nil_msg_errno() {
     let mut lua = with_host();
     let vals = run(

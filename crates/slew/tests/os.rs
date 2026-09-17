@@ -55,6 +55,30 @@ fn clock_time_date_difftime() {
 }
 
 #[test]
+fn date_and_difftime_coercions() {
+    let mut lua = with_host();
+    let vals = run(
+        &mut lua,
+        r#"
+        -- difftime coerces integral floats/numeric strings for both arguments
+        assert(os.difftime("10", 5) == 5.0)
+        assert(os.difftime(10.0, 3.0) == 7.0)
+        assert(not pcall(os.difftime, 10))
+        assert(not pcall(os.difftime, 10, nil))
+        assert(not pcall(os.difftime, 1.5, 0))
+        assert(not pcall(os.difftime, {}))
+        -- literal non-ASCII bytes in the format string pass through unchanged
+        return os.date("\xff%Y", 0)
+        "#,
+    );
+    assert_eq!(
+        lua.str_bytes(vals[0]),
+        Some(&b"\xff1970"[..]),
+        "os.date must not re-encode literal bytes"
+    );
+}
+
+#[test]
 fn tmpname_remove_rename() {
     let mut lua = with_host();
     let vals = run(

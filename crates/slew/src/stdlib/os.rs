@@ -5,8 +5,6 @@
 //! it records a request ([`crate::Lua::take_exit_request`]) and raises a
 //! controlled error the embedder can observe.
 
-use std::fmt::Write as _;
-
 use crate::host::{DateParts, HostError};
 use crate::value::Value;
 use crate::vm::Lua;
@@ -161,12 +159,20 @@ fn wday_index(p: &DateParts) -> usize {
     p.wday.rem_euclid(7) as usize
 }
 
-fn strftime(p: &DateParts, fmt: &[u8]) -> Result<String, String> {
-    let mut out = String::new();
+/// Formats into `out` without requiring UTF-8. The conversion specifiers only
+/// ever emit ASCII, but literal bytes from the format string must pass through
+/// unchanged (Lua strings are byte strings).
+fn push_fmt(out: &mut Vec<u8>, args: std::fmt::Arguments<'_>) {
+    let s = std::fmt::format(args);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn strftime(p: &DateParts, fmt: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < fmt.len() {
         if fmt[i] != b'%' {
-            out.push(fmt[i] as char);
+            out.push(fmt[i]);
             i += 1;
             continue;
         }
@@ -178,13 +184,17 @@ fn strftime(p: &DateParts, fmt: &[u8]) -> Result<String, String> {
         let wday = wday_index(p);
         let yday0 = p.yday - 1;
         match c {
-            b'a' => out.push_str(WDAY_ABBR[wday]),
-            b'A' => out.push_str(WDAY_FULL[wday]),
-            b'b' | b'h' => out.push_str(MON_ABBR[(p.month - 1).clamp(0, 11) as usize]),
-            b'B' => out.push_str(MON_FULL[(p.month - 1).clamp(0, 11) as usize]),
-            b'c' => {
-                let _ = write!(
-                    out,
+            b'a' => out.extend_from_slice(WDAY_ABBR[wday].as_bytes()),
+            b'A' => out.extend_from_slice(WDAY_FULL[wday].as_bytes()),
+            b'b' | b'h' => {
+                out.extend_from_slice(MON_ABBR[(p.month - 1).clamp(0, 11) as usize].as_bytes());
+            }
+            b'B' => {
+                out.extend_from_slice(MON_FULL[(p.month - 1).clamp(0, 11) as usize].as_bytes());
+            }
+            b'c' => push_fmt(
+                &mut out,
+                format_args!(
                     "{} {} {:2} {:02}:{:02}:{:02} {}",
                     WDAY_ABBR[wday],
                     MON_ABBR[(p.month - 1).clamp(0, 11) as usize],
@@ -193,64 +203,41 @@ fn strftime(p: &DateParts, fmt: &[u8]) -> Result<String, String> {
                     p.min,
                     p.sec,
                     p.year
-                );
-            }
-            b'd' => {
-                let _ = write!(out, "{:02}", p.day);
-            }
-            b'e' => {
-                let _ = write!(out, "{:2}", p.day);
-            }
-            b'H' => {
-                let _ = write!(out, "{:02}", p.hour);
-            }
+                ),
+            ),
+            b'd' => push_fmt(&mut out, format_args!("{:02}", p.day)),
+            b'e' => push_fmt(&mut out, format_args!("{:2}", p.day)),
+            b'H' => push_fmt(&mut out, format_args!("{:02}", p.hour)),
             b'I' => {
                 let h = p.hour % 12;
-                let _ = write!(out, "{:02}", if h == 0 { 12 } else { h });
+                push_fmt(&mut out, format_args!("{:02}", if h == 0 { 12 } else { h }));
             }
-            b'j' => {
-                let _ = write!(out, "{:03}", p.yday);
-            }
-            b'm' => {
-                let _ = write!(out, "{:02}", p.month);
-            }
-            b'M' => {
-                let _ = write!(out, "{:02}", p.min);
-            }
-            b'p' => out.push_str(if p.hour < 12 { "AM" } else { "PM" }),
-            b'S' => {
-                let _ = write!(out, "{:02}", p.sec);
-            }
-            b'U' => {
-                let _ = write!(out, "{:02}", (yday0 + 7 - p.wday.rem_euclid(7)) / 7);
-            }
-            b'w' => {
-                let _ = write!(out, "{}", p.wday.rem_euclid(7));
-            }
+            b'j' => push_fmt(&mut out, format_args!("{:03}", p.yday)),
+            b'm' => push_fmt(&mut out, format_args!("{:02}", p.month)),
+            b'M' => push_fmt(&mut out, format_args!("{:02}", p.min)),
+            b'p' => out.extend_from_slice(if p.hour < 12 { b"AM" } else { b"PM" }),
+            b'S' => push_fmt(&mut out, format_args!("{:02}", p.sec)),
+            b'U' => push_fmt(
+                &mut out,
+                format_args!("{:02}", (yday0 + 7 - p.wday.rem_euclid(7)) / 7),
+            ),
+            b'w' => push_fmt(&mut out, format_args!("{}", p.wday.rem_euclid(7))),
             b'W' => {
                 let mon = (p.wday.rem_euclid(7) + 6) % 7;
-                let _ = write!(out, "{:02}", (yday0 + 7 - mon) / 7);
+                push_fmt(&mut out, format_args!("{:02}", (yday0 + 7 - mon) / 7));
             }
-            b'x' => {
-                let _ = write!(
-                    out,
-                    "{:02}/{:02}/{:02}",
-                    p.month,
-                    p.day,
-                    p.year.rem_euclid(100)
-                );
-            }
-            b'X' => {
-                let _ = write!(out, "{:02}:{:02}:{:02}", p.hour, p.min, p.sec);
-            }
-            b'y' => {
-                let _ = write!(out, "{:02}", p.year.rem_euclid(100));
-            }
-            b'Y' => {
-                let _ = write!(out, "{}", p.year);
-            }
-            b'Z' => out.push_str("UTC"),
-            b'%' => out.push('%'),
+            b'x' => push_fmt(
+                &mut out,
+                format_args!("{:02}/{:02}/{:02}", p.month, p.day, p.year.rem_euclid(100)),
+            ),
+            b'X' => push_fmt(
+                &mut out,
+                format_args!("{:02}:{:02}:{:02}", p.hour, p.min, p.sec),
+            ),
+            b'y' => push_fmt(&mut out, format_args!("{:02}", p.year.rem_euclid(100))),
+            b'Y' => push_fmt(&mut out, format_args!("{}", p.year)),
+            b'Z' => out.extend_from_slice(b"UTC"),
+            b'%' => out.push(b'%'),
             _ => return Err(format!("invalid conversion specifier '%{}'", c as char)),
         }
     }
@@ -294,7 +281,7 @@ fn n_date<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
             isdst: false,
         },
     };
-    if fmt == b"*t" || fmt == b"!*t" {
+    if fmt == b"*t" {
         let table = lua.new_table();
         let fields: [(&str, i64); 8] = [
             ("year", parts.year),
@@ -313,27 +300,44 @@ fn n_date<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
         return Ok(vec![table]);
     }
     let s = strftime(&parts, &fmt)?;
-    Ok(vec![lua.new_string(s.as_bytes())])
+    Ok(vec![lua.new_string(&s)])
 }
 
 fn n_difftime<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
-    let _ = lua;
-    let to_num = |v: Value, i: usize| -> Result<f64, String> {
-        match v {
-            Value::Int(i) => Ok(i as f64),
-            Value::Float(f) => Ok(f),
-            Value::Str(_) => Err(format!(
-                "bad argument #{i} to 'difftime' (number expected, got string)"
-            )),
-            other => Err(format!(
-                "bad argument #{i} to 'difftime' (number expected, got {})",
+    // PUC's `os_difftime` checks BOTH arguments with `l_checktime`, i.e.
+    // `luaL_checkinteger`: integral floats and numeric strings coerce, while a
+    // missing, nil, or fractional argument is an error.
+    let t1 = check_time(lua, arg(args, 0), 1)?;
+    let t2 = check_time(lua, arg(args, 1), 2)?;
+    // Compute in f64 so a difference wider than i64 does not wrap.
+    Ok(vec![Value::Float(t1 as f64 - t2 as f64)])
+}
+
+/// `luaL_checkinteger`-ish for `os.difftime`: integers pass, integral floats
+/// and numeric strings coerce, everything else is a type/representation error.
+fn check_time<C>(lua: &Lua<C>, v: Value, argno: usize) -> Result<i64, String> {
+    let n = match v {
+        Value::Int(i) => return Ok(i),
+        Value::Float(f) => f,
+        Value::Str(s) => match super::parse_number(lua.strings.get(s)) {
+            Some(Value::Int(i)) => return Ok(i),
+            Some(Value::Float(f)) => f,
+            _ => {
+                return Err(format!(
+                    "bad argument #{argno} to 'difftime' (number expected, got string)"
+                ));
+            }
+        },
+        other => {
+            return Err(format!(
+                "bad argument #{argno} to 'difftime' (number expected, got {})",
                 other.type_name()
-            )),
+            ));
         }
     };
-    let t2 = to_num(arg(args, 0), 1)?;
-    let t1 = to_num(arg(args, 1), 2)?;
-    Ok(vec![Value::Float(t2 - t1)])
+    crate::value::float_to_exact_int(n).ok_or_else(|| {
+        format!("bad argument #{argno} to 'difftime' (number has no integer representation)")
+    })
 }
 
 fn n_getenv<C>(lua: &mut Lua<C>, args: &[Value]) -> Result<Vec<Value>, String> {
