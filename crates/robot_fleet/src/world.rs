@@ -301,8 +301,8 @@ pub(crate) enum Request {
 /// when another execution adopts the parked coroutine.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitKind {
-    /// The robot's current job has finished (`robot.wait()`).
-    ActionDone,
+    /// Robot `usize`'s current job has finished (`robot.wait()`).
+    ActionDone(usize),
     /// The channel has at least one message (`ch.wait_nonempty`).
     ChannelNonEmpty(i64),
     /// The channel has room for another message (`ch.wait_room`).
@@ -310,43 +310,46 @@ pub(crate) enum WaitKind {
 }
 
 impl WaitKind {
-    /// The kind occupies the top byte of the token; the channel id the rest.
-    /// Channel ids are non-negative and well under 2^56, as the game uses.
+    /// The kind occupies the top byte of the token; its payload the rest.
     const KIND_SHIFT: u32 = 56;
-    const CHANNEL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+    const PAYLOAD_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
-    fn kind_bits(self) -> u64 {
+    /// The kind's numeric tag and its payload (robot id or channel id).
+    fn parts(self) -> (u64, i64) {
         match self {
-            WaitKind::ActionDone => 0,
-            WaitKind::ChannelNonEmpty(_) => 1,
-            WaitKind::ChannelRoom(_) => 2,
+            WaitKind::ActionDone(rid) => (0, rid as i64),
+            WaitKind::ChannelNonEmpty(chan) => (1, chan),
+            WaitKind::ChannelRoom(chan) => (2, chan),
         }
     }
 
-    /// The token naming this wait.
+    /// The token naming this wait. The payload must be non-negative and fit in
+    /// 56 bits (channel ids are, and robot ids are tiny).
     pub(crate) fn token(self) -> NativeWait {
-        let channel = match self {
-            WaitKind::ActionDone => 0,
-            WaitKind::ChannelNonEmpty(c) | WaitKind::ChannelRoom(c) => c as u64,
-        };
-        NativeWait((self.kind_bits() << Self::KIND_SHIFT) | (channel & Self::CHANNEL_MASK))
+        let (kind, payload) = self.parts();
+        debug_assert!(
+            payload >= 0 && payload as u64 <= Self::PAYLOAD_MASK,
+            "wait payload {payload} does not fit in the token"
+        );
+        NativeWait((kind << Self::KIND_SHIFT) | (payload as u64 & Self::PAYLOAD_MASK))
     }
 
     /// The wait a token names, or `None` for a token this host did not mint.
     pub(crate) fn from_token(token: NativeWait) -> Option<Self> {
-        let channel = (token.0 & Self::CHANNEL_MASK) as i64;
+        let payload = (token.0 & Self::PAYLOAD_MASK) as i64;
         match token.0 >> Self::KIND_SHIFT {
-            0 => Some(WaitKind::ActionDone),
-            1 => Some(WaitKind::ChannelNonEmpty(channel)),
-            2 => Some(WaitKind::ChannelRoom(channel)),
+            0 => Some(WaitKind::ActionDone(payload as usize)),
+            1 => Some(WaitKind::ChannelNonEmpty(payload)),
+            2 => Some(WaitKind::ChannelRoom(payload)),
             _ => None,
         }
     }
 
     /// Whether the world condition this wait is waiting for currently holds.
-    pub(crate) fn is_ready(self, world: &World, rid: usize) -> bool {
+    /// The wait itself names the robot or channel it concerns.
+    pub(crate) fn is_ready(self, world: &World) -> bool {
         match self {
-            WaitKind::ActionDone => world.robots[rid].job.is_none(),
+            WaitKind::ActionDone(rid) => world.robots[rid].job.is_none(),
             WaitKind::ChannelNonEmpty(chan) => world
                 .channels
                 .get(&chan)

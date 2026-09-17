@@ -362,12 +362,11 @@ pub(crate) fn deliver_ready(
     lua: &mut Lua<Ctx>,
     world: &Rc<RefCell<World>>,
 ) {
-    let rid = exec.context().robot;
     for token in exec.pending_waits(lua) {
         let Some(kind) = WaitKind::from_token(token) else {
             continue;
         };
-        if !kind.is_ready(&world.borrow(), rid) {
+        if !kind.is_ready(&world.borrow()) {
             continue;
         }
         if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() && *root_wait == Some(token) {
