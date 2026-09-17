@@ -333,6 +333,64 @@ fn ungranted_recv_returns_denied_without_parking() {
     assert_eq!(lua.display_value(vals[1]), "denied");
 }
 
+#[test]
+fn adopted_wait_is_completed_by_the_adopting_execution() {
+    let (mut lua, world) = test_env(0);
+    // Execution A parks a coroutine on channel 0 and finishes.
+    let a = lua
+        .load_named(
+            "=a",
+            "co = coroutine.create(function() got = sched.recv(0) end)\ncoroutine.resume(co)",
+        )
+        .unwrap();
+    let mut ea = lua.execute_with_context(
+        &a,
+        Ctx {
+            robot: 0,
+            world: Rc::clone(&world),
+        },
+    );
+    assert!(matches!(
+        ea.step(&mut lua, 1_000_000).unwrap(),
+        Step::Done(_)
+    ));
+
+    // Execution B adopts the wait by resuming the parked coroutine.
+    let b = lua
+        .load_named("=b", "while got == nil do coroutine.resume(co) end")
+        .unwrap();
+    let mut eb = lua.execute_with_context(
+        &b,
+        Ctx {
+            robot: 0,
+            world: Rc::clone(&world),
+        },
+    );
+    assert_eq!(eb.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
+    assert!(
+        !eb.pending_waits(&lua).is_empty(),
+        "the adopting execution owns the wait"
+    );
+
+    world.borrow_mut().channels.insert(
+        0,
+        Channel {
+            cap: CHANNEL_CAP,
+            items: VecDeque::from([Msg::Int(7)]),
+        },
+    );
+    let mut root_wait = None;
+    loop {
+        deliver_ready(&mut eb, &mut root_wait, &mut lua, &world);
+        match eb.step(&mut lua, 1_000_000).unwrap() {
+            Step::Done(_) => break,
+            Step::Pending => {}
+            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
+        }
+    }
+    assert_eq!(lua.get_global("got"), Value::Int(7));
+}
+
 /// Force the default programs into place so App tests are hermetic.
 fn reset_robot_dirs() {
     let root = sources_dir();

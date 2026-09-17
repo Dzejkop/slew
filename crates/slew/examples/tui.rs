@@ -174,6 +174,10 @@ impl WaitKind {
             WaitKind::NonEmpty(c) => (1, c),
             WaitKind::Room(c) => (2, c),
         };
+        debug_assert!(
+            chan >= 0 && chan as u64 <= Self::CHANNEL_MASK,
+            "channel id {chan} does not fit in the token"
+        );
         NativeWait(((bits as u64) << Self::KIND_SHIFT) | (chan as u64 & Self::CHANNEL_MASK))
     }
 

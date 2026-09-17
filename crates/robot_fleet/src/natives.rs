@@ -253,17 +253,17 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
-/// Suspends until the robot's current job finishes (immediately if idle).
-///
-/// Parks the calling coroutine; the wait's kind is carried by the token, so
-/// the host can complete it even if another execution adopts the coroutine.
+/// Suspends until the robot's current job finishes. Parks the calling
+/// coroutine; on the execution's root thread, or where the VM cannot park, it
+/// blocks the execution instead (see [`NativeOutcome::Wait`]).
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    if world.borrow().robots[rid].job.is_none() {
+    let wait = WaitKind::ActionDone(rid);
+    if wait.is_ready(&world.borrow()) {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    Ok(NativeOutcome::Wait(WaitKind::ActionDone.token()))
+    Ok(NativeOutcome::Wait(wait.token()))
 }
 
 /// Suspends until channel `chan` has a message. Parks the calling coroutine
@@ -277,18 +277,12 @@ fn native_wait_nonempty(
     let chan = int_arg(ctx, args, 0, "wait_nonempty")?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (granted, empty) = {
-        let w = world.borrow();
-        let granted = w.grants[rid].contains(&chan);
-        (
-            granted,
-            granted && w.channels.get(&chan).is_none_or(|c| c.items.is_empty()),
-        )
-    };
-    if !granted || !empty {
+    let wait = WaitKind::ChannelNonEmpty(chan);
+    let w = world.borrow();
+    if !w.grants[rid].contains(&chan) || wait.is_ready(&w) {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    Ok(NativeOutcome::Wait(WaitKind::ChannelNonEmpty(chan).token()))
+    Ok(NativeOutcome::Wait(wait.token()))
 }
 
 /// Suspends until channel `chan` has room for another message. Parks the
@@ -302,21 +296,12 @@ fn native_wait_room(
     let chan = int_arg(ctx, args, 0, "wait_room")?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (granted, full) = {
-        let w = world.borrow();
-        let granted = w.grants[rid].contains(&chan);
-        (
-            granted,
-            granted
-                && w.channels
-                    .get(&chan)
-                    .is_some_and(|c| c.items.len() >= c.cap),
-        )
-    };
-    if !granted || !full {
+    let wait = WaitKind::ChannelRoom(chan);
+    let w = world.borrow();
+    if !w.grants[rid].contains(&chan) || wait.is_ready(&w) {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    Ok(NativeOutcome::Wait(WaitKind::ChannelRoom(chan).token()))
+    Ok(NativeOutcome::Wait(wait.token()))
 }
 
 /// Requests that the host shut this robot down after the current step.

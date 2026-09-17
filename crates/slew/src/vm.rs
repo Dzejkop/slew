@@ -94,11 +94,13 @@ pub struct ExecutionId(u64);
 
 /// A host-chosen token naming one or more native waits.
 ///
-/// The embedder completes waits with [`Execution::complete_native`]. Tokens
-/// are scoped to an execution; completing a token completes every wait parked
-/// under it in that execution, so a native that must complete calls
-/// individually should mint a token unique among its simultaneously parked
-/// calls.
+/// The embedder completes waits with [`Execution::complete_native`]. Completing
+/// a token completes every wait parked under it, so a native that must complete
+/// calls individually should mint a token unique among its simultaneously
+/// parked calls. A wait's owning execution is the one that most recently
+/// resumed the parked coroutine, so adoption can move a token between
+/// executions; use [`Execution::pending_waits`] to find the execution that can
+/// complete a given wait.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NativeWait(pub u64);
 
@@ -111,9 +113,8 @@ pub enum NativeOutcome {
     /// On the execution's root thread — or on a coroutine wait that the VM
     /// cannot park (a coroutine with no resumer, a non-yieldable C-call
     /// boundary, a staged `coroutine.yield`, or an active multi-step driver
-    /// such as `print`/`string.format`/`coroutine.close`, an xpcall error
-    /// handler, a `__gc` finalizer) — the whole execution blocks and
-    /// [`Execution::step`] returns
+    /// such as `print`/`string.format`/`coroutine.close` or a `__gc` finalizer)
+    /// — the whole execution blocks and [`Execution::step`] returns
     /// [`Step::Waiting`]. On a parkable coroutine only that coroutine sleeps:
     /// it yields to its resumer while every other coroutine keeps running. A
     /// `coroutine.resume` of a parked coroutine returns `true` with no values;
@@ -2703,7 +2704,7 @@ impl<C> Lua<C> {
     }
 
     /// Whether `th` may yield to a resumer right now: a coroutine outside a
-    /// non-yieldable C-call boundary. This is the base predicate shared with
+    /// non-yieldable C-call boundary. This is the predicate behind
     /// `coroutine.isyieldable`; see also [`Lua::wait_can_park`].
     fn thread_can_yield(th: &Thread) -> bool {
         !th.is_main && th.non_yieldable == 0
@@ -2733,7 +2734,7 @@ impl<C> Lua<C> {
     }
 
     /// Suspends `th` (a coroutine parked on a native wait), marks its resumer
-    /// runnable, delivers an empty success result to it, and returns the
+    /// runnable, delivers an empty success result to the resumer, and returns
     /// resumer's id so the caller can schedule the switch.
     ///
     /// Unlike [`Lua::perform_yield`], this leaves `th.yield_ret` unset: a
@@ -7031,8 +7032,8 @@ impl<C> Execution<C> {
         Ok(())
     }
 
-    /// Wait tokens currently awaiting completion in this execution, in thread
-    /// order and without duplicates. A token belongs to the root thread
+    /// Wait tokens currently awaiting completion in this execution, in a
+    /// stable order (thread arena order) and without duplicates. A token belongs to the root thread
     /// (whole-execution block, also reported as `Step::Waiting`), one or more
     /// suspended coroutines, or both. Tokens whose completion the host has
     /// already supplied are omitted: they resume on the next `step`, they do
