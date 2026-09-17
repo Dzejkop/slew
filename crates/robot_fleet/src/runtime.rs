@@ -100,8 +100,8 @@ pub(crate) fn make_reader(
 /// Why a robot failed to boot: its prelude or `init.lua` did not load or run.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BootError {
-    #[error("prelude: {0}")]
-    Prelude(#[source] slew::Error),
+    #[error("{0}")]
+    Script(#[source] slew::Error),
     #[error("prelude suspended")]
     Suspended,
     #[error("cannot read init.lua: {0}")]
@@ -119,7 +119,7 @@ pub(crate) fn run_to_completion(
             Ok(Step::Done(_)) => return Ok(()),
             Ok(Step::Pending) => {}
             Ok(Step::Waiting(_)) => return Err(BootError::Suspended),
-            Err(e) => return Err(BootError::Prelude(e)),
+            Err(e) => return Err(BootError::Script(e)),
         }
     }
 }
@@ -140,7 +140,7 @@ pub(crate) fn boot_robot(
     };
     let prelude = lua
         .load_named("=prelude", PRELUDE)
-        .map_err(BootError::Prelude)?;
+        .map_err(BootError::Script)?;
     let mut pexec = lua.execute_with_context(&prelude, ctx.clone());
     run_to_completion(&mut lua, &mut pexec)?;
 

@@ -77,7 +77,15 @@ pub(crate) struct VmError {
     pub source: Option<Rc<str>>,
 }
 
+/// A native function installed with [`Lua::register_native`].
+///
+/// The `Err(String)` is a Lua error *value*, raised verbatim (no position
+/// prefix), matching PUC-Lua's native errors — not a Rust control-flow error.
+/// Slew-internal failures use [`Error`].
 pub type NativeFn<C = ()> = fn(&mut Lua<C>, &[Value]) -> Result<Vec<Value>, String>;
+
+/// A native function that may suspend; `Err(String)` is a Lua error value, as
+/// for [`NativeFn`].
 pub type SuspendableNativeFn<C> =
     fn(&mut NativeContext<'_, C>, &[Value]) -> Result<NativeOutcome, String>;
 
@@ -616,6 +624,10 @@ pub struct Execution<C = ()> {
 }
 
 /// Metamethod identifiers; indexes into `Lua::mm_names`.
+///
+/// `mm_names` is built from [`Mm::iter`], so the name list and the
+/// `mm as usize` discriminant indexes must stay in declaration order: do not
+/// add explicit discriminants or reorder variants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumIter, strum::IntoStaticStr)]
 #[repr(usize)]
 pub(crate) enum Mm {

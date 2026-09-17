@@ -305,3 +305,34 @@ fn boot_isolates_robots() {
     assert_eq!(lb.get_global("seed"), Value::Int(2222));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn facing_name_and_aliases_round_trip() {
+    use crate::world::Facing;
+    // `name()` feeds the Lua-facing `robot.facing()`; the bundled `nav.turn`
+    // keys on the lower-case words, so it must not pick up a title-cased alias.
+    for (facing, name) in [
+        (Facing::North, "north"),
+        (Facing::East, "east"),
+        (Facing::South, "south"),
+        (Facing::West, "west"),
+    ] {
+        assert_eq!(facing.name(), name, "canonical name must stay lower-case");
+        assert_eq!(Facing::from_name(name.as_bytes()), Some(facing));
+        // Capitalised initial ("N") and full word ("North") are accepted aliases.
+        assert_eq!(
+            Facing::from_name(name[..1].to_uppercase().as_bytes()),
+            Some(facing)
+        );
+        let capitalised = {
+            let mut c = name.to_string();
+            c.replace_range(..1, &name[..1].to_uppercase());
+            c
+        };
+        assert_eq!(Facing::from_name(capitalised.as_bytes()), Some(facing));
+    }
+    assert_eq!(Facing::from_name(b"N"), Some(Facing::North));
+    assert_eq!(Facing::from_name(b"n"), None);
+    assert_eq!(Facing::from_name(b"NORTH"), None);
+    assert_eq!(Facing::from_name(b"north "), None);
+}

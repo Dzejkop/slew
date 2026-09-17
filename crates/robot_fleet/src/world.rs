@@ -8,13 +8,15 @@ use crate::config::{MAP_H, MAP_W, MAX_LOG, ROBOTS, SHARED_CHANNEL};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumString, strum::IntoStaticStr)]
 pub(crate) enum Facing {
-    #[strum(serialize = "north", serialize = "North", serialize = "N")]
+    // `to_string` pins the canonical lower-case name returned by `name()` and
+    // is also accepted by `from_name`; `serialize` entries add aliases.
+    #[strum(to_string = "north", serialize = "North", serialize = "N")]
     North,
-    #[strum(serialize = "east", serialize = "East", serialize = "E")]
+    #[strum(to_string = "east", serialize = "East", serialize = "E")]
     East,
-    #[strum(serialize = "south", serialize = "South", serialize = "S")]
+    #[strum(to_string = "south", serialize = "South", serialize = "S")]
     South,
-    #[strum(serialize = "west", serialize = "West", serialize = "W")]
+    #[strum(to_string = "west", serialize = "West", serialize = "W")]
     West,
 }
 
