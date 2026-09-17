@@ -1,6 +1,7 @@
 //! Regression tests for the host-capability `os` library.
 
 use slew::{Lua, StdHost, Step, Value};
+use test_case::test_case;
 
 fn with_host() -> Lua {
     let mut lua = Lua::new();
@@ -54,23 +55,34 @@ fn clock_time_date_difftime() {
     assert_eq!(vals[0], Value::Bool(true));
 }
 
-#[test]
-fn date_and_difftime_coercions() {
+// `os.difftime` coerces integral floats and numeric strings for both
+// arguments.
+#[test_case("os.difftime(\"10\", 5)", "5.0"; "numeric_string_coerces")]
+#[test_case("os.difftime(10.0, 3.0)", "7.0"; "integral_floats_coerce")]
+fn difftime_coerces_numbers(call: &str, expected: &str) {
+    let mut lua = with_host();
+    let vals = run(&mut lua, &format!("return {call} == {expected}"));
+    assert_eq!(vals[0], Value::Bool(true), "{call} should equal {expected}");
+}
+
+#[test_case("os.difftime(10)" ; "missing_second_argument")]
+#[test_case("os.difftime(10, nil)" ; "nil_second_argument")]
+#[test_case("os.difftime(1.5, 0)" ; "fractional_argument")]
+#[test_case("os.difftime({})" ; "table_argument")]
+fn difftime_rejects_bad_arguments(call: &str) {
     let mut lua = with_host();
     let vals = run(
         &mut lua,
-        r#"
-        -- difftime coerces integral floats/numeric strings for both arguments
-        assert(os.difftime("10", 5) == 5.0)
-        assert(os.difftime(10.0, 3.0) == 7.0)
-        assert(not pcall(os.difftime, 10))
-        assert(not pcall(os.difftime, 10, nil))
-        assert(not pcall(os.difftime, 1.5, 0))
-        assert(not pcall(os.difftime, {}))
-        -- literal non-ASCII bytes in the format string pass through unchanged
-        return os.date("\xff%Y", 0)
-        "#,
+        &format!("return not pcall(function() return {call} end)"),
     );
+    assert_eq!(vals[0], Value::Bool(true), "{call} should error");
+}
+
+#[test]
+fn date_preserves_non_utf8_format_bytes() {
+    // Lua strings are byte strings: literal bytes in the format survive.
+    let mut lua = with_host();
+    let vals = run(&mut lua, r#"return os.date("\xff%Y", 0)"#);
     assert_eq!(
         lua.str_bytes(vals[0]),
         Some(&b"\xff1970"[..]),

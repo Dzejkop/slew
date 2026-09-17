@@ -2,6 +2,7 @@
 //! file-reader seam, and `package`/`require`.
 
 use slew::{Lua, Step};
+use test_case::test_case;
 
 fn eval(lua: &mut Lua, src: &str) -> String {
     let chunk = lua
@@ -562,71 +563,35 @@ fn crafted_chunks_error_instead_of_panicking() {
     );
 }
 
-#[test]
-fn dumped_protos_with_tables_and_bare_returns_round_trip() {
-    // `string.dump` output must load back: the validator's register bounds
-    // must accept everything the compiler emits (table constructors and
-    // zero-value returns are the tight cases).
+// `string.dump` output must load back: the validator's register bounds must
+// accept everything the compiler emits (table constructors and zero-value
+// returns are the tight cases).
+#[test_case(
+    "local f = function() return {1, 2, 3} end local g = assert(load(string.dump(f))) return #g()"
+    => "3"; "table_constructor")]
+#[test_case(
+    "local f = function() local a, b return a, b end local g = assert(load(string.dump(f))) return tostring(g())"
+    => "nil"; "two_value_return")]
+// A zero-value `return` after locals puts `base` at the register watermark.
+#[test_case(
+    "local f = function() local a, b return end local g = assert(load(string.dump(f))) return select('#', g())"
+    => "0"; "zero_value_return_with_locals")]
+#[test_case(
+    "local f = assert(load('local a, b return')) local g = assert(load(string.dump(f))) return select('#', g())"
+    => "0"; "zero_value_return_main_chunk")]
+#[test_case(
+    "local f = function(...) local s = 0 for i = 1, select('#', ...) do s = s + 1 end return s end \
+     local g = assert(load(string.dump(f))) return g(1, 2, 3)"
+    => "3"; "vararg")]
+// A generic `for` with more variables than the iterator call's 3-slot staging
+// window exercises the result-register accounting.
+#[test_case(
+    "local f = function() for a, b, c, d in pairs({x = 1}) do return a, b, c, d end end \
+     local g = assert(load(string.dump(f))) return g()"
+    => "x"; "generic_for_four_vars")]
+fn dumped_protos_round_trip(src: &str) -> String {
     let mut lua = Lua::new();
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = function() return {1, 2, 3} end \
-             local g = assert(load(string.dump(f))) \
-             return #g()"
-        ),
-        "3"
-    );
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = function() local a, b return a, b end \
-             local g = assert(load(string.dump(f))) \
-             return tostring(g())"
-        ),
-        "nil"
-    );
-    // A zero-value `return` after locals puts `base` at the register watermark.
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = function() local a, b return end \
-             local g = assert(load(string.dump(f))) \
-             return select('#', g())"
-        ),
-        "0"
-    );
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = assert(load('local a, b return')) \
-             local g = assert(load(string.dump(f))) \
-             return select('#', g())"
-        ),
-        "0"
-    );
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = function(...) local s = 0 for i = 1, select('#', ...) do s = s + 1 end return s end \
-             local g = assert(load(string.dump(f))) \
-             return g(1, 2, 3)"
-        ),
-        "3"
-    );
-    // A generic `for` with more variables than the iterator call's 3-slot
-    // staging window exercises the result-register accounting.
-    assert_eq!(
-        eval(
-            &mut lua,
-            "local f = function() \
-               for a, b, c, d in pairs({x = 1}) do return a, b, c, d end \
-             end \
-             local g = assert(load(string.dump(f))) \
-             return g()"
-        ),
-        "x"
-    );
+    eval(&mut lua, src)
 }
 
 #[test]

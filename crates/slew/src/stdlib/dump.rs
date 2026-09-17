@@ -927,6 +927,7 @@ fn cmp_from_index(i: u8) -> Result<CmpOp, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     /// Builds a proto over `code` with parallel debug tables, so a test can
     /// vary one field and see the validator's verdict.
@@ -965,44 +966,26 @@ mod tests {
         assert_eq!(validate_proto(&p), Ok(()));
     }
 
+    #[test_case(
+        vec![Instr::LoadK { dst: 0, k: 7 }, Instr::Return { base: 0, n: 2 }],
+        vec![Value::Int(1)],
+        2
+        ; "constant_index_past_table")]
+    #[test_case(vec![Instr::Move { dst: 9, src: 0 }], Vec::new(), 2 ; "register_beyond_max_regs")]
+    #[test_case(
+        vec![Instr::Call { base: 0, nargs: 9, nres: 0 }],
+        Vec::new(),
+        2
+        ; "call_argument_window")]
+    #[test_case(vec![Instr::Jump { off: 100 }], Vec::new(), 2 ; "jump_past_end")]
+    #[test_case(vec![Instr::GetUpval { dst: 0, up: 0 }], Vec::new(), 2 ; "upvalue_index")]
+    fn validate_proto_rejects(code: Vec<Instr>, consts: Vec<Value>, max_regs: u8) {
+        let p = proto_with(code, consts, max_regs);
+        assert!(validate_proto(&p).is_err());
+    }
+
     #[test]
-    fn validate_proto_rejects_out_of_range_operands() {
-        // Constant index past the constant table.
-        let p = proto_with(
-            vec![
-                Instr::LoadK { dst: 0, k: 7 },
-                Instr::Return { base: 0, n: 2 },
-            ],
-            vec![Value::Int(1)],
-            2,
-        );
-        assert!(validate_proto(&p).is_err());
-
-        // Register operand beyond max_regs.
-        let p = proto_with(vec![Instr::Move { dst: 9, src: 0 }], Vec::new(), 2);
-        assert!(validate_proto(&p).is_err());
-
-        // A `Call` whose static argument window does not fit the frame.
-        let p = proto_with(
-            vec![Instr::Call {
-                base: 0,
-                nargs: 9,
-                nres: 0,
-            }],
-            Vec::new(),
-            2,
-        );
-        assert!(validate_proto(&p).is_err());
-
-        // Jump landing past the end of the code.
-        let p = proto_with(vec![Instr::Jump { off: 100 }], Vec::new(), 2);
-        assert!(validate_proto(&p).is_err());
-
-        // GetUpval with no upvalues declared.
-        let p = proto_with(vec![Instr::GetUpval { dst: 0, up: 0 }], Vec::new(), 2);
-        assert!(validate_proto(&p).is_err());
-
-        // Debug tables not parallel to the code.
+    fn validate_proto_rejects_non_parallel_debug_tables() {
         let mut p = proto_with(vec![Instr::Return { base: 0, n: 1 }], Vec::new(), 2);
         p.lines.clear();
         assert!(validate_proto(&p).is_err());

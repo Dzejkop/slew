@@ -427,26 +427,29 @@ fn table_concat_pack_unpack() {
     assert_eq!(eval("return select('#', table.unpack({}, 10, 6))"), "0");
 }
 
-#[test]
-fn select_index_forms_and_errors() {
-    // Only a string starting with '#' is the count form (PUC luaB_select).
-    assert_eq!(eval("return select('#', 10, 20, 30)"), "3");
-    assert!(run_err("return select('abc', 10, 20)").contains("number expected"));
-    // A negative index counts back from the end.
-    assert_eq!(eval("return select(-1, 10, 20, 30)"), "30");
-    assert_eq!(eval_multi("return select(-2, 10, 20, 30)"), ["20", "30"]);
-    // ...but an index before the first vararg is out of range, not clamped.
-    assert!(run_err("return select(-4, 10, 20, 30)").contains("index out of range"));
-    assert_eq!(
-        eval_multi("return select(-3, 10, 20, 30)"),
-        ["10", "20", "30"]
-    );
-    // Index 0 and fractional indices are out of range / not integers; integral
-    // floats and numeric strings coerce like luaL_checkinteger.
-    assert!(run_err("return select(0, 10)").contains("index out of range"));
-    assert!(run_err("return select(1.5, 10, 20)").contains("no integer representation"));
-    assert_eq!(eval_multi("return select(2.0, 10, 20, 30)"), ["20", "30"]);
-    assert_eq!(eval_multi("return select('2', 10, 20, 30)"), ["20", "30"]);
+// Only a string starting with '#' is the count form (PUC luaB_select).
+#[test_case("return select('#', 10, 20, 30)" => "3"; "count_form")]
+#[test_case("return select(-1, 10, 20, 30)" => "30"; "negative_index_counts_back")]
+fn select_single_value(src: &str) -> String {
+    eval(src)
+}
+
+#[test_case("return select(-2, 10, 20, 30)" => "20,30"; "negative_two")]
+#[test_case("return select(-3, 10, 20, 30)" => "10,20,30"; "negative_all")]
+#[test_case("return select(2.0, 10, 20, 30)" => "20,30"; "integral_float_index")]
+#[test_case("return select('2', 10, 20, 30)" => "20,30"; "numeric_string_index")]
+fn select_multiple_values(src: &str) -> String {
+    eval_multi(src).join(",")
+}
+
+#[test_case("return select('abc', 10, 20)", "number expected"; "non_numeric_string")]
+// An index before the first vararg is out of range, not clamped.
+#[test_case("return select(-4, 10, 20, 30)", "index out of range"; "negative_out_of_range")]
+#[test_case("return select(0, 10)", "index out of range"; "zero")]
+#[test_case("return select(1.5, 10, 20)", "no integer representation"; "fractional_index")]
+fn select_rejects_bad_indices(src: &str, expected: &str) {
+    let err = run_err(src);
+    assert!(err.contains(expected), "got: {err}");
 }
 
 #[test]
