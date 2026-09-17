@@ -23,7 +23,7 @@
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "slew";
-          version = "0.1.0";
+          version = "0.2.0";
 
           # Flake source is the git tree, so untracked `target/`/`result/`
           # never enter the store.

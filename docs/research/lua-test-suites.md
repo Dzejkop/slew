@@ -6,7 +6,7 @@ Research date: 2026-09-10
 
 Use the official **Lua 5.4.9 release test archive** as the long-term conformance corpus, but initially run a curated language-only subset through a small Rust harness. Do not expect the upstream `all.lua` runner to work unchanged yet.
 
-The archive is the best fit because `slew` explicitly targets Lua 5.4 ([README](../../README.md), [design](../../DESIGN.md)), and Lua publishes a test archive for every 5.4 patch release through 5.4.9. Lua says to use the exact release when possible and warns that suites do not work across different major/minor versions. The official 5.4.9 archive and its SHA-256 are listed on the [Lua test-suite page](https://www.lua.org/tests/) (direct archive: [lua-5.4.9-tests.tar.gz](https://www.lua.org/tests/lua-5.4.9-tests.tar.gz)).
+The archive is the best fit because `slew` explicitly targets Lua 5.4 ([README](../../crates/slew/README.md), [design](../../crates/slew/DESIGN.md)), and Lua publishes a test archive for every 5.4 patch release through 5.4.9. Lua says to use the exact release when possible and warns that suites do not work across different major/minor versions. The official 5.4.9 archive and its SHA-256 are listed on the [Lua test-suite page](https://www.lua.org/tests/) (direct archive: [lua-5.4.9-tests.tar.gz](https://www.lua.org/tests/lua-5.4.9-tests.tar.gz)).
 
 The project does not declare a 5.4 patch target. Start with 5.4.9 because it is the current maintained 5.4 suite; if a failure looks tied to a post-5.4.8 bug fix, compare with the [5.4.8 archive](https://www.lua.org/tests/lua-5.4.8-tests.tar.gz). Pin the selected archive and published checksum in CI rather than following a moving branch.
 
@@ -22,14 +22,22 @@ Lua describes the release suite as unsupported internal tooling. Its basic mode 
 
 ## Compatibility with the current project
 
-The language core is promising: the project claims the full 5.4 lexical grammar, parser, core VM, metamethods, errors, coroutines, to-be-closed variables, patterns, and selected standard libraries ([design](../../DESIGN.md)). Existing Rust tests cover those areas under `tests/`.
+The language core is promising: the project claims the full 5.4 lexical grammar, parser, core VM, metamethods, errors, coroutines, to-be-closed variables, patterns, and selected standard libraries ([design](../../crates/slew/DESIGN.md)). Existing Rust tests cover those areas under `tests/`.
 
 The upstream runner is nevertheless **not directly runnable**:
 
-- The CLI accepts a script path or stdin, but not Lua's `-e` option ([REPL runner](../../src/bin/repl.rs)). A wrapper or Rust integration harness must set `_U` before execution.
-- The installed base environment does not define `_G`, `_VERSION`, `arg`, `load`, `loadfile`, `dofile`, `collectgarbage`, `warn`, or `require` ([stdlib installer](../../src/stdlib/mod.rs), [VM initialization](../../src/vm.rs)). `all.lua` needs these immediately.
-- `io`, `os`, `package`, `debug`, and `utf8` are absent; `os` and `io` are explicit non-goals for the sandboxed runtime ([design](../../DESIGN.md)). The official runner uses all of them for orchestration and coverage.
-- Library coverage is intentionally partial. Examples needed by the suite but currently absent include `string.dump`, `string.pack`, `string.unpack`, `string.packsize`, `table.move`, `coroutine.close`, `math.deg`, and `math.rad`. Known deviations also include no weak tables/finalizers and no `%a` in `string.format` ([design](../../DESIGN.md)).
+- The CLI accepts a script path or stdin, but not Lua's `-e` option ([REPL runner](../../crates/slew/src/bin/repl.rs)). A wrapper or Rust integration harness must set `_U` before execution.
+- At the time of writing (2026-09-10) the base environment did not define `_G`,
+  `_VERSION`, `arg`, `load`, `loadfile`, `dofile`, `collectgarbage`, `warn`, or
+  `require` ([stdlib installer](../../crates/slew/src/stdlib/mod.rs), [VM initialization](../../crates/slew/src/vm.rs));
+  `all.lua` needs these immediately. Most of the standard libraries have since
+  landed (see the bullet below).
+- `io` and `os` remain capability-gated rather than absent: they exist only once
+  an embedder installs a host ([design](../../crates/slew/DESIGN.md)). The official runner
+  expects them, along with `package`, `debug`, and `utf8`.
+- Library coverage is intentionally partial. Since this research was written the
+  M4/M5 libraries, weak tables, and `__gc` finalizers have landed; the remaining
+  intentional gaps are tracked in [design](../../crates/slew/DESIGN.md).
 - Full mode's C modules and internal mode's `T`/`ltests` hooks assume PUC-Lua's C API and internals. The C API is a stated non-goal, so those modes should be classified as out of scope rather than treated as failing conformance.
 
 As a quick direct-use check, running the archive's standalone `vararg.lua` with the already-built `target/debug/slew` reached the test body but failed at line 13 (`arg == _G.arg`) because `_G` is nil. This confirms that even relatively self-contained files need a compatibility prelude or selective extraction; it does not indicate that vararg semantics themselves failed.
