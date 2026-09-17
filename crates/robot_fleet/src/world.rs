@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+use slew::NativeWait;
+
 use crate::config::{MAP_H, MAP_W, MAX_LOG, ROBOTS, SHARED_CHANNEL};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumString, strum::IntoStaticStr)]
@@ -296,9 +298,16 @@ pub(crate) enum Request {
     Reboot,
 }
 
+/// What a parked native wait is waiting for. The host re-checks the matching
+/// world condition each frame and completes the wait when it holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitReason {
+    /// The robot's current job has finished (`robot.wait()`).
     ActionDone,
+    /// The channel has at least one message (`ch.wait_nonempty`).
+    ChannelNonEmpty(i64),
+    /// The channel has room for another message (`ch.wait_room`).
+    ChannelRoom(i64),
 }
 
 /// Per-execution context. All of a robot's executions share the `Rc`s.
@@ -306,5 +315,7 @@ pub(crate) enum WaitReason {
 pub(crate) struct Ctx {
     pub(crate) robot: usize,
     pub(crate) world: Rc<RefCell<World>>,
-    pub(crate) wait_reason: Option<WaitReason>,
+    /// Waits parked by this execution, keyed by token so each is completed
+    /// only once its own condition holds.
+    pub(crate) waiting: Vec<(NativeWait, WaitReason)>,
 }

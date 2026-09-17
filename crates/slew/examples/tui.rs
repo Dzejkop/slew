@@ -1076,7 +1076,7 @@ mod tests {
                     return;
                 }
                 Step::Pending => {}
-                other => panic!("unexpected {other:?}"),
+                Step::Waiting(w) => panic!("unexpected wait {w:?}"),
             }
         }
         panic!("coroutine recv never completed");
@@ -1122,7 +1122,7 @@ mod tests {
                     return;
                 }
                 Step::Pending => {}
-                other => panic!("unexpected {other:?}"),
+                Step::Waiting(w) => panic!("unexpected wait {w:?}"),
             }
         }
         panic!("coroutine waits never completed");

@@ -211,7 +211,7 @@ impl App {
                 let ctx = Ctx {
                     robot: i,
                     world,
-                    wait_reason: None,
+                    waiting: Vec::new(),
                 };
                 let exec = lua.execute_with_context(&chunk, ctx);
                 *prompt = Some(Prompt { exec, wait: None });
@@ -353,11 +353,27 @@ impl App {
     }
 }
 
-/// Completes parked native calls once their condition holds.
+/// Whether the world condition a parked wait is waiting for currently holds.
+fn wait_ready(world: &World, rid: usize, reason: WaitReason) -> bool {
+    match reason {
+        WaitReason::ActionDone => world.robots[rid].job.is_none(),
+        WaitReason::ChannelNonEmpty(chan) => world
+            .channels
+            .get(&chan)
+            .is_some_and(|c| !c.items.is_empty()),
+        WaitReason::ChannelRoom(chan) => world
+            .channels
+            .get(&chan)
+            .is_none_or(|c| c.items.len() < c.cap),
+    }
+}
+
+/// Completes parked native calls once their own condition holds.
 ///
 /// A wait on the program's root thread surfaces as `Step::Waiting` and is
 /// tracked in `root_wait`. A wait on a coroutine parks only that coroutine and
-/// never surfaces, so it is rediscovered here via [`Execution::pending_waits`].
+/// never surfaces, so every wait is recorded in `Ctx::waiting` and rediscovered
+/// here (see [`Execution::pending_waits`]).
 pub(crate) fn deliver_one(
     exec: &mut Execution<Ctx>,
     root_wait: &mut Option<NativeWait>,
@@ -365,24 +381,22 @@ pub(crate) fn deliver_one(
     world: &Rc<RefCell<World>>,
 ) {
     let rid = exec.context().robot;
-    let ready = matches!(exec.context().wait_reason, Some(WaitReason::ActionDone))
-        && world.borrow().robots[rid].job.is_none();
-    if !ready {
-        return;
-    }
-    if let Some(token) = root_wait.take() {
-        if exec.complete_native(lua, token, Ok(Vec::new())).is_err() {
-            // Leave the request in place so the status stays "waiting" and the
-            // completion is retried on the next tick.
-            *root_wait = Some(token);
-            return;
+    // Snapshot: `complete_native` needs `&mut exec`, so the list is cloned and
+    // stale/delivered entries are pruned in the one `retain` below.
+    let live = exec.pending_waits(lua);
+    let mut delivered = Vec::new();
+    for (token, reason) in exec.context().waiting.clone() {
+        if !live.contains(&token) || !wait_ready(&world.borrow(), rid, reason) {
+            continue;
+        }
+        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
+            if *root_wait == Some(token) {
+                *root_wait = None;
+            }
+            delivered.push(token);
         }
     }
-    // Every wait in this execution shares the `ActionDone` reason, so once the
-    // job is done they are all ready. `pending_waits` only yields open tokens,
-    // so each completion succeeds.
-    for token in exec.pending_waits(lua) {
-        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
-    }
-    exec.context_mut().wait_reason = None;
+    exec.context_mut()
+        .waiting
+        .retain(|(t, _)| live.contains(t) && !delivered.contains(t));
 }

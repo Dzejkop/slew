@@ -136,7 +136,7 @@ pub(crate) fn boot_robot(
     let ctx = Ctx {
         robot: id,
         world,
-        wait_reason: None,
+        waiting: Vec::new(),
     };
     let prelude = lua
         .load_named("=prelude", PRELUDE)
