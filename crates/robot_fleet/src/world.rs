@@ -303,9 +303,9 @@ pub(crate) enum Request {
 pub(crate) enum WaitKind {
     /// Robot `usize`'s current job has finished (`robot.wait()`).
     ActionDone(usize),
-    /// The channel has at least one message (`ch.wait_nonempty`).
+    /// The channel has at least one message (`ch.recv`).
     ChannelNonEmpty(i64),
-    /// The channel has room for another message (`ch.wait_room`).
+    /// The channel has room for another message (`ch.send`).
     ChannelRoom(i64),
 }
 

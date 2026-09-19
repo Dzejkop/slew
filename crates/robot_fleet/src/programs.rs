@@ -10,13 +10,12 @@ local raw = {
   mine = __mine, busy = __busy, pos = __pos, facing = __facing,
   carrying = __carrying, drop = __drop, scan = __scan, wait = __wait,
   probe = __probe, shutdown = __shutdown, reboot = __reboot,
-  send = __try_send, recv = __try_recv,
-  wait_nonempty = __ch_wait_nonempty, wait_room = __ch_wait_room,
+  send = __send, recv = __recv,
 }
 __log = nil __face = nil __forward = nil __back = nil __left = nil __right = nil
 __mine = nil __busy = nil __pos = nil __facing = nil __carrying = nil __drop = nil
 __scan = nil __wait = nil __probe = nil __shutdown = nil __reboot = nil
-__try_send = nil __try_recv = nil __ch_wait_nonempty = nil __ch_wait_room = nil
+__send = nil __recv = nil
 
 log = raw.log
 robot = {
@@ -26,7 +25,27 @@ robot = {
   carrying = raw.carrying, drop = raw.drop, scan = raw.scan, wait = raw.wait,
   probe = raw.probe, shutdown = raw.shutdown, reboot = raw.reboot,
 }
-ch = { try_send = raw.send, try_recv = raw.recv, wait_nonempty = raw.wait_nonempty, wait_room = raw.wait_room }
+-- `ch.recv`/`ch.send` block the calling coroutine until they can complete.
+-- The `__recv`/`__send` natives park it (return a wait) when the channel is
+-- empty/full; the host wakes it with no values, so `nil` with no error means
+-- "retry", and a denial is returned to the caller.
+ch = {}
+
+function ch.recv(chan)
+  while true do
+    local m, err = raw.recv(chan)
+    if m ~= nil then return m end
+    if err then return nil, err end
+  end
+end
+
+function ch.send(chan, msg)
+  while true do
+    local ok, err = raw.send(chan, msg)
+    if ok then return true end
+    if err then return nil, err end
+  end
+end
 
 sched = {}
 local tasks = {}
@@ -41,26 +60,8 @@ function sched.yield() coroutine.yield() end
 function sched.sleep(n) for _ = 1, n do coroutine.yield() end end
 function sched.await(pred) while not pred() do coroutine.yield() end end
 
--- `try_recv`/`try_send` return `nil, "denied"|"empty"|"full"`; only `empty` and
--- `full` are worth parking on (via the suspendable `wait_nonempty`/`wait_room`
--- natives), any other reason is returned to the caller.
-function sched.recv(chan)
-  while true do
-    local m, err = ch.try_recv(chan)
-    if m ~= nil then return m end
-    if err ~= 'empty' then return nil, err end
-    ch.wait_nonempty(chan)
-  end
-end
-
-function sched.send(chan, msg)
-  while true do
-    local ok, err = ch.try_send(chan, msg)
-    if ok then return true end
-    if err ~= 'full' then return nil, err end
-    ch.wait_room(chan)
-  end
-end
+sched.recv = ch.recv
+sched.send = ch.send
 
 function sched.loop()
   while true do

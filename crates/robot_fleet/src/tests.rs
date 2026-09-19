@@ -52,9 +52,9 @@ fn channel_roundtrip_and_gating() {
         &world,
         0,
         r"
-            ch.try_send(0, 'hi')
-            log(ch.try_recv(0))
-            local v, err = ch.try_recv(999)
+            ch.send(0, 'hi')
+            log(ch.recv(0))
+            local v, err = ch.recv(999)
             log(tostring(v) .. '/' .. tostring(err))
             ",
     );
@@ -64,16 +64,20 @@ fn channel_roundtrip_and_gating() {
 }
 
 #[test]
-fn channel_empty_reports_empty() {
+fn recv_parks_on_an_empty_channel() {
     let (mut lua, world) = test_env(0);
-    run_src(
-        &mut lua,
-        &world,
-        0,
-        "local v, err = ch.try_recv(0) log(tostring(v) .. '/' .. tostring(err))",
-    );
-    let log = world.borrow().log.borrow().join("\n");
-    assert!(log.contains("nil/empty"), "log was:\n{log}");
+    // With no message queued, `ch.recv` suspends the calling thread instead of
+    // reporting an empty channel.
+    let chunk = lua.load_named("=t", "ch.recv(0)").unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+    assert!(matches!(
+        exec.step(&mut lua, 1_000_000).unwrap(),
+        Step::Waiting(_)
+    ));
 }
 
 #[test]
@@ -85,7 +89,7 @@ fn sending_nil_is_rejected() {
         &mut lua,
         &world,
         0,
-        "local ok, err = pcall(ch.try_send, 0, nil) \
+        "local ok, err = pcall(ch.send, 0, nil) \
          log(tostring(ok) .. '/' .. tostring(err))",
     );
     let log = world.borrow().log.borrow().join("\n");
