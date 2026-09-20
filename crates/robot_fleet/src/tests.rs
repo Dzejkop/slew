@@ -1,16 +1,17 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slew::{Lua, Step, Value};
+use slew::{Execution, Lua, Step, Value};
 
-use crate::app::{App, boot_or_error};
-use crate::config::{MOVE_TICKS, ROBOTS};
+use crate::app::{App, boot_or_error, deliver_ready};
+use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS, ROBOTS};
 use crate::natives::install_natives;
 use crate::programs::{DEFAULT_NAV, PRELUDE, default_program_for};
 use crate::runtime::{boot_robot, run_to_completion, sources_dir};
 use crate::ui::ui;
-use crate::world::{Cell, Ctx, Job, JobKind, Request, World};
+use crate::world::{Cell, Channel, Ctx, Job, JobKind, Msg, Request, World};
 
 fn test_env(id: usize) -> (Lua<Ctx>, Rc<RefCell<World>>) {
     let world = Rc::new(RefCell::new(World::generate()));
@@ -19,7 +20,6 @@ fn test_env(id: usize) -> (Lua<Ctx>, Rc<RefCell<World>>) {
     let ctx = Ctx {
         robot: id,
         world: Rc::clone(&world),
-        wait: None,
     };
     let prelude = lua.load_named("=prelude", PRELUDE).unwrap();
     let mut pe = lua.execute_with_context(&prelude, ctx);
@@ -32,7 +32,6 @@ fn run_src(lua: &mut Lua<Ctx>, world: &Rc<RefCell<World>>, id: usize, src: &str)
     let ctx = Ctx {
         robot: id,
         world: Rc::clone(world),
-        wait: None,
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
     loop {
@@ -45,6 +44,24 @@ fn run_src(lua: &mut Lua<Ctx>, world: &Rc<RefCell<World>>, id: usize, src: &str)
     }
 }
 
+/// Steps `exec` to completion, handing ready waits to the host each round.
+/// Panics on a root wait; tests expecting one drive `deliver_ready` themselves.
+fn step_to_done(
+    lua: &mut Lua<Ctx>,
+    world: &Rc<RefCell<World>>,
+    exec: &mut Execution<Ctx>,
+) -> Vec<Value> {
+    let mut root_wait = None;
+    loop {
+        deliver_ready(exec, &mut root_wait, lua, world);
+        match exec.step(lua, 1_000_000).unwrap() {
+            Step::Done(v) => return v,
+            Step::Pending => {}
+            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
+        }
+    }
+}
+
 #[test]
 fn channel_roundtrip_and_gating() {
     let (mut lua, world) = test_env(0);
@@ -53,9 +70,9 @@ fn channel_roundtrip_and_gating() {
         &world,
         0,
         r"
-            ch.try_send(0, 'hi')
-            log(ch.try_recv(0))
-            local v, err = ch.try_recv(999)
+            ch.send(0, 'hi')
+            log(ch.recv(0))
+            local v, err = ch.recv(999)
             log(tostring(v) .. '/' .. tostring(err))
             ",
     );
@@ -65,16 +82,20 @@ fn channel_roundtrip_and_gating() {
 }
 
 #[test]
-fn channel_empty_reports_empty() {
+fn recv_parks_on_an_empty_channel() {
     let (mut lua, world) = test_env(0);
-    run_src(
-        &mut lua,
-        &world,
-        0,
-        "local v, err = ch.try_recv(0) log(tostring(v) .. '/' .. tostring(err))",
-    );
-    let log = world.borrow().log.borrow().join("\n");
-    assert!(log.contains("nil/empty"), "log was:\n{log}");
+    // With no message queued, `ch.recv` suspends the calling thread instead of
+    // reporting an empty channel.
+    let chunk = lua.load_named("=t", "ch.recv(0)").unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+    assert!(matches!(
+        exec.step(&mut lua, 1_000_000).unwrap(),
+        Step::Waiting(_)
+    ));
 }
 
 #[test]
@@ -86,7 +107,7 @@ fn sending_nil_is_rejected() {
         &mut lua,
         &world,
         0,
-        "local ok, err = pcall(ch.try_send, 0, nil) \
+        "local ok, err = pcall(ch.send, 0, nil) \
          log(tostring(ok) .. '/' .. tostring(err))",
     );
     let log = world.borrow().log.borrow().join("\n");
@@ -131,7 +152,6 @@ fn blocked_coroutine_does_not_stall_others() {
     let ctx = Ctx {
         robot: 0,
         world: Rc::clone(&world),
-        wait: None,
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
     for _ in 0..200 {
@@ -148,6 +168,245 @@ fn blocked_coroutine_does_not_stall_others() {
     }
     let log = world.borrow().log.borrow().join("\n");
     assert!(log.contains("tick 5"), "log was:\n{log}");
+}
+
+#[test]
+fn coroutine_wait_is_completed_by_the_host() {
+    let (mut lua, world) = test_env(0);
+    // An in-flight job makes `robot.wait()` park the calling coroutine.
+    world.borrow_mut().robots[0].job = Some(Job {
+        kind: JobKind::Mine,
+        remaining: MINE_TICKS,
+    });
+    let chunk = lua
+        .load_named(
+            "=t",
+            r"
+                sched.spawn(function() robot.wait(); done = true end)
+                sched.loop()
+                ",
+        )
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+
+    // The coroutine wait parks (never `Step::Waiting`); found via `pending_waits`.
+    assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
+
+    // Once the job finishes, the host driver must complete the coroutine wait.
+    world.borrow_mut().robots[0].job = None;
+    let mut root_wait = None;
+    deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
+
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("done"), Value::Bool(true));
+}
+
+#[test]
+fn recv_wait_resumes_when_a_message_arrives() {
+    let (mut lua, world) = test_env(0);
+    // `sched.recv` blocks on the native channel wait instead of yielding.
+    let chunk = lua
+        .load_named(
+            "=t",
+            r"
+                sched.spawn(function() got = sched.recv(0) end)
+                sched.loop()
+                ",
+        )
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+
+    // Parked on the empty channel: runnable, tracked (not `Step::Waiting`).
+    assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
+
+    // A message arrives; the host completes the channel wait.
+    world.borrow_mut().channels.insert(
+        0,
+        Channel {
+            cap: CHANNEL_CAP,
+            items: VecDeque::from([Msg::Int(7)]),
+        },
+    );
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("got"), Value::Int(7));
+}
+
+#[test]
+fn root_wait_is_completed_by_the_host() {
+    let (mut lua, world) = test_env(0);
+    world.borrow_mut().robots[0].job = Some(Job {
+        kind: JobKind::Mine,
+        remaining: MINE_TICKS,
+    });
+    let chunk = lua
+        .load_named("=t", "local n = robot.wait() done = (n == nil)")
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+
+    // A root-thread wait surfaces as `Step::Waiting` and is tracked.
+    let token = match exec.step(&mut lua, 1_000_000).unwrap() {
+        Step::Waiting(t) => t,
+        other => panic!("expected a root wait, got {other:?}"),
+    };
+    assert_eq!(exec.pending_waits(&lua), vec![token]);
+
+    world.borrow_mut().robots[0].job = None;
+    let mut root_wait = Some(token);
+    deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
+    assert!(root_wait.is_none(), "the host cleared the root wait");
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("done"), Value::Bool(true));
+}
+
+#[test]
+fn root_wait_latch_clears_when_the_host_completes_it_directly() {
+    let (mut lua, world) = test_env(0);
+    world.borrow_mut().robots[0].job = Some(Job {
+        kind: JobKind::Mine,
+        remaining: MINE_TICKS,
+    });
+    let chunk = lua
+        .load_named("=t", "local n = robot.wait() done = (n == nil)")
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+    let token = match exec.step(&mut lua, 1_000_000).unwrap() {
+        Step::Waiting(t) => t,
+        other => panic!("expected a root wait, got {other:?}"),
+    };
+
+    // Complete directly (not via `deliver_ready`): the latch must still clear.
+    exec.complete_native(&mut lua, token, Ok(Vec::new()))
+        .unwrap();
+    let mut root_wait = Some(token);
+    deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
+    assert!(
+        root_wait.is_none(),
+        "the latch clears once the wait is no longer outstanding"
+    );
+
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("done"), Value::Bool(true));
+}
+
+#[test]
+fn send_wait_resumes_when_the_channel_has_room() {
+    let (mut lua, world) = test_env(0);
+    world.borrow_mut().channels.insert(
+        0,
+        Channel {
+            cap: CHANNEL_CAP,
+            items: (0..CHANNEL_CAP).map(|i| Msg::Int(i as i64)).collect(),
+        },
+    );
+    let chunk = lua
+        .load_named(
+            "=t",
+            "sched.spawn(function() sent = sched.send(0, 99) end) sched.loop()",
+        )
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+
+    // Blocked on the full channel, not blocking the execution.
+    assert_eq!(exec.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
+
+    // Freeing one slot must wake the sender.
+    world
+        .borrow_mut()
+        .channels
+        .get_mut(&0)
+        .unwrap()
+        .items
+        .pop_front();
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("sent"), Value::Bool(true));
+}
+
+#[test]
+fn ungranted_recv_returns_denied_without_parking() {
+    let (mut lua, world) = test_env(0);
+    // Channel 999 is ungranted, so `sched.recv` returns at once.
+    let vals = run_src(
+        &mut lua,
+        &world,
+        0,
+        "local m, err = sched.recv(999) return m == nil, err",
+    );
+    assert_eq!(vals[0], Value::Bool(true));
+    assert_eq!(lua.display_value(vals[1]), "denied");
+}
+
+#[test]
+fn adopted_wait_is_completed_by_the_adopting_execution() {
+    let (mut lua, world) = test_env(0);
+    // Execution A parks a coroutine on channel 0 and finishes.
+    let a = lua
+        .load_named(
+            "=a",
+            "co = coroutine.create(function() got = sched.recv(0) end)\ncoroutine.resume(co)",
+        )
+        .unwrap();
+    let mut ea = lua.execute_with_context(
+        &a,
+        Ctx {
+            robot: 0,
+            world: Rc::clone(&world),
+        },
+    );
+    assert!(matches!(
+        ea.step(&mut lua, 1_000_000).unwrap(),
+        Step::Done(_)
+    ));
+
+    // Execution B adopts the wait by resuming the parked coroutine.
+    let b = lua
+        .load_named("=b", "while got == nil do coroutine.resume(co) end")
+        .unwrap();
+    let mut eb = lua.execute_with_context(
+        &b,
+        Ctx {
+            robot: 0,
+            world: Rc::clone(&world),
+        },
+    );
+    assert_eq!(eb.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
+    assert_ne!(
+        eb.pending_waits(&lua).len(),
+        0,
+        "the adopting execution owns the wait"
+    );
+
+    world.borrow_mut().channels.insert(
+        0,
+        Channel {
+            cap: CHANNEL_CAP,
+            items: VecDeque::from([Msg::Int(7)]),
+        },
+    );
+    step_to_done(&mut lua, &world, &mut eb);
+    assert_eq!(lua.get_global("got"), Value::Int(7));
 }
 
 /// Force the default programs into place so App tests are hermetic.

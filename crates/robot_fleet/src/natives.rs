@@ -4,10 +4,10 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use slew::{Lua, NativeContext, NativeOutcome, NativeWait, Value};
+use slew::{Lua, NativeContext, NativeOutcome, Value};
 
 use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS};
-use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitReason};
+use crate::world::{Cell, Channel, Ctx, Facing, Job, JobKind, Msg, Request, WaitKind};
 
 fn int_arg(
     _ctx: &NativeContext<'_, Ctx>,
@@ -65,8 +65,7 @@ fn rotate(
 }
 
 fn value_to_msg(ctx: &NativeContext<'_, Ctx>, v: Value) -> Option<Msg> {
-    // `nil` is deliberately not a message: `sched.recv` treats `nil` as "nothing
-    // arrived", so a nil message could never be delivered.
+    // `nil` is not a message: `ch.recv` reads a `nil` result as "retry".
     match v {
         Value::Bool(b) => Some(Msg::Bool(b)),
         Value::Int(i) => Some(Msg::Int(i)),
@@ -253,19 +252,16 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
+/// Suspends until the robot's current job finishes (see [`NativeOutcome::Wait`]
+/// for the parking rules).
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
-    let (token, busy) = {
-        let mut w = world.borrow_mut();
-        w.next_token += 1;
-        (w.next_token, w.robots[rid].job.is_some())
-    };
-    if !busy {
+    let wait = WaitKind::ActionDone(rid);
+    if wait.is_ready(&world.borrow()) {
         return Ok(NativeOutcome::Return(Vec::new()));
     }
-    ctx.context_mut().wait = Some(WaitReason::ActionDone);
-    Ok(NativeOutcome::Wait(NativeWait(token)))
+    Ok(NativeOutcome::Wait(wait.token()))
 }
 
 /// Requests that the host shut this robot down after the current step.
@@ -314,16 +310,16 @@ fn native_probe(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(desc.as_bytes())]))
 }
 
-fn native_try_send(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-) -> Result<NativeOutcome, String> {
-    let chan = int_arg(ctx, args, 0, "try_send")?;
+/// Sends `msg` on `chan`; returns [`NativeOutcome::Wait`] if the channel is full
+/// (the call then resumes with no values and the `ch.send` wrapper retries).
+/// Returns `true` on success, or `nil, "denied"` if the robot lacks a grant.
+fn native_send(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "send")?;
     let Some(value) = args.get(1) else {
-        return Err("bad argument #2 to 'try_send' (value expected)".into());
+        return Err("bad argument #2 to 'send' (value expected)".into());
     };
     let msg = value_to_msg(ctx, *value).ok_or_else(|| {
-        "bad argument #2 to 'try_send' (message must be bool/number/string)".to_string()
+        "bad argument #2 to 'send' (message must be bool/number/string)".to_string()
     })?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
@@ -337,18 +333,17 @@ fn native_try_send(
         items: VecDeque::new(),
     });
     if ch.items.len() >= ch.cap {
-        let s = ctx.new_string(b"full");
-        return Ok(NativeOutcome::Return(vec![Value::Nil, s]));
+        return Ok(NativeOutcome::Wait(WaitKind::ChannelRoom(chan).token()));
     }
     ch.items.push_back(msg);
     Ok(NativeOutcome::Return(vec![Value::Bool(true)]))
 }
 
-fn native_try_recv(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-) -> Result<NativeOutcome, String> {
-    let chan = int_arg(ctx, args, 0, "try_recv")?;
+/// Receives a message from `chan`; returns [`NativeOutcome::Wait`] if the channel
+/// is empty (the call then resumes with no values and the `ch.recv` wrapper
+/// retries). Returns the message, or `nil, "denied"` if the robot lacks a grant.
+fn native_recv(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    let chan = int_arg(ctx, args, 0, "recv")?;
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
     let (allowed, msg) = {
@@ -368,10 +363,7 @@ fn native_try_recv(
         return Ok(NativeOutcome::Return(vec![Value::Nil, s]));
     }
     match msg {
-        None => {
-            let s = ctx.new_string(b"empty");
-            Ok(NativeOutcome::Return(vec![Value::Nil, s]))
-        }
+        None => Ok(NativeOutcome::Wait(WaitKind::ChannelNonEmpty(chan).token())),
         Some(m) => Ok(NativeOutcome::Return(vec![msg_to_value(ctx, &m)])),
     }
 }
@@ -391,8 +383,8 @@ pub(crate) fn install_natives(lua: &mut Lua<Ctx>) {
     lua.register_suspendable_native("__drop", native_drop);
     lua.register_suspendable_native("__scan", native_scan);
     lua.register_suspendable_native("__wait", native_wait);
-    lua.register_suspendable_native("__try_send", native_try_send);
-    lua.register_suspendable_native("__try_recv", native_try_recv);
+    lua.register_suspendable_native("__send", native_send);
+    lua.register_suspendable_native("__recv", native_recv);
     lua.register_suspendable_native("__shutdown", native_shutdown);
     lua.register_suspendable_native("__reboot", native_reboot);
     lua.register_suspendable_native("__probe", native_probe);
