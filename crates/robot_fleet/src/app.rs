@@ -349,13 +349,11 @@ impl App {
     }
 }
 
-/// Completes parked native calls once their own condition holds.
+/// Completes parked native calls whose condition holds.
 ///
-/// A wait on the program's root thread surfaces as `Step::Waiting` and is
-/// tracked in `root_wait`. A wait on a coroutine parks only that coroutine and
-/// never surfaces, so every parked token is rediscovered here through
-/// [`Execution::pending_waits`]. The token encodes what it is waiting for, so
-/// a wait stays completable after another execution adopts its coroutine.
+/// A root-thread wait surfaces as `Step::Waiting` and is tracked in `root_wait`;
+/// a coroutine wait never surfaces, so it is rediscovered through
+/// [`Execution::pending_waits`].
 pub(crate) fn deliver_ready(
     exec: &mut Execution<Ctx>,
     root_wait: &mut Option<NativeWait>,
@@ -372,10 +370,8 @@ pub(crate) fn deliver_ready(
         // The token came from `pending_waits`, so this cannot fail.
         let _ = exec.complete_native(lua, token, Ok(Vec::new()));
     }
-    // A host may complete the root wait through another route (the token is not
-    // in `pending_waits` once its completion is set), so drop the latch whenever
-    // the token is no longer outstanding — otherwise the execution would never
-    // be stepped again.
+    // A wait can also be completed through another route, so drop the latch once
+    // its token is no longer outstanding — a stale latch stops all stepping.
     if let Some(token) = *root_wait
         && !exec.pending_waits(lua).contains(&token)
     {

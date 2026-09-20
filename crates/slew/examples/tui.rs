@@ -156,8 +156,7 @@ enum WaitKind {
 }
 
 impl WaitKind {
-    /// The kind occupies the top byte of the token; the channel id the rest.
-    /// Channel ids are non-negative and well under 2^56, as the example uses.
+    /// Top byte = kind, low 56 bits = channel id.
     const KIND_SHIFT: u32 = 56;
     const CHANNEL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
@@ -167,8 +166,7 @@ impl WaitKind {
         }
     }
 
-    /// The token naming this wait. Encoding the kind in the token keeps a wait
-    /// completable if another runtime's execution adopts its coroutine.
+    /// The token naming this wait (kind in the top byte).
     fn token(self) -> NativeWait {
         let (bits, chan) = match self {
             WaitKind::NonEmpty(c) => (1, c),
@@ -181,9 +179,8 @@ impl WaitKind {
         NativeWait(((bits as u64) << Self::KIND_SHIFT) | (chan as u64 & Self::CHANNEL_MASK))
     }
 
-    /// The wait a token's kind tag names, or `None` if the tag is unknown to
-    /// this runtime. Not a provenance check: only feed it tokens from
-    /// `pending_waits`, which this host minted.
+    /// The wait a token's tag names, or `None` if the tag is unknown. Not a
+    /// provenance check: feed it only tokens from `pending_waits`.
     fn from_token(token: NativeWait) -> Option<Self> {
         let chan = (token.0 & Self::CHANNEL_MASK) as i64;
         match token.0 >> Self::KIND_SHIFT {
@@ -221,9 +218,8 @@ struct Runtime {
     rate: f64,
     /// Fractional fuel carried between frames.
     fuel_acc: f64,
-    /// The root thread's wait token while the execution is blocked on a
-    /// `__ch_wait_*` native, as reported by `Step::Waiting`. A coroutine wait
-    /// leaves this `None`; those are discovered from `Execution::pending_waits`.
+    /// The root thread's wait token while blocked (`Step::Waiting`); `None` for a
+    /// purely coroutine wait, found via `Execution::pending_waits`.
     wait: Option<NativeWait>,
     line: Option<u32>,
     finished: bool,
@@ -282,10 +278,9 @@ impl Runtime {
     /// a sub-1-fuel frame is not lost.
     fn advance(&mut self, lua: &mut Lua<Ctx>, dt: Duration, speed: f64) {
         if self.finished || self.wait.is_some() {
-            // Blocked on a channel on the root thread: bank nothing, or a long
-            // wait would release one huge budget the moment a message arrives.
-            // A coroutine wait is deliberately not tested here — its siblings
-            // keep running, so the runtime must keep stepping.
+            // Blocked on the root thread: bank nothing, or a long wait would
+            // release one huge budget at once. A coroutine wait is not tested
+            // here: its siblings must keep running.
             self.fuel_acc = 0.0;
             return;
         }
@@ -320,7 +315,7 @@ impl Runtime {
 /// across frames and is stepped alongside the runtimes.
 struct Prompt {
     exec: Execution<Ctx>,
-    /// As `Runtime::wait`: the root thread's token while blocked, or `None`.
+    /// As `Runtime::wait`.
     wait: Option<NativeWait>,
 }
 
@@ -603,10 +598,9 @@ fn push_log(log: &Rc<RefCell<Vec<String>>>, line: String) {
     }
 }
 
-/// Re-reads `channels[chan]` from Lua and reports whether `kind` is satisfied.
-/// Read-only: the dequeue/enqueue is done by the Lua side once it resumes.
-/// A missing channel is never-ready for either kind: `ch.recv`/`ch.send` call
-/// `get(chan)` (creating the entry) before they wait.
+/// Re-reads `channels[chan]` and reports whether `kind` holds. Read-only; the
+/// Lua side does the dequeue/enqueue once it resumes. A missing channel is
+/// never-ready for either kind: `ch.recv`/`ch.send` create it before waiting.
 fn channel_ready(lua: &mut Lua<Ctx>, kind: WaitKind) -> bool {
     let channels = lua.get_global("channels");
     if !matches!(channels, Value::Table(_)) {
@@ -635,11 +629,9 @@ fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
     }
 }
 
-/// If `exec` has parked native calls whose own conditions are satisfied, hand
-/// them back to Lua. A wait on the root thread surfaces as `Step::Waiting` and
-/// is tracked in `root_wait`; a coroutine wait parks only that coroutine and
-/// never surfaces, so it is rediscovered through [`Execution::pending_waits`].
-/// The token encodes the wait kind, so adoption by another execution is safe.
+/// Hands back parked waits whose condition holds. A root wait surfaces as
+/// `Step::Waiting` and is tracked in `root_wait`; a coroutine wait never
+/// surfaces, so it is rediscovered through [`Execution::pending_waits`].
 fn deliver_ready(
     lua: &mut Lua<Ctx>,
     exec: &mut Execution<Ctx>,
@@ -655,9 +647,8 @@ fn deliver_ready(
         // The token came from `pending_waits`, so this cannot fail.
         let _ = exec.complete_native(lua, token, Ok(Vec::new()));
     }
-    // A host may complete the root wait through another route; drop the latch
-    // once its token is no longer outstanding, or the runtime would never step
-    // again.
+    // Drop the latch once its token is no longer outstanding, or the runtime
+    // would never step again.
     if let Some(token) = *root_wait
         && !exec.pending_waits(lua).contains(&token)
     {

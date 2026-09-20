@@ -65,8 +65,7 @@ fn rotate(
 }
 
 fn value_to_msg(ctx: &NativeContext<'_, Ctx>, v: Value) -> Option<Msg> {
-    // `nil` is deliberately not a message: `ch.recv` reads a `nil` result as
-    // "woken, so try again", so a nil message could never be delivered.
+    // `nil` is not a message: `ch.recv` reads a `nil` result as "retry".
     match v {
         Value::Bool(b) => Some(Msg::Bool(b)),
         Value::Int(i) => Some(Msg::Int(i)),
@@ -253,9 +252,8 @@ fn native_scan(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(out.as_bytes())]))
 }
 
-/// Suspends until the robot's current job finishes. Parks the calling
-/// coroutine; on the execution's root thread, or where the VM cannot park, it
-/// blocks the execution instead (see [`NativeOutcome::Wait`]).
+/// Suspends until the robot's current job finishes (see [`NativeOutcome::Wait`]
+/// for the parking rules).
 fn native_wait(ctx: &mut NativeContext<'_, Ctx>, _args: &[Value]) -> Result<NativeOutcome, String> {
     let rid = ctx.context().robot;
     let world = Rc::clone(&ctx.context().world);
@@ -312,10 +310,9 @@ fn native_probe(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(desc.as_bytes())]))
 }
 
-/// Sends `msg` on `chan`. If the channel is full, returns
-/// [`NativeOutcome::Wait`]; when the host completes the wait the call resumes
-/// with no values, so the `ch.send` prelude wrapper retries. Returns `true` on
-/// success, and `nil, "denied"` at once if the robot lacks a grant.
+/// Sends `msg` on `chan`; returns [`NativeOutcome::Wait`] if the channel is full
+/// (the call then resumes with no values and the `ch.send` wrapper retries).
+/// Returns `true` on success, or `nil, "denied"` if the robot lacks a grant.
 fn native_send(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
     let chan = int_arg(ctx, args, 0, "send")?;
     let Some(value) = args.get(1) else {
@@ -342,10 +339,9 @@ fn native_send(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Nativ
     Ok(NativeOutcome::Return(vec![Value::Bool(true)]))
 }
 
-/// Receives a message from `chan`. If the channel is empty, returns
-/// [`NativeOutcome::Wait`]; when the host completes the wait the call resumes
-/// with no values, so the `ch.recv` prelude wrapper retries. Returns the
-/// received message, and `nil, "denied"` at once if the robot lacks a grant.
+/// Receives a message from `chan`; returns [`NativeOutcome::Wait`] if the channel
+/// is empty (the call then resumes with no values and the `ch.recv` wrapper
+/// retries). Returns the message, or `nil, "denied"` if the robot lacks a grant.
 fn native_recv(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
     let chan = int_arg(ctx, args, 0, "recv")?;
     let rid = ctx.context().robot;

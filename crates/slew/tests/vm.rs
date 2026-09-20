@@ -829,9 +829,8 @@ struct RobotContext {
     moves: Vec<(u32, String)>,
 }
 
-/// Test native that records a move and parks. It mints its token from the robot
-/// id so tests can name the wait as `NativeWait(robot)`; calls from one robot
-/// therefore share a token (see `duplicate_wait_tokens_complete_together`).
+/// Test native that records a move and parks, minting its token from the robot id
+/// so tests can name the wait as `NativeWait(robot)` (shared between calls).
 fn move_robot(
     ctx: &mut NativeContext<'_, RobotContext>,
     args: &[Value],
@@ -985,9 +984,8 @@ fn complete_native_rejects_unknown_and_already_completed_tokens() {
 fn wait_during_staged_yield_hook_blocks_execution() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // A return hook fires while `coroutine.yield` is staged through its hook
-    // steps. A wait there must not park the coroutine (that would interleave
-    // with the deferred yield); it blocks the execution instead.
+    // A wait during a staged-hook yield must not park (it would interleave with
+    // the deferred yield), so it blocks the execution.
     let chunk = lua
         .load(
             "local co = coroutine.create(function() coroutine.yield(11); return 22 end)\n\
@@ -1016,9 +1014,8 @@ fn wait_during_staged_yield_hook_blocks_execution() {
 fn wait_inside_create_pcall_is_completable() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // `coroutine.create(pcall)` runs the protected call on the coroutine's
-    // stack from inside the resumer's dispatch; the wait must still be tracked
-    // against (and completable by) the resuming execution.
+    // The wait must be tracked against (and completable by) the resuming
+    // execution even though `pcall` runs on the coroutine.
     let chunk = lua
         .load(
             "local co = coroutine.create(pcall)\n\
@@ -1121,9 +1118,7 @@ fn coroutine_native_error_is_caught_by_inner_pcall() {
 fn wait_inside_xpcall_handler_parks_coroutine() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // The wait is issued from inside an xpcall message handler. That handler's
-    // continuation is frame-local, not a single-slot driver, so the wait parks
-    // the coroutine rather than blocking the execution.
+    // An xpcall handler's continuation is frame-local, so a wait in it parks.
     let chunk = lua
         .load(
             "local co = coroutine.create(function()\n\
@@ -1208,9 +1203,8 @@ fn wait_inside_close_handler_parks_coroutine() {
 fn wait_in_gc_finalizer_on_a_coroutine_blocks_execution() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // The finalizer runs on the coroutine's thread. It first switches to another
-    // coroutine; that switch must not clear the finalizer guard, so a wait
-    // issued after it still blocks the execution instead of parking.
+    // The finalizer switches to another coroutine first; that must not clear the
+    // finalizer guard, so its wait still blocks the execution.
     let chunk = lua
         .load(
             "local helper = coroutine.create(function() end)\n\
@@ -1254,9 +1248,8 @@ fn wait_in_gc_finalizer_on_a_coroutine_blocks_execution() {
 fn finalizer_guard_does_not_wedge_later_finalizers() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // A finalizer that tries to yield must not leave the guard owned by an
-    // abandoned coroutine: a later `__gc` still has to run and `collectgarbage`
-    // must not be wedged.
+    // A finalizer that yields must not wedge the guard: later `__gc` and
+    // `collectgarbage` still have to work.
     let chunk = lua
         .load(
             "local ran = 0\n\
@@ -1294,9 +1287,8 @@ fn finalizer_guard_does_not_wedge_later_finalizers() {
 fn print_and_format_errors_do_not_wedge_coroutine_parking() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // `print`/`string.format` must drop their job slot when the `__tostring`
-    // call or argument lookup errors; a leaked job would make every later
-    // parkable wait block instead of parking.
+    // An errored `print`/`format` must not leak its job slot, or every later
+    // parkable wait would block.
     let chunk = lua
         .load(
             "pcall(function() print(setmetatable({}, { __tostring = function() return {} end })) end)\n\
@@ -1327,8 +1319,7 @@ fn print_and_format_errors_do_not_wedge_coroutine_parking() {
 fn abort_releases_a_blocked_finalizer_guard() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // A finalizer that waits blocks the execution; aborting it must release the
-    // finalizer guard, or the whole state can never finalize or collect again.
+    // Aborting the blocked finalizer must release its guard.
     let chunk = lua
         .load(
             "local co = coroutine.create(function()\n\
@@ -1382,8 +1373,7 @@ fn abort_releases_a_blocked_finalizer_guard() {
 fn parked_coroutine_can_be_adopted_by_another_execution() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // First execution parks `saved` (a global) and finishes, dropping its
-    // execution-scoped tracking.
+    // The first execution parks `saved` and finishes.
     let first = lua
         .load(
             "saved = coroutine.create(function() return move('east') end)\n\
@@ -1403,8 +1393,7 @@ fn parked_coroutine_can_be_adopted_by_another_execution() {
         "a finished execution reports no outstanding waits"
     );
 
-    // A second execution resumes the still-parked coroutine; the wait must be
-    // adopted by the resuming execution and be completable there.
+    // A second execution adopts the wait and can complete it.
     let second = lua
         .load("while true do coroutine.resume(saved) end")
         .unwrap();
@@ -1462,8 +1451,7 @@ fn collectgarbage_does_not_disturb_a_parked_coroutine() {
 fn wait_inside_non_yieldable_boundary_blocks_execution() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
-    // `table.sort`'s comparator runs behind a non-yieldable C boundary, so a
-    // wait there cannot park just its coroutine: the execution blocks instead.
+    // A comparator runs behind a non-yieldable boundary, so the wait blocks.
     let chunk = lua
         .load(
             "local t = { 3, 1, 2 }\n\

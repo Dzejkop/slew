@@ -45,8 +45,7 @@ fn run_src(lua: &mut Lua<Ctx>, world: &Rc<RefCell<World>>, id: usize, src: &str)
 }
 
 /// Steps `exec` to completion, handing ready waits to the host each round.
-/// Panics if a wait surfaces on the root thread; tests that expect one drive
-/// `deliver_ready` themselves.
+/// Panics on a root wait; tests expecting one drive `deliver_ready` themselves.
 fn step_to_done(
     lua: &mut Lua<Ctx>,
     world: &Rc<RefCell<World>>,
@@ -194,8 +193,7 @@ fn coroutine_wait_is_completed_by_the_host() {
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
 
-    // The coroutine wait parks without blocking the execution, so it never
-    // surfaces as `Step::Waiting`; it is discovered via `pending_waits`.
+    // The coroutine wait parks (never `Step::Waiting`); found via `pending_waits`.
     assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
     assert_ne!(exec.pending_waits(&lua).len(), 0);
 
@@ -227,8 +225,7 @@ fn recv_wait_resumes_when_a_message_arrives() {
     };
     let mut exec = lua.execute_with_context(&chunk, ctx);
 
-    // Parked on the empty channel: the execution stays runnable and the wait
-    // is tracked rather than surfacing as `Step::Waiting`.
+    // Parked on the empty channel: runnable, tracked (not `Step::Waiting`).
     assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
     assert_ne!(exec.pending_waits(&lua).len(), 0);
 
@@ -295,8 +292,7 @@ fn root_wait_latch_clears_when_the_host_completes_it_directly() {
         other => panic!("expected a root wait, got {other:?}"),
     };
 
-    // Complete the wait directly, not through `deliver_ready`. The latch must
-    // still clear, or the execution would never be stepped again.
+    // Complete directly (not via `deliver_ready`): the latch must still clear.
     exec.complete_native(&mut lua, token, Ok(Vec::new()))
         .unwrap();
     let mut root_wait = Some(token);
@@ -351,8 +347,7 @@ fn send_wait_resumes_when_the_channel_has_room() {
 #[test]
 fn ungranted_recv_returns_denied_without_parking() {
     let (mut lua, world) = test_env(0);
-    // Channel 999 is not granted to robot 0, so `sched.recv` returns at once
-    // instead of parking forever.
+    // Channel 999 is ungranted, so `sched.recv` returns at once.
     let vals = run_src(
         &mut lua,
         &world,

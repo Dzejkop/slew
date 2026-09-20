@@ -25,10 +25,9 @@ robot = {
   carrying = raw.carrying, drop = raw.drop, scan = raw.scan, wait = raw.wait,
   probe = raw.probe, shutdown = raw.shutdown, reboot = raw.reboot,
 }
--- `ch.recv`/`ch.send` block the calling coroutine until they can complete.
--- The `__recv`/`__send` natives park it (return a wait) when the channel is
--- empty/full; the host wakes it with no values, so `nil` with no error means
--- "retry", and a denial is returned to the caller.
+-- `ch.recv`/`ch.send` park the caller until they can complete: the native
+-- returns a wait when the channel is empty/full, and the host wakes it with no
+-- values, so `nil` without an error means "retry".
 ch = {}
 
 function ch.recv(chan)

@@ -11,14 +11,11 @@
 //! `Lua`, so robots cannot see or mutate each other's globals; they communicate
 //! only through host-owned channels.
 //!
-//! Concurrency inside a robot is cooperative. `robot.wait()`, `ch.recv` and
-//! `ch.send` block the calling coroutine: the natives behind them park it until
-//! the host sees the world condition hold (the job finishing, a message
-//! available, channel room) and the `sched` prelude re-exports them as
-//! `sched.recv`/`sched.send` (plus the yield-based `sched.sleep`/`sched.await`
-//! helpers). A robot program ends by entering
-//! `sched.run{...}`, which drives its coroutines round-robin forever; the host
-//! bounds each frame with a fuel budget (`Execution::step`).
+//! Concurrency inside a robot is cooperative: `robot.wait()`, `ch.recv` and
+//! `ch.send` park the calling coroutine until the host sees the world condition
+//! hold. The `sched` prelude re-exports the channel ops and adds the yield-based
+//! `sched.sleep`/`sched.await`. A program ends in `sched.run{...}`, which drives
+//! its coroutines round-robin; the host bounds each frame with a fuel budget.
 //!
 //! Controls:
 //!   j/k or ↑/↓  select · f follow · n new robot · e edit in $EDITOR
