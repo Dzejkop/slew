@@ -181,7 +181,9 @@ impl WaitKind {
         NativeWait(((bits as u64) << Self::KIND_SHIFT) | (chan as u64 & Self::CHANNEL_MASK))
     }
 
-    /// The wait a token names, or `None` for a token this host did not mint.
+    /// The wait a token's kind tag names, or `None` if the tag is unknown to
+    /// this runtime. Not a provenance check: only feed it tokens from
+    /// `pending_waits`, which this host minted.
     fn from_token(token: NativeWait) -> Option<Self> {
         let chan = (token.0 & Self::CHANNEL_MASK) as i64;
         match token.0 >> Self::KIND_SHIFT {
@@ -192,8 +194,8 @@ impl WaitKind {
     }
 }
 
-/// Per-execution context. Channels themselves live in Lua; this only carries
-/// the log handle.
+/// Per-execution context. Channels themselves live in Lua; this carries the
+/// column label and the log handle.
 struct Ctx {
     label: String,
     log: Rc<RefCell<Vec<String>>>,
@@ -280,8 +282,10 @@ impl Runtime {
     /// a sub-1-fuel frame is not lost.
     fn advance(&mut self, lua: &mut Lua<Ctx>, dt: Duration, speed: f64) {
         if self.finished || self.wait.is_some() {
-            // Parked on a channel: bank nothing, or a long wait would release
-            // one huge budget the moment a message arrives.
+            // Blocked on a channel on the root thread: bank nothing, or a long
+            // wait would release one huge budget the moment a message arrives.
+            // A coroutine wait is deliberately not tested here — its siblings
+            // keep running, so the runtime must keep stepping.
             self.fuel_acc = 0.0;
             return;
         }
@@ -316,6 +320,7 @@ impl Runtime {
 /// across frames and is stepped alongside the runtimes.
 struct Prompt {
     exec: Execution<Ctx>,
+    /// As `Runtime::wait`: the root thread's token while blocked, or `None`.
     wait: Option<NativeWait>,
 }
 
@@ -550,6 +555,13 @@ fn wait_room(_ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Native
 
 fn wait_on(args: &[Value], name: &str, make: fn(i64) -> WaitKind) -> Result<NativeOutcome, String> {
     let chan = int_arg(args, 0, name)?;
+    // The token carries only 56 payload bits; reject ids that would not
+    // round-trip through `from_token` instead of silently aliasing them.
+    if !(0..=WaitKind::CHANNEL_MASK as i64).contains(&chan) {
+        return Err(format!(
+            "bad argument #1 to '{name}' (channel id out of range)"
+        ));
+    }
     Ok(NativeOutcome::Wait(make(chan).token()))
 }
 
@@ -593,6 +605,8 @@ fn push_log(log: &Rc<RefCell<Vec<String>>>, line: String) {
 
 /// Re-reads `channels[chan]` from Lua and reports whether `kind` is satisfied.
 /// Read-only: the dequeue/enqueue is done by the Lua side once it resumes.
+/// A missing channel is never-ready for either kind: `ch.recv`/`ch.send` call
+/// `get(chan)` (creating the entry) before they wait.
 fn channel_ready(lua: &mut Lua<Ctx>, kind: WaitKind) -> bool {
     let channels = lua.get_global("channels");
     if !matches!(channels, Value::Table(_)) {
@@ -631,9 +645,6 @@ fn deliver_ready(
     exec: &mut Execution<Ctx>,
     root_wait: &mut Option<NativeWait>,
 ) {
-    if exec.is_finished() {
-        return;
-    }
     for token in exec.pending_waits(lua) {
         let Some(kind) = WaitKind::from_token(token) else {
             continue;
@@ -641,9 +652,16 @@ fn deliver_ready(
         if !channel_ready(lua, kind) {
             continue;
         }
-        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() && *root_wait == Some(token) {
-            *root_wait = None;
-        }
+        // The token came from `pending_waits`, so this cannot fail.
+        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
+    }
+    // A host may complete the root wait through another route; drop the latch
+    // once its token is no longer outstanding, or the runtime would never step
+    // again.
+    if let Some(token) = *root_wait
+        && !exec.pending_waits(lua).contains(&token)
+    {
+        *root_wait = None;
     }
 }
 
@@ -1071,21 +1089,13 @@ mod tests {
         let mut wait = None;
         let step = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
         assert!(matches!(step, Step::Pending), "got {step:?}");
-        assert!(!exec.pending_waits(&h.lua).is_empty());
+        assert_ne!(exec.pending_waits(&h.lua).len(), 0);
 
         h.run("ch.send(7, 42)");
-        for _ in 0..64 {
-            deliver_ready(&mut h.lua, &mut exec, &mut wait);
-            match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
-                Step::Done(vals) => {
-                    assert_eq!(vals[0], Value::Int(42));
-                    return;
-                }
-                Step::Pending => {}
-                Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-            }
+        match h.settle(&mut exec, &mut wait) {
+            Ok(Step::Done(vals)) => assert_eq!(vals[0], Value::Int(42)),
+            other => panic!("coroutine recv should complete, got {other:?}"),
         }
-        panic!("coroutine recv never completed");
     }
 
     #[test]
@@ -1119,19 +1129,26 @@ mod tests {
         );
 
         h.run("ch.send(12, 'b')");
-        for _ in 0..64 {
-            deliver_ready(&mut h.lua, &mut exec, &mut wait);
-            match exec.step(&mut h.lua, PROMPT_FUEL).unwrap() {
-                Step::Done(vals) => {
-                    assert_eq!(h.text(vals[0]), "a");
-                    assert_eq!(h.text(vals[1]), "b");
-                    return;
-                }
-                Step::Pending => {}
-                Step::Waiting(w) => panic!("unexpected wait {w:?}"),
+        match h.settle(&mut exec, &mut wait) {
+            Ok(Step::Done(vals)) => {
+                assert_eq!(h.text(vals[0]), "a");
+                assert_eq!(h.text(vals[1]), "b");
             }
+            other => panic!("coroutine waits should complete, got {other:?}"),
         }
-        panic!("coroutine waits never completed");
+    }
+
+    #[test]
+    fn out_of_range_channel_id_is_rejected_not_masked() {
+        let mut h = Harness::new();
+        // A negative id cannot round-trip through the 56-bit token payload, so
+        // it must be rejected rather than silently aliasing another channel.
+        let mut exec = h.spawn("return ch.recv(-1)");
+        let mut wait = None;
+        match h.settle(&mut exec, &mut wait) {
+            Err(e) => assert!(e.to_string().contains("out of range"), "got {e}"),
+            Ok(step) => panic!("expected an out-of-range error, got {step:?}"),
+        }
     }
 
     #[test]
