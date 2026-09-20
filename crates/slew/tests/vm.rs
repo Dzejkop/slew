@@ -1118,6 +1118,267 @@ fn coroutine_native_error_is_caught_by_inner_pcall() {
 }
 
 #[test]
+fn wait_inside_xpcall_handler_parks_coroutine() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // The wait is issued from inside an xpcall message handler. That handler's
+    // continuation is frame-local, not a single-slot driver, so the wait parks
+    // the coroutine rather than blocking the execution.
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function()\n\
+               return xpcall(function() error('boom') end, function() return move('east') end)\n\
+             end)\n\
+             local ok, x, y\n\
+             while coroutine.status(co) ~= 'dead' do\n\
+               ok, x, y = coroutine.resume(co)\n\
+             end\n\
+             return ok, x, y",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(7)]);
+    assert_eq!(exec.context().moves, vec![(7, "east".into())]);
+
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("the handler wait should complete");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume succeeded");
+    assert_eq!(
+        values[1],
+        Value::Bool(false),
+        "xpcall reports the error it caught"
+    );
+    assert_eq!(
+        values[2],
+        Value::Bool(true),
+        "the handler's parked move completed with its result"
+    );
+}
+
+#[test]
+fn wait_inside_close_handler_parks_coroutine() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // A `<close>` handler runs from a frame-local `Pending` continuation, not a
+    // single-slot driver, so a wait there parks the coroutine.
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function()\n\
+               local guard <close> = setmetatable({}, { __close = function() return move('east') end })\n\
+               guard_ran = true\n\
+             end)\n\
+             local ok, err\n\
+             while coroutine.status(co) ~= 'dead' do\n\
+               ok, err = coroutine.resume(co)\n\
+             end\n\
+             return ok, err",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 2_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(7)]);
+    assert_eq!(lua.get_global("guard_ran"), Value::Bool(true));
+    assert_eq!(exec.context().moves, vec![(7, "east".into())]);
+
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("the close-handler wait should complete");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume succeeded");
+}
+
+#[test]
+fn wait_in_gc_finalizer_on_a_coroutine_blocks_execution() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // The finalizer runs on the coroutine's thread. It first switches to another
+    // coroutine; that switch must not clear the finalizer guard, so a wait
+    // issued after it still blocks the execution instead of parking.
+    let chunk = lua
+        .load(
+            "local helper = coroutine.create(function() end)\n\
+             local co = coroutine.create(function()\n\
+               local obj = setmetatable({}, { __gc = function()\n\
+                 coroutine.resume(helper)\n\
+                 move('east')\n\
+               end })\n\
+               obj = nil\n\
+               collectgarbage('collect')\n\
+             end)\n\
+             local ok, err\n\
+             while coroutine.status(co) ~= 'dead' do\n\
+               ok, err = coroutine.resume(co)\n\
+             end\n\
+             return ok, err",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(
+        exec.step(&mut lua, 1_000_000).unwrap(),
+        Step::Waiting(NativeWait(7)),
+        "a wait in a __gc finalizer on a coroutine must block the execution"
+    );
+    assert_eq!(exec.context().moves, vec![(7, "east".into())]);
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 1_000_000).unwrap() else {
+        panic!("the finalizer wait should complete");
+    };
+    assert_eq!(values[0], Value::Bool(true), "resume succeeded");
+}
+
+#[test]
+fn finalizer_guard_does_not_wedge_later_finalizers() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // A finalizer that tries to yield must not leave the guard owned by an
+    // abandoned coroutine: a later `__gc` still has to run and `collectgarbage`
+    // must not be wedged.
+    let chunk = lua
+        .load(
+            "local ran = 0\n\
+             local co = coroutine.create(function()\n\
+               local obj = setmetatable({}, { __gc = function() coroutine.yield() end })\n\
+               obj = nil\n\
+               collectgarbage('collect')\n\
+             end)\n\
+             coroutine.resume(co)\n\
+             coroutine.close(co)\n\
+             setmetatable({}, { __gc = function() ran = ran + 1 end })\n\
+             collectgarbage('collect')\n\
+             return ran, collectgarbage('collect') ~= nil",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    let Step::Done(values) = exec.step(&mut lua, 1_000_000).unwrap() else {
+        panic!("the script should finish");
+    };
+    assert_eq!(values[0], Value::Int(1), "a later __gc must still run");
+    assert_eq!(
+        values[1],
+        Value::Bool(true),
+        "collectgarbage must not be wedged by a leaked finalizer guard"
+    );
+}
+
+#[test]
+fn print_and_format_errors_do_not_wedge_coroutine_parking() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // `print`/`string.format` must drop their job slot when the `__tostring`
+    // call or argument lookup errors; a leaked job would make every later
+    // parkable wait block instead of parking.
+    let chunk = lua
+        .load(
+            "pcall(function() print(setmetatable({}, { __tostring = function() return {} end })) end)\n\
+             pcall(function() string.format('%d %d', 1) end)\n\
+             local co = coroutine.create(function() a_done = move('east') end)\n\
+             while a_done == nil do coroutine.resume(co) end\n\
+             return a_done",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert_eq!(exec.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
+    assert_eq!(exec.pending_waits(&lua), vec![NativeWait(7)]);
+    exec.complete_native(&mut lua, NativeWait(7), Ok(vec![Value::Bool(true)]))
+        .unwrap();
+    let Step::Done(values) = exec.step(&mut lua, 100_000).unwrap() else {
+        panic!("the coroutine wait should park and complete");
+    };
+    assert_eq!(values[0], Value::Bool(true));
+}
+
+#[test]
+fn abort_releases_a_blocked_finalizer_guard() {
+    let mut lua = slew::Lua::<RobotContext>::new();
+    lua.register_suspendable_native("move", move_robot);
+    // A finalizer that waits blocks the execution; aborting it must release the
+    // finalizer guard, or the whole state can never finalize or collect again.
+    let chunk = lua
+        .load(
+            "local co = coroutine.create(function()\n\
+               local obj = setmetatable({}, { __gc = function() move('east') end })\n\
+               obj = nil\n\
+               collectgarbage('collect')\n\
+             end)\n\
+             coroutine.resume(co)",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        exec.step(&mut lua, 1_000_000).unwrap(),
+        Step::Waiting(_)
+    ));
+    exec.abort(&mut lua);
+
+    let chunk = lua
+        .load(
+            "local ran = 0\n\
+             setmetatable({}, { __gc = function() ran = ran + 1 end })\n\
+             collectgarbage('collect')\n\
+             return ran, collectgarbage('collect') ~= nil",
+        )
+        .unwrap();
+    let mut exec = lua.execute_with_context(
+        &chunk,
+        RobotContext {
+            robot: 7,
+            moves: Vec::new(),
+        },
+    );
+    let Step::Done(values) = exec.step(&mut lua, 1_000_000).unwrap() else {
+        panic!("the second execution should finish");
+    };
+    assert_eq!(values[0], Value::Int(1), "a later __gc must still run");
+    assert_eq!(
+        values[1],
+        Value::Bool(true),
+        "collectgarbage must not be wedged"
+    );
+}
+
+#[test]
 fn parked_coroutine_can_be_adopted_by_another_execution() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
@@ -1166,7 +1427,7 @@ fn parked_coroutine_can_be_adopted_by_another_execution() {
 }
 
 #[test]
-fn parked_coroutine_survives_gc_and_completes() {
+fn collectgarbage_does_not_disturb_a_parked_coroutine() {
     let mut lua = slew::Lua::<RobotContext>::new();
     lua.register_suspendable_native("move", move_robot);
     let chunk = lua

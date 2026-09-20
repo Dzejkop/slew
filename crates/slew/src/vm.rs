@@ -101,6 +101,13 @@ pub struct ExecutionId(u64);
 /// resumed the parked coroutine, so adoption can move a token between
 /// executions; use [`Execution::pending_waits`] to find the execution that can
 /// complete a given wait.
+///
+/// The VM treats the `u64` as opaque. A host whose completions depend on the
+/// wait's *meaning* must encode that meaning in the token: `complete_native`
+/// and `pending_waits` only ever see the `u64`, and the issuing execution's
+/// context may no longer own the wait after another execution adopts the
+/// coroutine. Both in-repo hosts pack a kind tag and a payload into the value;
+/// the VM never reads the packed fields, so the convention is the host's.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NativeWait(pub u64);
 
@@ -112,13 +119,17 @@ pub enum NativeOutcome {
     ///
     /// On the execution's root thread — or on a coroutine wait that the VM
     /// cannot park (a coroutine with no resumer, a non-yieldable C-call
-    /// boundary, a staged `coroutine.yield`, or an active multi-step driver
-    /// such as `print`/`string.format`/`coroutine.close` or a `__gc` finalizer)
-    /// — the whole execution blocks and [`Execution::step`] returns
-    /// [`Step::Waiting`]. On a parkable coroutine only that coroutine sleeps:
-    /// it yields to its resumer while every other coroutine keeps running. A
-    /// `coroutine.resume` of a parked coroutine returns `true` with no values;
-    /// a `coroutine.wrap` call returns no values at all.
+    /// boundary, a staged `coroutine.yield`, or an active single-slot driver
+    /// such as `print`/`string.format`/`coroutine.close`, a message handler
+    /// running at a `__close` error site, or a `__gc` finalizer) — the whole
+    /// execution blocks and [`Execution::step`] returns [`Step::Waiting`]. On a
+    /// parkable coroutine only that coroutine sleeps: it yields to its resumer
+    /// while every other coroutine keeps running. A `coroutine.resume` of a
+    /// parked coroutine returns `true` with no values; a `coroutine.wrap` call
+    /// returns no values at all. A wait inside an ordinary `xpcall` message
+    /// handler, or inside a `__close` handler whether it runs at scope exit or
+    /// during error unwinding, does park: those continuations live on the
+    /// thread's own frame stack.
     Wait(NativeWait),
 }
 
@@ -805,9 +816,12 @@ pub struct Lua<C = ()> {
     pub(crate) gc_stepmul: i64,
     /// Objects selected for `__gc`, awaiting a dispatch safe point. A GC root.
     pending_finalizers: Vec<Value>,
-    /// Frame depth at which the in-flight finalizer was started; suppresses
-    /// nested finalizer dispatch until that frame returns.
-    finalizer_depth: Option<usize>,
+    /// The thread running the in-flight finalizer and the frame depth at which
+    /// it started. While set, nested finalizer dispatch and every
+    /// `collectgarbage` call are suppressed until that frame returns. Keyed by
+    /// thread so only the owner's frame depth (or the owner going away) clears
+    /// it.
+    finalizer_depth: Option<(ThreadId, usize)>,
     /// In-progress `coroutine.close` driver (see [`CloseJob`]).
     close_job: Option<CloseJob>,
     /// In-progress `print` driver (see [`PrintJob`]).
@@ -2717,10 +2731,18 @@ impl<C> Lua<C> {
     /// ([`Lua::thread_can_yield`]), has no resumer to yield to, has a staged
     /// `coroutine.yield` in flight (a hook-fired wait must not interleave with
     /// the deferred yield), or is inside an active single-slot driver
-    /// (`print`/`string.format`/`coroutine.close`/`__close`, an xpcall handler,
-    /// a `__gc` finalizer). Interleaving another coroutine in those states
-    /// would clobber VM state, so such waits conservatively block the
-    /// execution.
+    /// (`print`/`string.format`/`coroutine.close`, a message handler running at
+    /// a `__close` error site, or a `__gc` finalizer). Each of those drivers
+    /// keeps its continuation in one `Lua` slot that switching coroutines would
+    /// clobber, so such waits conservatively block the execution.
+    ///
+    /// An ordinary `xpcall` message handler and a `__close` handler — whether it
+    /// runs at scope exit or during error unwinding — are not single-slot
+    /// drivers: their continuations are frame-local `Pending` entries, so a wait
+    /// there parks normally.
+    ///
+    /// This list is authoritative; the user-facing docs ([`NativeOutcome::Wait`],
+    /// [`Step::Waiting`]) describe the observable consequences.
     fn wait_can_park(&self, th: &Thread) -> bool {
         Self::thread_can_yield(th)
             && th.parent.is_some()
@@ -4546,6 +4568,19 @@ impl<C> Lua<C> {
                 "attempt to yield across a C-call boundary".into(),
             ));
         }
+        // A `__gc` finalizer is a C-call boundary in PUC, so yielding from the
+        // thread running one is an error too. This also keeps the finalizer
+        // guard attached to a frame that cannot be abandoned mid-finalizer.
+        if !th.is_main
+            && self
+                .finalizer_depth
+                .is_some_and(|(owner, _)| owner == self.current_thread)
+        {
+            return Err(Self::rt_err(
+                th,
+                "attempt to yield across a C-call boundary".into(),
+            ));
+        }
         let Some(parent) = th.parent else {
             return Err(Self::rt_err(
                 th,
@@ -5416,7 +5451,9 @@ impl<C> Lua<C> {
             if let Value::Str(s) = v {
                 job.out.push(self.strings.get(s).to_vec());
             } else {
-                self.print_job = Some(job);
+                // The frame carrying `Pending::PrintStep` is unwinding, so the
+                // job can never resume: drop it rather than parking it in the
+                // slot, which would disable coroutine parking forever.
                 return Err(Self::rt_err(th, "'__tostring' must return a string".into()));
             }
         }
@@ -5472,7 +5509,7 @@ impl<C> Lua<C> {
                 Value::Str(id) => self.strings.get(id).to_vec(),
                 Value::Int(_) | Value::Float(_) => crate::value::fmt_number(v).into_bytes(),
                 _ => {
-                    self.format_job = Some(job);
+                    // Unwinding: drop the job (see `print_step`).
                     return Err(Self::rt_err(th, "'__tostring' must return a string".into()));
                 }
             };
@@ -5496,7 +5533,7 @@ impl<C> Lua<C> {
             job.arg += 1;
             if job.arg > job.args.len() {
                 let arg = job.arg;
-                self.format_job = Some(job);
+                // Unwinding: drop the job (see `print_step`).
                 return Err(Self::rt_err(
                     th,
                     format!("bad argument #{arg} to 'format' (no value)"),
@@ -6217,11 +6254,26 @@ impl<C> Lua<C> {
         th: &mut Thread,
         fuel: &mut i64,
     ) -> Result<(), VmError> {
-        if let Some(depth) = self.finalizer_depth {
-            if th.frames.len() < depth || self.current_thread != tid {
-                self.finalizer_depth = None;
+        if let Some((owner, depth)) = self.finalizer_depth {
+            if owner == tid {
+                if th.frames.len() < depth {
+                    self.finalizer_depth = None;
+                } else {
+                    return Ok(());
+                }
             } else {
-                return Ok(());
+                // Another thread is being dispatched: hold the guard only while
+                // its owner still has the finalizer frame. A closed or unwound
+                // owner releases it, so an abandoned finalizer cannot stall
+                // every later `__gc` and `collectgarbage`.
+                let owner_holds = {
+                    let owner_th = &self.threads[owner.0 as usize];
+                    owner_th.status != CoStatus::Dead && owner_th.frames.len() >= depth
+                };
+                if owner_holds {
+                    return Ok(());
+                }
+                self.finalizer_depth = None;
             }
         }
         if th.frames.is_empty() {
@@ -6250,7 +6302,7 @@ impl<C> Lua<C> {
             // the guard set in that case would stall the driver forever and
             // leave `pending_finalizers` permanently rooted.
             self.finalizer_depth = if th.frames.len() > frames_before {
-                Some(th.frames.len())
+                Some((tid, th.frames.len()))
             } else {
                 None
             };
@@ -6960,6 +7012,17 @@ impl<C> Execution<C> {
     pub fn abort(mut self, lua: &mut Lua<C>) {
         self.finished = true;
         lua.exec_roots.remove(&self.thread.0);
+        // A finalizer blocked on a native wait in this execution never resumes,
+        // so release its guard: otherwise every later `__gc` and `collectgarbage`
+        // stays suppressed for the rest of the state.
+        if let Some((owner, _)) = lua.finalizer_depth
+            && lua.threads[owner.0 as usize]
+                .pending_native
+                .as_ref()
+                .is_some_and(|p| p.exec == self.id)
+        {
+            lua.finalizer_depth = None;
+        }
     }
 
     #[must_use]
@@ -7033,19 +7096,20 @@ impl<C> Execution<C> {
     }
 
     /// Wait tokens currently awaiting completion in this execution, in a
-    /// stable order (thread arena order) and without duplicates. A token belongs to the root thread
-    /// (whole-execution block, also reported as `Step::Waiting`), one or more
-    /// suspended coroutines, or both. Tokens whose completion the host has
-    /// already supplied are omitted: they resume on the next `step`, they do
-    /// not need completing again.
+    /// stable order (thread arena order) and without duplicates. A token
+    /// belongs to the root thread (whole-execution block, also reported as
+    /// `Step::Waiting`), one or more suspended coroutines, or both. Tokens
+    /// whose completion the host has already supplied are omitted: they resume
+    /// on the next `step`, they do not need completing again.
     ///
-    /// A finished execution reports none, even for a coroutine parked under it
-    /// that is still reachable from Lua: adopt such a wait by resuming the
-    /// coroutine from a live execution first (its next park transfers the wait
-    /// to that execution). A parked coroutine is only tracked while it is
-    /// reachable (from Lua, or as the execution's current thread); an embedder
-    /// that parks a coroutine and drops every reference to it cannot complete
-    /// that wait.
+    /// A finished execution reports none. If a coroutine parked under it is
+    /// still live, adopt its wait by resuming the coroutine from a live
+    /// execution (e.g. `coroutine.resume` + `step`): that moves the wait to the
+    /// adopting execution unless a completion was already supplied. The scan
+    /// covers every thread in the arena, so a parked coroutine is reported even
+    /// when no long-lived registry references it — but only until the collector
+    /// sweeps it, after which the wait (and its token) is gone. Keep a parked
+    /// coroutine reachable, or complete its wait, if the host must act on it.
     #[must_use]
     pub fn pending_waits(&self, lua: &Lua<C>) -> Vec<NativeWait> {
         if self.finished {
