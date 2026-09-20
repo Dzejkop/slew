@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slew::{Lua, Step, Value};
+use slew::{Execution, Lua, Step, Value};
 
 use crate::app::{App, boot_or_error, deliver_ready};
 use crate::config::{CHANNEL_CAP, MINE_TICKS, MOVE_TICKS, ROBOTS};
@@ -40,6 +40,25 @@ fn run_src(lua: &mut Lua<Ctx>, world: &Rc<RefCell<World>>, id: usize, src: &str)
             Ok(Step::Pending) => {}
             Ok(Step::Waiting(_)) => panic!("unexpected wait"),
             Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// Steps `exec` to completion, handing ready waits to the host each round.
+/// Panics if a wait surfaces on the root thread; tests that expect one drive
+/// `deliver_ready` themselves.
+fn step_to_done(
+    lua: &mut Lua<Ctx>,
+    world: &Rc<RefCell<World>>,
+    exec: &mut Execution<Ctx>,
+) -> Vec<Value> {
+    let mut root_wait = None;
+    loop {
+        deliver_ready(exec, &mut root_wait, lua, world);
+        match exec.step(lua, 1_000_000).unwrap() {
+            Step::Done(v) => return v,
+            Step::Pending => {}
+            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
         }
     }
 }
@@ -178,20 +197,14 @@ fn coroutine_wait_is_completed_by_the_host() {
     // The coroutine wait parks without blocking the execution, so it never
     // surfaces as `Step::Waiting`; it is discovered via `pending_waits`.
     assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
-    assert!(!exec.pending_waits(&lua).is_empty());
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
 
     // Once the job finishes, the host driver must complete the coroutine wait.
     world.borrow_mut().robots[0].job = None;
     let mut root_wait = None;
     deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
 
-    loop {
-        match exec.step(&mut lua, 100_000).unwrap() {
-            Step::Done(_) => break,
-            Step::Pending => {}
-            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-        }
-    }
+    step_to_done(&mut lua, &world, &mut exec);
     assert_eq!(lua.get_global("done"), Value::Bool(true));
 }
 
@@ -217,7 +230,7 @@ fn recv_wait_resumes_when_a_message_arrives() {
     // Parked on the empty channel: the execution stays runnable and the wait
     // is tracked rather than surfacing as `Step::Waiting`.
     assert_eq!(exec.step(&mut lua, 100_000).unwrap(), Step::Pending);
-    assert!(!exec.pending_waits(&lua).is_empty());
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
 
     // A message arrives; the host completes the channel wait.
     world.borrow_mut().channels.insert(
@@ -227,15 +240,7 @@ fn recv_wait_resumes_when_a_message_arrives() {
             items: VecDeque::from([Msg::Int(7)]),
         },
     );
-    let mut root_wait = None;
-    loop {
-        deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
-        match exec.step(&mut lua, 100_000).unwrap() {
-            Step::Done(_) => break,
-            Step::Pending => {}
-            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-        }
-    }
+    step_to_done(&mut lua, &world, &mut exec);
     assert_eq!(lua.get_global("got"), Value::Int(7));
 }
 
@@ -266,13 +271,42 @@ fn root_wait_is_completed_by_the_host() {
     let mut root_wait = Some(token);
     deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
     assert!(root_wait.is_none(), "the host cleared the root wait");
-    loop {
-        match exec.step(&mut lua, 1_000_000).unwrap() {
-            Step::Done(_) => break,
-            Step::Pending => {}
-            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-        }
-    }
+    step_to_done(&mut lua, &world, &mut exec);
+    assert_eq!(lua.get_global("done"), Value::Bool(true));
+}
+
+#[test]
+fn root_wait_latch_clears_when_the_host_completes_it_directly() {
+    let (mut lua, world) = test_env(0);
+    world.borrow_mut().robots[0].job = Some(Job {
+        kind: JobKind::Mine,
+        remaining: MINE_TICKS,
+    });
+    let chunk = lua
+        .load_named("=t", "local n = robot.wait() done = (n == nil)")
+        .unwrap();
+    let ctx = Ctx {
+        robot: 0,
+        world: Rc::clone(&world),
+    };
+    let mut exec = lua.execute_with_context(&chunk, ctx);
+    let token = match exec.step(&mut lua, 1_000_000).unwrap() {
+        Step::Waiting(t) => t,
+        other => panic!("expected a root wait, got {other:?}"),
+    };
+
+    // Complete the wait directly, not through `deliver_ready`. The latch must
+    // still clear, or the execution would never be stepped again.
+    exec.complete_native(&mut lua, token, Ok(Vec::new()))
+        .unwrap();
+    let mut root_wait = Some(token);
+    deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
+    assert!(
+        root_wait.is_none(),
+        "the latch clears once the wait is no longer outstanding"
+    );
+
+    step_to_done(&mut lua, &world, &mut exec);
     assert_eq!(lua.get_global("done"), Value::Bool(true));
 }
 
@@ -300,7 +334,7 @@ fn send_wait_resumes_when_the_channel_has_room() {
 
     // Blocked on the full channel, not blocking the execution.
     assert_eq!(exec.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
-    assert!(!exec.pending_waits(&lua).is_empty());
+    assert_ne!(exec.pending_waits(&lua).len(), 0);
 
     // Freeing one slot must wake the sender.
     world
@@ -310,15 +344,7 @@ fn send_wait_resumes_when_the_channel_has_room() {
         .unwrap()
         .items
         .pop_front();
-    let mut root_wait = None;
-    loop {
-        deliver_ready(&mut exec, &mut root_wait, &mut lua, &world);
-        match exec.step(&mut lua, 1_000_000).unwrap() {
-            Step::Done(_) => break,
-            Step::Pending => {}
-            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-        }
-    }
+    step_to_done(&mut lua, &world, &mut exec);
     assert_eq!(lua.get_global("sent"), Value::Bool(true));
 }
 
@@ -371,8 +397,9 @@ fn adopted_wait_is_completed_by_the_adopting_execution() {
         },
     );
     assert_eq!(eb.step(&mut lua, 1_000_000).unwrap(), Step::Pending);
-    assert!(
-        !eb.pending_waits(&lua).is_empty(),
+    assert_ne!(
+        eb.pending_waits(&lua).len(),
+        0,
         "the adopting execution owns the wait"
     );
 
@@ -383,15 +410,7 @@ fn adopted_wait_is_completed_by_the_adopting_execution() {
             items: VecDeque::from([Msg::Int(7)]),
         },
     );
-    let mut root_wait = None;
-    loop {
-        deliver_ready(&mut eb, &mut root_wait, &mut lua, &world);
-        match eb.step(&mut lua, 1_000_000).unwrap() {
-            Step::Done(_) => break,
-            Step::Pending => {}
-            Step::Waiting(w) => panic!("unexpected wait {w:?}"),
-        }
-    }
+    step_to_done(&mut lua, &world, &mut eb);
     assert_eq!(lua.get_global("got"), Value::Int(7));
 }
 

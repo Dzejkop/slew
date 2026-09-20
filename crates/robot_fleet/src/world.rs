@@ -301,7 +301,7 @@ pub(crate) enum Request {
 /// when another execution adopts the parked coroutine.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitKind {
-    /// Robot `usize`'s current job has finished (`robot.wait()`).
+    /// The robot at this index has finished its current job (`robot.wait()`).
     ActionDone(usize),
     /// The channel has at least one message (`ch.recv`).
     ChannelNonEmpty(i64),
@@ -324,7 +324,9 @@ impl WaitKind {
     }
 
     /// The token naming this wait. The payload must be non-negative and fit in
-    /// 56 bits (channel ids are, and robot ids are tiny).
+    /// 56 bits. Callers only pass a robot id or a channel id drawn from the
+    /// robot's grant set (small non-negative constants), so the mask only ever
+    /// truncates in the unreachable case the `debug_assert!` guards.
     pub(crate) fn token(self) -> NativeWait {
         let (kind, payload) = self.parts();
         debug_assert!(
@@ -334,7 +336,10 @@ impl WaitKind {
         NativeWait((kind << Self::KIND_SHIFT) | (payload as u64 & Self::PAYLOAD_MASK))
     }
 
-    /// The wait a token names, or `None` for a token this host did not mint.
+    /// The wait a token's kind tag names, or `None` if the tag is unknown to
+    /// this host. This is not a provenance check: any token whose tag happens
+    /// to match decodes, so only feed it tokens this host minted (as
+    /// `Execution::pending_waits` does).
     pub(crate) fn from_token(token: NativeWait) -> Option<Self> {
         let payload = (token.0 & Self::PAYLOAD_MASK) as i64;
         match token.0 >> Self::KIND_SHIFT {
@@ -347,6 +352,10 @@ impl WaitKind {
 
     /// Whether the world condition this wait is waiting for currently holds.
     /// The wait itself names the robot or channel it concerns.
+    ///
+    /// A channel with no entry yet is not ready for a receive and is ready for
+    /// a send, matching the get-or-create in [`crate::natives`] (a send creates
+    /// the channel before parking).
     pub(crate) fn is_ready(self, world: &World) -> bool {
         match self {
             WaitKind::ActionDone(rid) => world.robots[rid].job.is_none(),

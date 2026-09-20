@@ -369,8 +369,16 @@ pub(crate) fn deliver_ready(
         if !kind.is_ready(&world.borrow()) {
             continue;
         }
-        if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() && *root_wait == Some(token) {
-            *root_wait = None;
-        }
+        // The token came from `pending_waits`, so this cannot fail.
+        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
+    }
+    // A host may complete the root wait through another route (the token is not
+    // in `pending_waits` once its completion is set), so drop the latch whenever
+    // the token is no longer outstanding — otherwise the execution would never
+    // be stepped again.
+    if let Some(token) = *root_wait
+        && !exec.pending_waits(lua).contains(&token)
+    {
+        *root_wait = None;
     }
 }

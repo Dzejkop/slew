@@ -12,6 +12,9 @@ use crate::world::{Ctx, World};
 
 pub(crate) struct Prompt {
     pub(crate) exec: Execution<Ctx>,
+    /// The root thread's wait token while the prompt is blocked on
+    /// `Step::Waiting`; `None` when runnable or parked only in a coroutine
+    /// (coroutine waits are found through `Execution::pending_waits`).
     pub(crate) wait: Option<NativeWait>,
 }
 
@@ -19,6 +22,7 @@ pub(crate) struct Robot {
     pub(crate) dir: PathBuf,
     pub(crate) lua: Option<Lua<Ctx>>,
     pub(crate) program: Option<Execution<Ctx>>,
+    /// As `Prompt::wait`, for the program execution.
     pub(crate) program_wait: Option<NativeWait>,
     pub(crate) prompt: Option<Prompt>,
     pub(crate) error: Option<String>,

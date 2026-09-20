@@ -312,8 +312,10 @@ fn native_probe(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Nati
     Ok(NativeOutcome::Return(vec![ctx.new_string(desc.as_bytes())]))
 }
 
-/// Sends `msg` on `chan`, suspending the caller until the channel has room.
-/// Returns `nil, "denied"` at once if the robot lacks a grant.
+/// Sends `msg` on `chan`. If the channel is full, returns
+/// [`NativeOutcome::Wait`]; when the host completes the wait the call resumes
+/// with no values, so the `ch.send` prelude wrapper retries. Returns `true` on
+/// success, and `nil, "denied"` at once if the robot lacks a grant.
 fn native_send(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
     let chan = int_arg(ctx, args, 0, "send")?;
     let Some(value) = args.get(1) else {
@@ -340,8 +342,10 @@ fn native_send(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<Nativ
     Ok(NativeOutcome::Return(vec![Value::Bool(true)]))
 }
 
-/// Receives a message from `chan`, suspending the caller until one is
-/// available. Returns `nil, "denied"` at once if the robot lacks a grant.
+/// Receives a message from `chan`. If the channel is empty, returns
+/// [`NativeOutcome::Wait`]; when the host completes the wait the call resumes
+/// with no values, so the `ch.recv` prelude wrapper retries. Returns the
+/// received message, and `nil, "denied"` at once if the robot lacks a grant.
 fn native_recv(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
     let chan = int_arg(ctx, args, 0, "recv")?;
     let rid = ctx.context().robot;
