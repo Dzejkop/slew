@@ -156,30 +156,51 @@ enum WaitKind {
 }
 
 impl WaitKind {
+    /// Top byte = kind, low 56 bits = channel id.
+    const KIND_SHIFT: u32 = 56;
+    const CHANNEL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
     fn channel(self) -> i64 {
         match self {
             WaitKind::NonEmpty(c) | WaitKind::Room(c) => c,
         }
     }
+
+    /// The token naming this wait (kind in the top byte).
+    fn token(self) -> NativeWait {
+        let (bits, chan) = match self {
+            WaitKind::NonEmpty(c) => (1, c),
+            WaitKind::Room(c) => (2, c),
+        };
+        debug_assert!(
+            chan >= 0 && chan as u64 <= Self::CHANNEL_MASK,
+            "channel id {chan} does not fit in the token"
+        );
+        NativeWait(((bits as u64) << Self::KIND_SHIFT) | (chan as u64 & Self::CHANNEL_MASK))
+    }
+
+    /// The wait a token's tag names, or `None` if the tag is unknown. Not a
+    /// provenance check: feed it only tokens from `pending_waits`.
+    fn from_token(token: NativeWait) -> Option<Self> {
+        let chan = (token.0 & Self::CHANNEL_MASK) as i64;
+        match token.0 >> Self::KIND_SHIFT {
+            1 => Some(WaitKind::NonEmpty(chan)),
+            2 => Some(WaitKind::Room(chan)),
+            _ => None,
+        }
+    }
 }
 
-/// Per-execution context. Channels themselves live in Lua; this only carries
-/// the log handle and the current wait.
+/// Per-execution context. Channels themselves live in Lua; this carries the
+/// column label and the log handle.
 struct Ctx {
     label: String,
     log: Rc<RefCell<Vec<String>>>,
-    waiting: Option<WaitKind>,
-    waits: u64,
 }
 
 impl Ctx {
     fn program(label: String, log: Rc<RefCell<Vec<String>>>) -> Self {
-        Self {
-            label,
-            log,
-            waiting: None,
-            waits: 0,
-        }
+        Self { label, log }
     }
 
     fn prompt(log: Rc<RefCell<Vec<String>>>) -> Self {
@@ -197,7 +218,8 @@ struct Runtime {
     rate: f64,
     /// Fractional fuel carried between frames.
     fuel_acc: f64,
-    /// Set while the execution is suspended on a `__ch_wait_*` native.
+    /// The root thread's wait token while blocked (`Step::Waiting`); `None` for a
+    /// purely coroutine wait, found via `Execution::pending_waits`.
     wait: Option<NativeWait>,
     line: Option<u32>,
     finished: bool,
@@ -234,17 +256,19 @@ impl Runtime {
         }
     }
 
-    fn status(&self) -> String {
+    fn status(&self, lua: &Lua<Ctx>) -> String {
         if let Some(e) = &self.error {
             return format!("error: {e}");
         }
         if self.finished {
             return "done".into();
         }
-        match self.exec.context().waiting {
-            Some(WaitKind::NonEmpty(c)) => return format!("waiting on ch {c}"),
-            Some(WaitKind::Room(c)) => return format!("waiting for room on ch {c}"),
-            None => {}
+        for token in self.exec.pending_waits(lua) {
+            match WaitKind::from_token(token) {
+                Some(WaitKind::NonEmpty(c)) => return format!("waiting on ch {c}"),
+                Some(WaitKind::Room(c)) => return format!("waiting for room on ch {c}"),
+                None => {}
+            }
         }
         self.line
             .map_or_else(|| "…".into(), |l| format!("line {l}"))
@@ -254,8 +278,9 @@ impl Runtime {
     /// a sub-1-fuel frame is not lost.
     fn advance(&mut self, lua: &mut Lua<Ctx>, dt: Duration, speed: f64) {
         if self.finished || self.wait.is_some() {
-            // Parked on a channel: bank nothing, or a long wait would release
-            // one huge budget the moment a message arrives.
+            // Blocked on the root thread: bank nothing, or a long wait would
+            // release one huge budget at once. A coroutine wait is not tested
+            // here: its siblings must keep running.
             self.fuel_acc = 0.0;
             return;
         }
@@ -290,6 +315,7 @@ impl Runtime {
 /// across frames and is stepped alongside the runtimes.
 struct Prompt {
     exec: Execution<Ctx>,
+    /// As `Runtime::wait`.
     wait: Option<NativeWait>,
 }
 
@@ -405,11 +431,11 @@ impl App {
 
     fn deliver_pending(&mut self) {
         for runtime in &mut self.runtimes {
-            deliver_if_ready(&mut self.lua, &mut runtime.exec, &mut runtime.wait);
+            deliver_ready(&mut self.lua, &mut runtime.exec, &mut runtime.wait);
         }
 
         if let Some(prompt) = &mut self.prompt {
-            deliver_if_ready(&mut self.lua, &mut prompt.exec, &mut prompt.wait);
+            deliver_ready(&mut self.lua, &mut prompt.exec, &mut prompt.wait);
         }
     }
 
@@ -511,28 +537,27 @@ impl App {
 
 /// Suspends the caller until `chan` is non-empty. Mutates nothing.
 fn wait_nonempty(
-    ctx: &mut NativeContext<'_, Ctx>,
+    _ctx: &mut NativeContext<'_, Ctx>,
     args: &[Value],
 ) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_nonempty", WaitKind::NonEmpty)
+    wait_on(args, "__ch_wait_nonempty", WaitKind::NonEmpty)
 }
 
 /// Suspends the caller until `chan` has room. Mutates nothing.
-fn wait_room(ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
-    wait_on(ctx, args, "__ch_wait_room", WaitKind::Room)
+fn wait_room(_ctx: &mut NativeContext<'_, Ctx>, args: &[Value]) -> Result<NativeOutcome, String> {
+    wait_on(args, "__ch_wait_room", WaitKind::Room)
 }
 
-fn wait_on(
-    ctx: &mut NativeContext<'_, Ctx>,
-    args: &[Value],
-    name: &str,
-    make: fn(i64) -> WaitKind,
-) -> Result<NativeOutcome, String> {
+fn wait_on(args: &[Value], name: &str, make: fn(i64) -> WaitKind) -> Result<NativeOutcome, String> {
     let chan = int_arg(args, 0, name)?;
-    let state = ctx.context_mut();
-    state.waiting = Some(make(chan));
-    state.waits += 1;
-    Ok(NativeOutcome::Wait(NativeWait(state.waits)))
+    // The token carries only 56 payload bits; reject ids that would not
+    // round-trip through `from_token` instead of silently aliasing them.
+    if !(0..=WaitKind::CHANNEL_MASK as i64).contains(&chan) {
+        return Err(format!(
+            "bad argument #1 to '{name}' (channel id out of range)"
+        ));
+    }
+    Ok(NativeOutcome::Wait(make(chan).token()))
 }
 
 /// Appends one line to the shared log.
@@ -573,8 +598,9 @@ fn push_log(log: &Rc<RefCell<Vec<String>>>, line: String) {
     }
 }
 
-/// Re-reads `channels[chan]` from Lua and reports whether `kind` is satisfied.
-/// Read-only: the dequeue/enqueue is done by the Lua side once it resumes.
+/// Re-reads `channels[chan]` and reports whether `kind` holds. Read-only; the
+/// Lua side does the dequeue/enqueue once it resumes. A missing channel is
+/// never-ready for either kind: `ch.recv`/`ch.send` create it before waiting.
 fn channel_ready(lua: &mut Lua<Ctx>, kind: WaitKind) -> bool {
     let channels = lua.get_global("channels");
     if !matches!(channels, Value::Table(_)) {
@@ -603,20 +629,30 @@ fn field_int(lua: &mut Lua<Ctx>, table: Value, name: &str) -> i64 {
     }
 }
 
-/// If `exec` is parked on a satisfied condition, hand it back to Lua.
-fn deliver_if_ready(lua: &mut Lua<Ctx>, exec: &mut Execution<Ctx>, wait: &mut Option<NativeWait>) {
-    let Some(token) = *wait else {
-        return;
-    };
-    let Some(kind) = exec.context().waiting else {
-        return;
-    };
-    if !channel_ready(lua, kind) {
-        return;
+/// Hands back parked waits whose condition holds. A root wait surfaces as
+/// `Step::Waiting` and is tracked in `root_wait`; a coroutine wait never
+/// surfaces, so it is rediscovered through [`Execution::pending_waits`].
+fn deliver_ready(
+    lua: &mut Lua<Ctx>,
+    exec: &mut Execution<Ctx>,
+    root_wait: &mut Option<NativeWait>,
+) {
+    for token in exec.pending_waits(lua) {
+        let Some(kind) = WaitKind::from_token(token) else {
+            continue;
+        };
+        if !channel_ready(lua, kind) {
+            continue;
+        }
+        // The token came from `pending_waits`, so this cannot fail.
+        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
     }
-    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-        *wait = None;
-        exec.context_mut().waiting = None;
+    // Drop the latch once its token is no longer outstanding, or the runtime
+    // would never step again.
+    if let Some(token) = *root_wait
+        && !exec.pending_waits(lua).contains(&token)
+    {
+        *root_wait = None;
     }
 }
 
@@ -664,7 +700,7 @@ fn ui(frame: &mut Frame, app: &App) {
 
     let areas = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(columns);
     for (i, area) in areas.iter().enumerate() {
-        draw_runtime(frame, *area, &app.runtimes[i], i == app.selected);
+        draw_runtime(frame, *area, &app.runtimes[i], i == app.selected, &app.lua);
     }
 
     draw_log(frame, log_area, app);
@@ -685,7 +721,7 @@ fn ui(frame: &mut Frame, app: &App) {
     );
 }
 
-fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool) {
+fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool, lua: &Lua<Ctx>) {
     let current_line = Style::new().bg(Color::Indexed(236));
     let lines: Vec<Line> = runtime
         .source
@@ -718,7 +754,7 @@ fn draw_runtime(frame: &mut Frame, area: Rect, runtime: &Runtime, selected: bool
         if selected { "▸" } else { " " },
         runtime.id,
         runtime.rate,
-        runtime.status()
+        runtime.status(lua)
     );
     let style = if runtime.error.is_some() {
         Style::new().fg(Color::Red)
@@ -961,7 +997,7 @@ mod tests {
             wait: &mut Option<NativeWait>,
         ) -> Result<Step, Error> {
             for _ in 0..64 {
-                deliver_if_ready(&mut self.lua, exec, wait);
+                deliver_ready(&mut self.lua, exec, wait);
                 let step = exec.step(&mut self.lua, PROMPT_FUEL)?;
                 if let Step::Waiting(w) = &step {
                     *wait = Some(*w);
@@ -1027,6 +1063,82 @@ mod tests {
         match h.settle(&mut waiter, &mut wait) {
             Ok(Step::Done(vals)) => assert_eq!(vals[0], Value::Int(99)),
             other => panic!("waiter should resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coroutine_recv_parks_without_blocking_the_execution() {
+        let mut h = Harness::new();
+        // The recv runs in a coroutine driven by a scheduler loop, so its wait
+        // parks only the coroutine: the execution stays `Pending`, never
+        // `Waiting`; the host discovers it from `Execution::pending_waits`.
+        let mut exec = h.spawn(
+            "local co = coroutine.create(function() got = ch.recv(7) end)\n\
+             while got == nil do coroutine.resume(co) end\n\
+             return got",
+        );
+        let mut wait = None;
+        let step = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
+        assert!(matches!(step, Step::Pending), "got {step:?}");
+        assert_ne!(exec.pending_waits(&h.lua).len(), 0);
+
+        h.run("ch.send(7, 42)");
+        match h.settle(&mut exec, &mut wait) {
+            Ok(Step::Done(vals)) => assert_eq!(vals[0], Value::Int(42)),
+            other => panic!("coroutine recv should complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coroutine_waits_are_delivered_per_channel() {
+        let mut h = Harness::new();
+        // Two coroutines in one execution wait on different channels; only the
+        // one whose channel becomes ready may be released.
+        let mut exec = h.spawn(
+            "local a = coroutine.create(function() got_a = ch.recv(11) end)\n\
+             local b = coroutine.create(function() got_b = ch.recv(12) end)\n\
+             while got_a == nil or got_b == nil do\n\
+               coroutine.resume(a)\n\
+               coroutine.resume(b)\n\
+             end\n\
+             return got_a, got_b",
+        );
+        let mut wait = None;
+        assert!(matches!(
+            exec.step(&mut h.lua, PROMPT_FUEL).unwrap(),
+            Step::Pending
+        ));
+        assert_eq!(exec.pending_waits(&h.lua).len(), 2);
+
+        h.run("ch.send(11, 'a')");
+        deliver_ready(&mut h.lua, &mut exec, &mut wait);
+        let _ = exec.step(&mut h.lua, PROMPT_FUEL).unwrap();
+        assert_eq!(
+            exec.pending_waits(&h.lua).len(),
+            1,
+            "only the ready channel's wait may be released"
+        );
+
+        h.run("ch.send(12, 'b')");
+        match h.settle(&mut exec, &mut wait) {
+            Ok(Step::Done(vals)) => {
+                assert_eq!(h.text(vals[0]), "a");
+                assert_eq!(h.text(vals[1]), "b");
+            }
+            other => panic!("coroutine waits should complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn out_of_range_channel_id_is_rejected_not_masked() {
+        let mut h = Harness::new();
+        // A negative id cannot round-trip through the 56-bit token payload, so
+        // it must be rejected rather than silently aliasing another channel.
+        let mut exec = h.spawn("return ch.recv(-1)");
+        let mut wait = None;
+        match h.settle(&mut exec, &mut wait) {
+            Err(e) => assert!(e.to_string().contains("out of range"), "got {e}"),
+            Ok(step) => panic!("expected an out-of-range error, got {step:?}"),
         }
     }
 

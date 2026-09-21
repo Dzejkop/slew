@@ -11,7 +11,7 @@ use slew::{Execution, Lua, NativeWait, Step};
 
 use crate::config::{ROBOTS, STEP_FUEL, TICK};
 use crate::runtime::{BootError, Prompt, Robot, boot_robot, ensure_default_files, sources_dir};
-use crate::world::{Ctx, Request, WaitReason, World};
+use crate::world::{Ctx, Request, WaitKind, World};
 
 pub(crate) struct App {
     pub(crate) world: Rc<RefCell<World>>,
@@ -118,10 +118,10 @@ impl App {
             } = &mut self.robots[i];
             let Some(lua) = lua.as_mut() else { continue };
             if let Some(exec) = program.as_mut() {
-                deliver_one(exec, program_wait, lua, &world, i);
+                deliver_ready(exec, program_wait, lua, &world);
             }
             if let Some(p) = prompt.as_mut() {
-                deliver_one(&mut p.exec, &mut p.wait, lua, &world, i);
+                deliver_ready(&mut p.exec, &mut p.wait, lua, &world);
             }
         }
     }
@@ -208,11 +208,7 @@ impl App {
         let Some(lua) = lua.as_mut() else { return };
         match lua.load_named("=prompt", text.as_bytes()) {
             Ok(chunk) => {
-                let ctx = Ctx {
-                    robot: i,
-                    world,
-                    wait: None,
-                };
+                let ctx = Ctx { robot: i, world };
                 let exec = lua.execute_with_context(&chunk, ctx);
                 *prompt = Some(Prompt { exec, wait: None });
             }
@@ -353,23 +349,32 @@ impl App {
     }
 }
 
-/// Completes a parked native call once its condition holds.
-pub(crate) fn deliver_one(
+/// Completes parked native calls whose condition holds.
+///
+/// A root-thread wait surfaces as `Step::Waiting` and is tracked in `root_wait`;
+/// a coroutine wait never surfaces, so it is rediscovered through
+/// [`Execution::pending_waits`].
+pub(crate) fn deliver_ready(
     exec: &mut Execution<Ctx>,
-    wait: &mut Option<NativeWait>,
+    root_wait: &mut Option<NativeWait>,
     lua: &mut Lua<Ctx>,
     world: &Rc<RefCell<World>>,
-    rid: usize,
 ) {
-    let Some(token) = *wait else { return };
-    let reason = exec.context().wait;
-    let ready =
-        matches!(reason, Some(WaitReason::ActionDone)) && world.borrow().robots[rid].job.is_none();
-    if !ready {
-        return;
+    for token in exec.pending_waits(lua) {
+        let Some(kind) = WaitKind::from_token(token) else {
+            continue;
+        };
+        if !kind.is_ready(&world.borrow()) {
+            continue;
+        }
+        // The token came from `pending_waits`, so this cannot fail.
+        let _ = exec.complete_native(lua, token, Ok(Vec::new()));
     }
-    if exec.complete_native(lua, token, Ok(Vec::new())).is_ok() {
-        *wait = None;
-        exec.context_mut().wait = None;
+    // A wait can also be completed through another route, so drop the latch once
+    // its token is no longer outstanding — a stale latch stops all stepping.
+    if let Some(token) = *root_wait
+        && !exec.pending_waits(lua).contains(&token)
+    {
+        *root_wait = None;
     }
 }

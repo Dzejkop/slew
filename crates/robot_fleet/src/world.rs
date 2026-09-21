@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+use slew::NativeWait;
+
 use crate::config::{MAP_H, MAP_W, MAX_LOG, ROBOTS, SHARED_CHANNEL};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumString, strum::IntoStaticStr)]
@@ -119,7 +121,6 @@ pub(crate) struct World {
     /// Pending lifecycle actions requested by robot programs.
     pub(crate) requests: Vec<Option<Request>>,
     pub(crate) log: Rc<RefCell<Vec<String>>>,
-    pub(crate) next_token: u64,
 }
 
 impl World {
@@ -191,7 +192,6 @@ impl World {
             grants,
             requests: (0..ROBOTS).map(|_| None).collect(),
             log: Rc::new(RefCell::new(Vec::new())),
-            next_token: 0,
         }
     }
 
@@ -296,9 +296,72 @@ pub(crate) enum Request {
     Reboot,
 }
 
+/// What a parked wait is waiting for, encoded in the [`NativeWait`] token so it
+/// survives adoption by another execution.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaitReason {
-    ActionDone,
+pub(crate) enum WaitKind {
+    /// The robot at this index has finished its current job (`robot.wait()`).
+    ActionDone(usize),
+    /// The channel has at least one message (`ch.recv`).
+    ChannelNonEmpty(i64),
+    /// The channel has room for another message (`ch.send`).
+    ChannelRoom(i64),
+}
+
+impl WaitKind {
+    /// The kind occupies the top byte of the token; its payload the rest.
+    const KIND_SHIFT: u32 = 56;
+    const PAYLOAD_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+    /// The kind's numeric tag and its payload (robot id or channel id).
+    fn parts(self) -> (u64, i64) {
+        match self {
+            WaitKind::ActionDone(rid) => (0, rid as i64),
+            WaitKind::ChannelNonEmpty(chan) => (1, chan),
+            WaitKind::ChannelRoom(chan) => (2, chan),
+        }
+    }
+
+    /// The token naming this wait. The payload must be non-negative and fit in 56
+    /// bits; callers pass only grant-bounded robot/channel ids, so the mask only
+    /// truncates in the unreachable case the `debug_assert!` guards.
+    pub(crate) fn token(self) -> NativeWait {
+        let (kind, payload) = self.parts();
+        debug_assert!(
+            payload >= 0 && payload as u64 <= Self::PAYLOAD_MASK,
+            "wait payload {payload} does not fit in the token"
+        );
+        NativeWait((kind << Self::KIND_SHIFT) | (payload as u64 & Self::PAYLOAD_MASK))
+    }
+
+    /// The wait a token's tag names, or `None` if the tag is unknown. Not a
+    /// provenance check: feed it only tokens this host minted.
+    pub(crate) fn from_token(token: NativeWait) -> Option<Self> {
+        let payload = (token.0 & Self::PAYLOAD_MASK) as i64;
+        match token.0 >> Self::KIND_SHIFT {
+            0 => Some(WaitKind::ActionDone(payload as usize)),
+            1 => Some(WaitKind::ChannelNonEmpty(payload)),
+            2 => Some(WaitKind::ChannelRoom(payload)),
+            _ => None,
+        }
+    }
+
+    /// Whether the condition this wait names currently holds. A missing channel
+    /// is not ready for a receive and ready for a send, matching the
+    /// get-or-create on send in [`crate::natives`].
+    pub(crate) fn is_ready(self, world: &World) -> bool {
+        match self {
+            WaitKind::ActionDone(rid) => world.robots[rid].job.is_none(),
+            WaitKind::ChannelNonEmpty(chan) => world
+                .channels
+                .get(&chan)
+                .is_some_and(|c| !c.items.is_empty()),
+            WaitKind::ChannelRoom(chan) => world
+                .channels
+                .get(&chan)
+                .is_none_or(|c| c.items.len() < c.cap),
+        }
+    }
 }
 
 /// Per-execution context. All of a robot's executions share the `Rc`s.
@@ -306,5 +369,4 @@ pub(crate) enum WaitReason {
 pub(crate) struct Ctx {
     pub(crate) robot: usize,
     pub(crate) world: Rc<RefCell<World>>,
-    pub(crate) wait: Option<WaitReason>,
 }
